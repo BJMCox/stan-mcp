@@ -9,6 +9,7 @@ length-validated against param_unc_num before the C++ call.
 Implemented during the build (see design tool group B).
 """
 
+import json
 from collections import OrderedDict
 from typing import TYPE_CHECKING
 
@@ -93,4 +94,49 @@ def log_density_hessian(stan, data, theta_unc, propto=True, jacobian=True) -> di
         "lp": float(lp),
         "gradient": np.asarray(grad).tolist(),
         "hessian": np.asarray(hess).tolist(),
+    }
+
+
+def param_constrain(stan, data, theta_unc, include_tp=False, include_gq=False) -> dict:
+    source = _compile.resolve_source(stan)
+    m = get_model(source, data)
+    theta = _validate_theta(m, theta_unc)
+    vals = np.asarray(
+        m.param_constrain(theta, include_tp=include_tp, include_gq=include_gq)
+    ).tolist()
+    names = m.param_names(include_tp=include_tp, include_gq=include_gq)
+    return {"constrained": dict(zip(names, vals, strict=True))}
+
+
+def param_unconstrain(stan, data, constrained: dict) -> dict:
+    source = _compile.resolve_source(stan)
+    m = get_model(source, data)
+    theta = m.param_unconstrain_json(json.dumps(constrained))
+    return {"theta_unc": np.asarray(theta).tolist()}
+
+
+def check_gradient(stan, data, theta_unc, eps=1e-6) -> dict:
+    source = _compile.resolve_source(stan)
+    m = get_model(source, data)
+    theta = _validate_theta(m, theta_unc)
+    _, ad_grad = m.log_density_gradient(theta)
+    ad_grad = np.asarray(ad_grad, dtype=float)
+    fd = np.zeros_like(theta)
+    for i in range(theta.size):
+        tp, tm = theta.copy(), theta.copy()
+        tp[i] += eps
+        tm[i] -= eps
+        fd[i] = (m.log_density(tp) - m.log_density(tm)) / (2 * eps)
+    abs_err = np.abs(ad_grad - fd)
+    denom = np.maximum(np.abs(ad_grad), 1e-12)
+    rel_err = abs_err / denom
+    mismatches = [
+        {"index": int(i), "autodiff": float(ad_grad[i]), "finite_diff": float(fd[i])}
+        for i in range(theta.size)
+        if abs_err[i] > 1e-4
+    ]
+    return {
+        "max_abs_err": float(abs_err.max()) if theta.size else 0.0,
+        "max_rel_err": float(rel_err.max()) if theta.size else 0.0,
+        "mismatches": mismatches,
     }

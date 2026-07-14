@@ -44,3 +44,11 @@ def test_live_log_density(tmp_path, monkeypatch):
     out = density.log_density_gradient(BERNOULLI, DATA, [0.0])
     assert isinstance(out["lp"], float)
     assert len(out["gradient"]) == 1
+
+
+def test_live_check_gradient(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    import density
+
+    out = density.check_gradient(BERNOULLI, DATA, [0.1])
+    assert out["max_abs_err"] < 1e-3
