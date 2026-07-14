@@ -56,19 +56,24 @@ class RunManager:
         return {"run_id": run_id, "method": method, "status": "running"}
 
     def _execute(self, run_id, source, data, method, kwargs, handle):
-        meta = runstore.read_meta(run_id)
         try:
-            model = self._compile(source, None)
-            fit = self._runner(method, model, data, kwargs)
-            self._persist(run_id, method, fit)
-            meta["status"] = "done"
-        except Exception as exc:  # noqa: BLE001 - persisted, not raised
-            meta["status"] = "failed"
-            meta["stderr"] = f"{exc}\n{traceback.format_exc()}"
-        runstore.write_meta(run_id, meta)
-        handle.event.set()
-        for loop, aio_event in handle.aio_events:
-            loop.call_soon_threadsafe(aio_event.set)
+            meta = runstore.read_meta(run_id)
+            try:
+                model = self._compile(source, None)
+                fit = self._runner(method, model, data, kwargs)
+                self._persist(run_id, method, fit)
+                meta["status"] = "done"
+            except Exception as exc:  # noqa: BLE001 - persisted, not raised
+                meta["status"] = "failed"
+                meta["stderr"] = f"{exc}\n{traceback.format_exc()}"
+            runstore.write_meta(run_id, meta)
+        finally:
+            handle.event.set()
+            for loop, aio_event in handle.aio_events:
+                try:
+                    loop.call_soon_threadsafe(aio_event.set)
+                except RuntimeError:
+                    pass
 
     def get_run_status(self, run_id) -> dict:
         try:
