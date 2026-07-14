@@ -17,3 +17,21 @@ def test_density_tools_registered():
         "check_gradient",
     ]:
         assert expected in tool_names
+
+
+def test_run_tools_registered():
+    import asyncio
+
+    import server
+
+    names = {t.name for t in asyncio.run(server.mcp.list_tools())}
+    for expected in [
+        "start_run",
+        "get_run_status",
+        "await_run",
+        "list_runs",
+        "get_run_summary",
+        "get_run_diagnostics",
+        "extract_draws",
+    ]:
+        assert expected in names
