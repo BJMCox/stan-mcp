@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import runstore
 
 
@@ -25,3 +27,21 @@ def test_estimate_roundtrip(tmp_path, monkeypatch):
     runstore.write_meta("optimize-0001", {"method": "optimize"})
     runstore.persist_estimate("optimize-0001", {"theta": 0.6, "lp__": -3.2})
     assert runstore.load_estimate("optimize-0001")["theta"] == 0.6
+
+
+def test_persist_csvs_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    src = tmp_path / "source"
+    src.mkdir()
+    csv_file = src / "chain-1.csv"
+    csv_file.write_text("a,b\n1,2\n")
+    runstore.persist_csvs("sample-0001", [str(csv_file)])
+    paths = runstore.csv_paths("sample-0001")
+    assert len(paths) == 1
+    assert paths[0].endswith("chain-1.csv")
+    assert Path(paths[0]).read_text() == "a,b\n1,2\n"
+
+
+def test_csv_paths_empty_when_no_csv_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    assert runstore.csv_paths("sample-9999") == []

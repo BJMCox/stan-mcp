@@ -44,6 +44,20 @@ def test_await_failed_run(tmp_path, monkeypatch):
     assert "exploded" in runstore.read_meta(started["run_id"])["stderr"]
 
 
+def test_generate_quantities_missing_from_run_id_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    mgr = sample.RunManager()
+    monkeypatch.setattr(mgr, "_compile", lambda src, args: object())
+    # Real _runner is exercised (not monkeypatched) so it hits the RunError itself.
+
+    started = mgr.start_run(
+        "model {}", None, method="generate_quantities", method_args={}
+    )
+    result = asyncio.run(mgr.await_run(started["run_id"], timeout=5))
+    assert result["status"] == "failed"
+    assert "from_run_id" in runstore.read_meta(started["run_id"])["stderr"]
+
+
 def test_await_run_unknown_run_id_raises_run_error(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     mgr = sample.RunManager()

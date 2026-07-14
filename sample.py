@@ -30,6 +30,15 @@ class RunManager:
         return _compile.cmdstan_model(source, stanc_args)
 
     def _runner(self, method, model, data, kwargs):
+        if method == "generate_quantities":
+            kwargs = dict(kwargs)
+            from_run_id = kwargs.pop("from_run_id", None)
+            if not from_run_id:
+                raise RunError("generate_quantities requires method_args.from_run_id")
+            csvs = runstore.csv_paths(from_run_id)
+            if not csvs:
+                raise RunError(f"run {from_run_id!r} has no persisted draws CSVs to reuse")
+            return model.generate_quantities(data=data, previous_fit=csvs, **kwargs)
         cmd = methods.METHODS[method]["cmd"]
         return getattr(model, cmd)(data=data, **kwargs)
 
@@ -62,6 +71,11 @@ class RunManager:
                 model = self._compile(source, None)
                 fit = self._runner(method, model, data, kwargs)
                 self._persist(run_id, method, fit)
+                # re-read: _persist may have written its own warning fields
+                # (persist_warning / csv_warning) directly to meta.json, and
+                # writing back the pre-persist `meta` below would silently
+                # clobber them.
+                meta = runstore.read_meta(run_id)
                 meta["status"] = "done"
             except Exception as exc:  # noqa: BLE001 - persisted, not raised
                 meta["status"] = "failed"

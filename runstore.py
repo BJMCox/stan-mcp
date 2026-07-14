@@ -10,6 +10,7 @@ Implemented during the build (see design "Run store").
 """
 
 import json
+import shutil
 from pathlib import Path
 
 import config
@@ -55,6 +56,20 @@ def list_runs(model_id: str | None = None, limit: int = 50) -> list[dict]:
 
 def idata_path(run_id: str) -> Path:
     return run_dir(run_id) / "inference.nc"
+
+
+def persist_csvs(run_id: str, csv_files) -> None:
+    dest = run_dir(run_id) / "csv"
+    dest.mkdir(parents=True, exist_ok=True)
+    for f in csv_files:
+        shutil.copy(f, dest / Path(f).name)
+
+
+def csv_paths(run_id: str) -> list[str]:
+    dest = run_dir(run_id) / "csv"
+    if not dest.is_dir():
+        return []
+    return sorted(str(p) for p in dest.glob("*.csv"))
 
 
 def persist_estimate(run_id: str, estimate: dict) -> None:

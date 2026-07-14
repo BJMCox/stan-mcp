@@ -2,8 +2,11 @@
 
 persist_run: after a run finishes, convert its fit to persistent storage —
 optimize writes an estimate.json (optimized_params_dict); draws-producing
-methods convert via arviz.from_cmdstanpy to inference.nc, recording a
-persist_warning in meta.json if the conversion fails.
+methods first persist the raw CmdStan CSVs (source of truth; enables
+generate_quantities reuse via runstore.csv_paths), best-effort and
+independent of arviz, then convert via arviz.from_cmdstanpy to inference.nc,
+recording a persist_warning in meta.json if the conversion fails (a
+csv_warning is recorded separately if CSV persistence itself fails).
 run_summary: draws-producing methods -> arviz summary (mean, sd, HDI,
 bulk/tail ESS, R-hat) over inference.nc; optimize -> the stored estimate.
 run_diagnostics: optimize -> lp__ from the estimate; draws-producing methods ->
@@ -22,13 +25,22 @@ def persist_run(run_id: str, method: str, fit) -> None:
     if method == "optimize":
         runstore.persist_estimate(run_id, dict(fit.optimized_params_dict))
         return
+
+    # persist raw cmdstan CSVs (source of truth; enables generate_quantities reuse)
+    try:
+        runstore.persist_csvs(run_id, fit.runset.csv_files)
+    except Exception as exc:  # best-effort
+        meta = runstore.read_meta(run_id)
+        meta["csv_warning"] = f"csv persist failed: {exc}"
+        runstore.write_meta(run_id, meta)
+
     import arviz as az
 
-    meta = runstore.read_meta(run_id)
     try:
         idata = az.from_cmdstanpy(fit)
         idata.to_netcdf(str(runstore.idata_path(run_id)))
     except Exception as exc:  # non-sample methods may not map cleanly
+        meta = runstore.read_meta(run_id)
         meta["persist_warning"] = f"arviz conversion failed: {exc}"
         runstore.write_meta(run_id, meta)
 

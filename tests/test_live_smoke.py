@@ -15,6 +15,8 @@ model { theta ~ beta(1,1); y ~ bernoulli(theta); }
 """
 DATA = {"N": 5, "y": [0, 1, 0, 1, 1]}
 
+BERNOULLI_GQ = BERNOULLI + "\ngenerated quantities { int y_sim = bernoulli_rng(theta); }\n"
+
 
 def test_compile_model_returns_artifacts(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
@@ -72,3 +74,46 @@ def test_live_sample_run(tmp_path, monkeypatch):
     assert any(row["param"] == "theta" for row in summ["summary"])
     diag = diagnostics.run_diagnostics(started["run_id"])
     assert "divergences" in diag
+
+
+def test_live_generate_quantities(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    import asyncio
+
+    import diagnostics
+    import errors
+    import runstore
+    import sample
+
+    mgr = sample.RunManager()
+
+    started_a = mgr.start_run(
+        BERNOULLI, DATA, method="sample",
+        method_args={"chains": 2, "iter_warmup": 200, "iter_sampling": 200},
+    )
+    result_a = asyncio.run(mgr.await_run(started_a["run_id"], timeout=120))
+    assert result_a["status"] == "done"
+    run_id_a = started_a["run_id"]
+
+    started_gq = mgr.start_run(
+        BERNOULLI_GQ, DATA, method="generate_quantities",
+        method_args={"from_run_id": run_id_a},
+    )
+    result_gq = asyncio.run(mgr.await_run(started_gq["run_id"], timeout=120))
+    assert result_gq["status"] == "done"
+    run_id_gq = started_gq["run_id"]
+
+    # Reality as of arviz 1.2 / arviz-base: its from_cmdstanpy converter calls
+    # fit.method_variables(), which cmdstanpy's CmdStanGQ does not implement,
+    # so the arviz conversion in diagnostics.persist_run fails (recorded as
+    # persist_warning) and inference.nc is never written for GQ runs. Output
+    # is still retrievable via the persisted raw CmdStan CSVs
+    # (runstore.csv_paths). If a future arviz version maps CmdStanGQ cleanly,
+    # prefer asserting through run_summary/extract_draws instead.
+    try:
+        diagnostics.extract_draws(run_id_gq, "y_sim")
+    except errors.RunError:
+        assert runstore.csv_paths(run_id_gq)
+    else:
+        summ = diagnostics.run_summary(run_id_gq)
+        assert "summary" in summ
