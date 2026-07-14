@@ -1,10 +1,49 @@
-"""Toolchain provisioning: ensure the C++ toolchain and the BridgeStan / CmdStan
-source trees are present.
+"""Toolchain provisioning: ensure BridgeStan + CmdStan are present, fail loud."""
 
-pixi pins the compiler + make; the BridgeStan and CmdStan source trees are
-auto-downloaded to STAN_MCP_HOME on first compile. Any gap (missing compiler,
-failed download) fails loud with an exact remediation message — never silent.
-Downloads are large; log clearly so a first compile does not look hung.
+from errors import ToolchainError
 
-Implemented during the build (see design "Toolchain provisioning").
-"""
+
+def _bridgestan_path() -> str:
+    # Downloads the pinned BridgeStan source to ~/.bridgestan on first call.
+    from bridgestan.compile import get_bridgestan_path
+
+    return str(get_bridgestan_path())
+
+
+def _cmdstan_path() -> str:
+    import cmdstanpy
+
+    return str(cmdstanpy.cmdstan_path())
+
+
+def _install_cmdstan() -> None:
+    import cmdstanpy
+
+    cmdstanpy.install_cmdstan()
+
+
+def ensure_bridgestan() -> str:
+    try:
+        return _bridgestan_path()
+    except Exception as exc:  # noqa: BLE001 - surfaced as a remediation message
+        raise ToolchainError(
+            "BridgeStan source tree unavailable and could not be downloaded "
+            f"({exc}). Check network access or run "
+            "`python -c \"from bridgestan.compile import get_bridgestan_path; "
+            'get_bridgestan_path()"` manually.'
+        ) from exc
+
+
+def ensure_cmdstan() -> str:
+    try:
+        return _cmdstan_path()
+    except Exception:
+        try:
+            _install_cmdstan()
+            return _cmdstan_path()
+        except Exception as exc:  # noqa: BLE001
+            raise ToolchainError(
+                "CmdStan not installed and install_cmdstan() failed "
+                f"({exc}). Run `python -c \"import cmdstanpy; "
+                'cmdstanpy.install_cmdstan()"` manually.'
+            ) from exc
