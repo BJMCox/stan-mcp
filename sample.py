@@ -88,7 +88,10 @@ class RunManager:
         handle = self._handles.get(run_id)
         if handle is None:
             # already finished in a prior process/session: read from disk
-            meta = runstore.read_meta(run_id)
+            try:
+                meta = runstore.read_meta(run_id)
+            except FileNotFoundError as exc:
+                raise RunError(f"unknown run_id {run_id!r}") from exc
             return {"status": meta["status"], "run_dir": str(runstore.run_dir(run_id)),
                     "meta": meta}
         loop = asyncio.get_running_loop()

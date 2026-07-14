@@ -31,7 +31,7 @@ mcp = FastMCP("stan-mcp")
 def _safe(fn, *args, **kwargs):
     try:
         return fn(*args, **kwargs)
-    except StanMcpError as exc:
+    except Exception as exc:
         return as_error_dict(exc)
 
 

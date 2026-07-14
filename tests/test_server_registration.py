@@ -1,6 +1,15 @@
 import asyncio
 
 
+def test_safe_catches_generic_exceptions_as_error_dict():
+    import server
+
+    def boom():
+        raise ValueError("boom")
+
+    assert server._safe(boom) == {"error": "boom", "error_type": "ValueError"}
+
+
 def test_density_tools_registered():
     import server
 
