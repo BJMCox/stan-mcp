@@ -12,8 +12,11 @@ Implemented during the build (see design tool group B).
 from collections import OrderedDict
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 import compile as _compile
 import config
+import errors
 
 if TYPE_CHECKING:
     import bridgestan
@@ -53,4 +56,41 @@ def param_info(stan, data) -> dict:
         "param_unc_names": m.param_unc_names(),
         "param_num": m.param_num(),
         "param_unc_num": m.param_unc_num(),
+    }
+
+
+def _validate_theta(model, theta_unc) -> np.ndarray:
+    arr = np.asarray(theta_unc, dtype=float)
+    n = model.param_unc_num()
+    if arr.shape != (n,):
+        raise errors.ValidationError(
+            f"theta_unc has length {arr.size}, expected {n} unconstrained params"
+        )
+    return arr
+
+
+def log_density(stan, data, theta_unc, propto=True, jacobian=True) -> dict:
+    source = _compile.resolve_source(stan)
+    m = get_model(source, data)
+    theta = _validate_theta(m, theta_unc)
+    return {"lp": float(m.log_density(theta, propto=propto, jacobian=jacobian))}
+
+
+def log_density_gradient(stan, data, theta_unc, propto=True, jacobian=True) -> dict:
+    source = _compile.resolve_source(stan)
+    m = get_model(source, data)
+    theta = _validate_theta(m, theta_unc)
+    lp, grad = m.log_density_gradient(theta, propto=propto, jacobian=jacobian)
+    return {"lp": float(lp), "gradient": np.asarray(grad).tolist()}
+
+
+def log_density_hessian(stan, data, theta_unc, propto=True, jacobian=True) -> dict:
+    source = _compile.resolve_source(stan)
+    m = get_model(source, data)
+    theta = _validate_theta(m, theta_unc)
+    lp, grad, hess = m.log_density_hessian(theta, propto=propto, jacobian=jacobian)
+    return {
+        "lp": float(lp),
+        "gradient": np.asarray(grad).tolist(),
+        "hessian": np.asarray(hess).tolist(),
     }

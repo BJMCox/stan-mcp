@@ -35,3 +35,12 @@ def test_param_info(tmp_path, monkeypatch):
     assert info["param_names"] == ["theta"]
     assert info["param_num"] == 1
     assert info["param_unc_num"] == 1  # theta is bounded -> 1 unconstrained dim
+
+
+def test_live_log_density(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    import density
+
+    out = density.log_density_gradient(BERNOULLI, DATA, [0.0])
+    assert isinstance(out["lp"], float)
+    assert len(out["gradient"]) == 1
