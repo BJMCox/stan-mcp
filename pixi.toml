@@ -1,0 +1,32 @@
+[workspace]
+name = "stan-mcp"
+version = "0.1.0"
+description = "MCP server for compiling, inspecting, and running Stan models (BridgeStan + CmdStanPy)"
+channels = ["conda-forge"]
+platforms = ["osx-arm64"]
+
+[tasks]
+serve = "python server.py"
+test = "pytest -q"
+test-live = "STAN_MCP_LIVE=1 pytest -q tests/test_live_smoke.py"
+lint = "ruff check ."
+format = "ruff format ."
+typecheck = "pyright"
+
+[dependencies]
+python = ">=3.11,<3.13"
+cxx-compiler = "*"
+make = "*"
+numpy = "*"
+pytest = "*"
+pytest-asyncio = "*"
+ruff = "*"
+pyright = "*"
+
+[pypi-dependencies]
+mcp = ">=1.0"
+bridgestan = "*"
+cmdstanpy = "*"
+arviz = "*"
+xarray = "*"
+netcdf4 = "*"

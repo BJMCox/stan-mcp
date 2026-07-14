@@ -1,0 +1,6 @@
+{
+  "include": ["."],
+  "exclude": ["**/.pixi", "**/__pycache__", "docs"],
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "basic"
+}
