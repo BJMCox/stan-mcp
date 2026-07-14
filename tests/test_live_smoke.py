@@ -52,3 +52,23 @@ def test_live_check_gradient(tmp_path, monkeypatch):
 
     out = density.check_gradient(BERNOULLI, DATA, [0.1])
     assert out["max_abs_err"] < 1e-3
+
+
+def test_live_sample_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    import asyncio
+
+    import diagnostics
+    import sample
+
+    mgr = sample.RunManager()
+    started = mgr.start_run(
+        BERNOULLI, DATA, method="sample",
+        method_args={"chains": 2, "iter_warmup": 200, "iter_sampling": 200},
+    )
+    result = asyncio.run(mgr.await_run(started["run_id"], timeout=120))
+    assert result["status"] == "done"
+    summ = diagnostics.run_summary(started["run_id"], params=["theta"])
+    assert any(row["param"] == "theta" for row in summ["summary"])
+    diag = diagnostics.run_diagnostics(started["run_id"])
+    assert "divergences" in diag
