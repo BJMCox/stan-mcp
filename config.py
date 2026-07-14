@@ -24,3 +24,18 @@ def home() -> Path:
 
 # Bounded in-process LRU of loaded BridgeStan StanModel objects.
 MODEL_LRU_SIZE = int(os.environ.get("STAN_MCP_LRU_SIZE") or 8)
+
+
+def _ensured(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def compiled_dir() -> Path:
+    """Directory holding compiled artifacts (.so / executables), keyed by model_id."""
+    return _ensured(home() / "compiled")
+
+
+def runs_dir() -> Path:
+    """Directory holding persisted inference runs, one subdir per run_id."""
+    return _ensured(home() / "runs")
