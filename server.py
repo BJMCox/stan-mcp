@@ -14,11 +14,87 @@ Modules keep the logic; this file stays thin (registration + arg validation +
 offload of blocking work via asyncio.to_thread).
 """
 
+import asyncio
+
 from mcp.server.fastmcp import FastMCP
+
+import compile as _compile
+import density
+from errors import StanMcpError, as_error_dict
 
 mcp = FastMCP("stan-mcp")
 
-# Tools are registered during implementation (see design sections A-C).
+
+def _safe(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except StanMcpError as exc:
+        return as_error_dict(exc)
+
+
+@mcp.tool()
+async def compile_model(stan: str, stanc_args: list[str] | None = None) -> dict:
+    """Compile a Stan model (BridgeStan .so + CmdStan exe). Returns artifact paths."""
+    return await asyncio.to_thread(_compile.compile_model, stan, stanc_args)
+
+
+@mcp.tool()
+async def param_info(stan: str, data=None) -> dict:
+    """Return parameter names and constrained/unconstrained counts for the model."""
+    return await asyncio.to_thread(_safe, density.param_info, stan, data)
+
+
+@mcp.tool()
+async def log_density(stan: str, data, theta_unc: list[float], propto: bool = True,
+                      jacobian: bool = True) -> dict:
+    """Log density at an unconstrained parameter vector."""
+    return await asyncio.to_thread(
+        _safe, density.log_density, stan, data, theta_unc, propto, jacobian
+    )
+
+
+@mcp.tool()
+async def log_density_gradient(stan: str, data, theta_unc: list[float],
+                               propto: bool = True, jacobian: bool = True) -> dict:
+    """Log density and gradient at an unconstrained parameter vector."""
+    return await asyncio.to_thread(
+        _safe, density.log_density_gradient, stan, data, theta_unc, propto, jacobian
+    )
+
+
+@mcp.tool()
+async def log_density_hessian(stan: str, data, theta_unc: list[float],
+                              propto: bool = True, jacobian: bool = True) -> dict:
+    """Log density, gradient, and Hessian at an unconstrained parameter vector."""
+    return await asyncio.to_thread(
+        _safe, density.log_density_hessian, stan, data, theta_unc, propto, jacobian
+    )
+
+
+@mcp.tool()
+async def param_constrain(stan: str, data, theta_unc: list[float],
+                          include_tp: bool = False, include_gq: bool = False) -> dict:
+    """Map unconstrained params to the constrained space (named)."""
+    return await asyncio.to_thread(
+        _safe, density.param_constrain, stan, data, theta_unc, include_tp, include_gq
+    )
+
+
+@mcp.tool()
+async def param_unconstrain(stan: str, data, constrained: dict) -> dict:
+    """Map named constrained params to the unconstrained vector."""
+    return await asyncio.to_thread(
+        _safe, density.param_unconstrain, stan, data, constrained
+    )
+
+
+@mcp.tool()
+async def check_gradient(stan: str, data, theta_unc: list[float],
+                         eps: float = 1e-6) -> dict:
+    """Compare autodiff gradient against central finite differences."""
+    return await asyncio.to_thread(
+        _safe, density.check_gradient, stan, data, theta_unc, eps
+    )
 
 
 if __name__ == "__main__":
