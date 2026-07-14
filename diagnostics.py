@@ -1,12 +1,17 @@
 """Method-aware summary and diagnostics over stored runs (arviz-backed).
 
-get_run_summary: draws-producing methods -> arviz summary (mean, sd, HDI,
-bulk/tail ESS, R-hat); optimize -> point estimate + lp__.
-get_run_diagnostics: sample -> divergences, tree-depth hits, E-BFMI, R-hat;
-variational -> ELBO convergence; pathfinder -> path diagnostics; optimize ->
-convergence / lp__.
-
-Implemented during the build (see design tool group C).
+persist_run: after a run finishes, convert its fit to persistent storage —
+optimize writes an estimate.json (optimized_params_dict); draws-producing
+methods convert via arviz.from_cmdstanpy to inference.nc, recording a
+persist_warning in meta.json if the conversion fails.
+run_summary: draws-producing methods -> arviz summary (mean, sd, HDI,
+bulk/tail ESS, R-hat) over inference.nc; optimize -> the stored estimate.
+run_diagnostics: optimize -> lp__ from the estimate; draws-producing methods ->
+currently reports only divergence count (from sample_stats.diverging, when
+present). Richer per-method diagnostics (tree-depth hits, E-BFMI, ELBO/path
+diagnostics) are not implemented yet.
+extract_draws: flattened draws for one parameter from inference.nc (draws-
+producing methods only; not available for optimize).
 """
 
 import runstore
@@ -23,7 +28,7 @@ def persist_run(run_id: str, method: str, fit) -> None:
     try:
         idata = az.from_cmdstanpy(fit)
         idata.to_netcdf(str(runstore.idata_path(run_id)))
-    except Exception as exc:  # noqa: BLE001 - non-sample methods may not map cleanly
+    except Exception as exc:  # non-sample methods may not map cleanly
         meta["persist_warning"] = f"arviz conversion failed: {exc}"
         runstore.write_meta(run_id, meta)
 
