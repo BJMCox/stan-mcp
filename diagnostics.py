@@ -844,11 +844,12 @@ def run_pathologies(run_id: str, top_k: int = 5, permutations: int = DEFAULT_PER
         raise RunError(
             f"divergence localization needs HMC sampler stats; run {run_id!r} used {method!r}"
         )
-    idata = _load_idata(run_id)
-    if "sample_stats" not in idata or "diverging" not in idata.sample_stats:
-        raise RunError(f"run {run_id!r} has no `diverging` sampler stat to localize")
+    d = draws.load(run_id)
+    if "divergent__" not in d.sampler_stats:
+        raise RunError(f"run {run_id!r} has no `divergent__` sampler stat to localize")
 
-    div = np.asarray(idata.sample_stats["diverging"].values).reshape(-1).astype(bool)
+    # CmdStan's own column name; arviz renamed it to `diverging`.
+    div = np.asarray(d.sampler_stats["divergent__"]).reshape(-1).astype(bool)
     n, n_div = int(div.size), int(div.sum())
     out: dict = {"run_id": run_id, "n_draws": n, "n_divergent": n_div, "ranking": []}
     if n_div == 0:
@@ -856,7 +857,7 @@ def run_pathologies(run_id: str, top_k: int = 5, permutations: int = DEFAULT_PER
     if n_div == n:
         return {**out, "note": "every draw diverged; no non-divergent draws to compare against"}
 
-    X, names = _draw_matrix(idata)
+    X, names = draws.matrix(d)
     sd = X.std(0)
     keep = np.isfinite(sd) & (sd > 0)  # constants carry no location information
     if not keep.any():
