@@ -126,6 +126,11 @@ def test_draw_row_offset_absent_from_sidecar_reads_every_row(tmp_path, monkeypat
 
 
 def test_ragged_chains_truncate_to_shortest_and_say_so(tmp_path, monkeypatch):
+    """Defence against a malformed or partially-written CSV set, not a cancelled
+    run: `persist_run` only runs when `_runner` returns, so a cancelled or killed
+    run has no sidecar at all and never reaches `load`. Truncating beats the raw
+    numpy broadcast error `np.stack` would otherwise give, provided it is
+    recorded rather than silent."""
     rid = _run(
         tmp_path,
         monkeypatch,

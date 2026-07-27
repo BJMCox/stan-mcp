@@ -153,7 +153,8 @@ def _typed_run(tmp_path, monkeypatch, method="sample", ragged=False):
     """A run with a sidecar: one scalar and one length-2 vector, 2 chains x 2 draws.
 
     ragged=True drops chain b's second draw -- 2 draws vs 1, the shape a
-    cancelled run leaves behind -- so `Draws.truncated_to` is set.
+    malformed or partially-written CSV set leaves behind -- so
+    `Draws.truncated_to` is set.
     """
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     rid = f"{method}-0001"
@@ -1158,9 +1159,11 @@ def test_run_summary_for_variational_never_calls_stansummary(tmp_path, monkeypat
 
 
 def test_run_summary_surfaces_ragged_chain_truncation(tmp_path, monkeypatch):
-    """A cancelled run leaves chains of unequal length. `_summary_from_draws`
-    must surface that truncation rather than silently reporting statistics
-    over the shortened array with no sign anything was dropped."""
+    """A malformed or partially-written CSV set leaves chains of unequal length —
+    not a cancelled run, which never gets a sidecar to be read at all.
+    `_summary_from_draws` must surface the truncation rather than silently
+    reporting statistics over the shortened array with no sign anything was
+    dropped."""
     rid = _typed_run(tmp_path, monkeypatch, method="variational", ragged=True)
     out = diagnostics.run_summary(rid)
     assert out["chains_truncated_to"] == 1

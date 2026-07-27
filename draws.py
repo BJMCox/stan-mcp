@@ -154,9 +154,22 @@ def load(run_id: str) -> Draws:
 
     lengths = [a.shape[0] for a in per_chain]
     n_draw = min(lengths)
-    # A (chain, draw, ...) array cannot represent ragged chains, which a cancelled
-    # run produces. Truncate to the shortest and RECORD it: silently dropping the
-    # excess is the failure mode this layer exists to remove.
+    # A (chain, draw, ...) array cannot represent ragged chains. Truncate to the
+    # shortest and RECORD it: silently dropping the excess is the failure mode
+    # this layer exists to remove.
+    #
+    # NOT a cancelled run, despite how this once read. `persist_run` only runs
+    # when `_runner` RETURNS (sample.py), so a cancelled or killed run never gets
+    # a sidecar at all and can never reach this code — `schema()` fails first with
+    # "has no draws_schema.json". What this actually defends against is a CSV set
+    # that is malformed or was only partly written: a truncated copy, a
+    # half-populated `csv/`, a hand-built fixture. Worth keeping for that alone,
+    # since the alternative is a raw numpy broadcast error from `np.stack`.
+    #
+    # Only `_summary_from_draws` surfaces this as `chains_truncated_to`; the
+    # `sample` path never sees it, because `stansummary` itself rejects ragged
+    # input ("Error during processing. Error: chain 2, missing or extra rows.",
+    # exit 1) and so fails loudly instead. See docs/usage.md.
     truncated_to = n_draw if len(set(lengths)) > 1 else None
     arr = np.stack([a[:n_draw] for a in per_chain])  # (chain, draw, column)
 
