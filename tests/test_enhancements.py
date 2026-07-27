@@ -1009,6 +1009,116 @@ def test_run_summary_for_sample_comes_from_stansummary(tmp_path, monkeypatch):
     assert "eti89_lb" not in rows["theta"]
 
 
+def test_run_summary_keeps_significant_figures_not_decimal_places(tmp_path, monkeypatch):
+    """`round(x, 6)` rounds decimal PLACES, which partly undoes --sig_figs 18: it
+    collapses any small-magnitude statistic to a flat 0.0. A well-mixed
+    parameter's MCSE is sd/sqrt(ESS), and a parameter whose sd is ~1e-5 has a
+    mean, sd and quantiles all below the old cliff."""
+    rid = _typed_run(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        diagnostics.stansummary,
+        "summarize",
+        lambda paths, **kw: {
+            "theta": {"Mean": 1.23456789e-8, "StdDev": 2.5e-9, "MCSE": 3.21e-11},
+            "z.1": {"Mean": 0.5},
+            "z.2": {"Mean": 0.5},
+        },
+    )
+    theta = next(r for r in diagnostics.run_summary(rid)["summary"] if r["param"] == "theta")
+    # every one of these read 0.0 under round(x, 6)
+    assert theta["mean"] == pytest.approx(1.23457e-8)
+    assert theta["sd"] == pytest.approx(2.5e-9)
+    assert theta["mcse"] == pytest.approx(3.21e-11)
+
+
+def test_summary_from_draws_keeps_significant_figures(tmp_path, monkeypatch):
+    """Same cliff on the approximate-method path, which computes its own moments:
+    a parameter whose draws sit around 1e-8 must not summarize as all zeros."""
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    rid = "variational-0001"
+    runstore.write_meta(rid, {"method": "variational", "status": "done"})
+    csvdir = runstore.run_dir(rid, create=True) / "csv"
+    csvdir.mkdir(parents=True, exist_ok=True)
+    (csvdir / "c.csv").write_text("# c\nlp__,tiny\n0,1e-8\n0,3e-8\n")
+    diagnostics.draws.schema_path(rid).write_text(
+        json.dumps(
+            {
+                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "files": ["c.csv"],
+                "params": {"tiny": {"dims": [], "cols": [1]}},
+                "sampler_stats": {"lp__": {"dims": [], "cols": [0]}},
+            }
+        )
+    )
+    row = diagnostics.run_summary(rid)["summary"][0]
+    assert row["mean"] == pytest.approx(2e-8)
+    assert row["sd"] > 0.0  # read 0.0 under round(x, 6)
+    assert row["q50"] == pytest.approx(2e-8)
+
+
+def test_run_summary_replaces_nan_with_null(tmp_path, monkeypatch):
+    """stansummary reports `nan` for the MCSE/ESS/R_hat of a CONSTANT column
+    (verified: `"fixed",2.5,nan,0,0,...,nan,nan,nan,nan`), and NaN is not valid
+    JSON. A constant parameter is common, so this is a normal path."""
+    rid = _typed_run(tmp_path, monkeypatch)
+    nan = float("nan")
+    monkeypatch.setattr(
+        diagnostics.stansummary,
+        "summarize",
+        lambda paths, **kw: {
+            "theta": {"Mean": 2.5, "StdDev": 0.0, "MCSE": nan, "ESS_bulk": nan, "R_hat": nan},
+            "z.1": {"Mean": 0.5},
+            "z.2": {"Mean": 0.5},
+        },
+    )
+    theta = next(r for r in diagnostics.run_summary(rid)["summary"] if r["param"] == "theta")
+    assert theta["mcse"] is None and theta["ess_bulk"] is None and theta["r_hat"] is None
+    assert theta["mean"] == 2.5  # the finite values are untouched
+    # and the whole result really is JSON-serializable, which NaN is not
+    json.dumps(diagnostics.run_summary(rid))
+
+
+def test_run_summary_raises_when_the_join_matches_nothing(tmp_path, monkeypatch):
+    """A wholesale join miss — a naming change on either side — would otherwise
+    return `{"summary": []}` as a SUCCESS. The per-element `continue` stays for a
+    genuinely partial match; only matching nothing at all is the failure."""
+    rid = _typed_run(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        diagnostics.stansummary,
+        "summarize",
+        lambda paths, **kw: {"theta[1]": {"Mean": 0.25}},  # munged, so nothing matches
+    )
+    with pytest.raises(errors.RunError, match="matched a stansummary row"):
+        diagnostics.run_summary(rid)
+
+
+def test_run_summary_tolerates_a_partial_join(tmp_path, monkeypatch):
+    """Paired negative to the guard above: one missing row is not a wholesale
+    miss, and must still return the rows that did match."""
+    rid = _typed_run(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        diagnostics.stansummary,
+        "summarize",
+        lambda paths, **kw: {"theta": {"Mean": 0.25}, "z.1": {"Mean": 11.5}},  # z.2 absent
+    )
+    assert [r["param"] for r in diagnostics.run_summary(rid)["summary"]] == ["theta", "z[1]"]
+
+
+def test_convergence_warns_when_the_join_matches_nothing(tmp_path, monkeypatch):
+    """The same wholesale miss on the diagnostics side. `_convergence` is a
+    degrade-to-warning site, so the verdict must come back "unknown" WITH the
+    reason, rather than silently omitting R-hat and ESS."""
+    rid = _typed_run(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        diagnostics.stansummary,
+        "summarize",
+        lambda paths, **kw: {"theta[1]": {"R_hat": 1.0}},
+    )
+    out = diagnostics.run_diagnostics(rid)
+    assert out["verdict"] == "unknown"
+    assert "matched a stansummary row" in out["convergence_warning"]
+
+
 def test_run_summary_params_filter_and_worst_first_truncation(tmp_path, monkeypatch):
     rid = _typed_run(tmp_path, monkeypatch)
     monkeypatch.setattr(

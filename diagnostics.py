@@ -345,6 +345,36 @@ def _wanted(name: str, params) -> bool:
     return not params or name in set(params)
 
 
+def _sig6(x) -> float:
+    """Six SIGNIFICANT figures, for a statistic of unknown magnitude.
+
+    NOT `round(x, 6)`, which rounds decimal PLACES and so partly undoes
+    `stansummary.SIG_FIGS = 18`: it collapses any small-magnitude statistic to
+    0.0 outright — a well-mixed parameter's MCSE (`sd/sqrt(ESS)`), or the
+    mean/sd/quantiles of a parameter whose sd is ~1e-5. `%g` keeps a row the same
+    size on screen without that cliff.
+    """
+    return float(f"{float(x):.6g}")
+
+
+def _no_match(run_id: str, n_elements: int, looked_up: list[str], stats) -> RunError:
+    """The error for a join that matched nothing at all.
+
+    Both consumers of stansummary's rows `continue` past an element with no row,
+    which is right for a PARTIAL match. Wholesale it is not: if the join ever
+    missed everything — a naming change on either side of it — `run_summary` would
+    return `{"summary": []}` as a SUCCESS, and `run_diagnostics` would report no
+    R-hat with no reason given. Same class of guard `stansummary.parse` already
+    applies one layer up to a header with no data rows.
+    """
+    return RunError(
+        f"run {run_id!r}: none of its {n_elements} parameter element(s) matched a "
+        f"stansummary row. Looked up {', '.join(looked_up[:5])}; stansummary "
+        f"reported {', '.join(sorted(stats)[:5])}. The sidecar and stansummary "
+        "disagree on element naming, so the result would be silently empty."
+    )
+
+
 def _summary_from_stansummary(run_id: str, params, max_rows: int) -> dict:
     """Statistics from CmdStan's own implementation, relabelled into Stan syntax.
 
@@ -354,18 +384,26 @@ def _summary_from_stansummary(run_id: str, params, max_rows: int) -> dict:
     sc = draws.schema(run_id)
     stats = stansummary.summarize(draws.csv_files(run_id))
     records = []
+    looked_up: list[str] = []
     for name, spec in sc["params"].items():
         if not _wanted(name, params):
             continue
         for stan_label, cmdstan_name in draws.element_labels(name, tuple(spec["dims"])):
+            looked_up.append(cmdstan_name)
             row = stats.get(cmdstan_name)
             if row is None:
                 continue
             rec: dict[str, Any] = {"param": stan_label}
             for src, dst in _SUMMARY_COLUMNS.items():
                 if src in row:
-                    rec[dst] = round(row[src], 6)
-            records.append(rec)
+                    rec[dst] = _sig6(row[src])
+            # stansummary reports `nan` for the MCSE/ESS/R_hat of a CONSTANT
+            # column (verified: `"fixed",2.5,nan,0,0,...,nan,nan,nan,nan`), and
+            # NaN is not valid JSON. A constant parameter is common enough that
+            # this is a normal path, not an edge case.
+            records.append(_json_safe(rec))
+    if looked_up and not records:
+        raise _no_match(run_id, len(looked_up), looked_up, stats)
     return _cap_rows(records, max_rows)
 
 
@@ -383,15 +421,17 @@ def _summary_from_draws(run_id: str, params, max_rows: int) -> dict:
         for label, values in draws.elements(name, arr):
             v = values.reshape(-1)
             records.append(
-                {
-                    "param": label,
-                    "mean": round(float(v.mean()), 6),
-                    "sd": round(float(v.std(ddof=1)), 6) if v.size > 1 else 0.0,
-                    "q5": round(float(np.quantile(v, 0.05)), 6),
-                    "q50": round(float(np.quantile(v, 0.5)), 6),
-                    "q95": round(float(np.quantile(v, 0.95)), 6),
-                    "n": int(v.size),
-                }
+                _json_safe(
+                    {
+                        "param": label,
+                        "mean": _sig6(v.mean()),
+                        "sd": _sig6(v.std(ddof=1)) if v.size > 1 else 0.0,
+                        "q5": _sig6(np.quantile(v, 0.05)),
+                        "q50": _sig6(np.quantile(v, 0.5)),
+                        "q95": _sig6(np.quantile(v, 0.95)),
+                        "n": int(v.size),
+                    }
+                )
             )
     out = _cap_rows(records, max_rows)
     if d.truncated_to is not None:
@@ -463,11 +503,15 @@ def _convergence_stats(run_id: str) -> dict:
     worst_rhat: tuple[float, str] | None = None
     min_bulk: float | None = None
     min_tail: float | None = None
+    looked_up: list[str] = []
+    matched = 0
     for name, spec in sc["params"].items():
         for stan_label, cmdstan_name in draws.element_labels(name, tuple(spec["dims"])):
+            looked_up.append(cmdstan_name)
             row = stats.get(cmdstan_name)
             if row is None:
                 continue
+            matched += 1
             if (r := _finite(row.get("R_hat"))) is not None:
                 if worst_rhat is None or r > worst_rhat[0]:
                     worst_rhat = (r, stan_label)
@@ -475,6 +519,12 @@ def _convergence_stats(run_id: str) -> dict:
                 min_bulk = b if min_bulk is None else min(min_bulk, b)
             if (t := _finite(row.get("ESS_tail"))) is not None:
                 min_tail = t if min_tail is None else min(min_tail, t)
+
+    if looked_up and not matched:
+        # `_convergence` turns this into a `convergence_warning` naming the
+        # mismatch, so the verdict reports "unknown" WITH a reason rather than
+        # silently omitting R-hat and ESS.
+        raise _no_match(run_id, len(looked_up), looked_up, stats)
 
     out: dict = {}
     if worst_rhat is not None:
@@ -1221,7 +1271,10 @@ def run_geometry(
         lo = max(float(ev[0]), 1e-12)
         eig: dict = {
             "condition_number": round(float(ev[-1]) / lo, 1),
-            "min_eigenvalue": round(float(ev[0]), 5),
+            # Six significant figures, not five decimal places: a near-singular
+            # direction's eigenvalue is exactly the small number worth reading,
+            # and rounding places would report 1e-7 as a flat 0.0.
+            "min_eigenvalue": _sig6(ev[0]),
             # What independent parameters alone would produce at this p/n_eff
             # (Marchenko-Pastur; matches measurement to ~0.4 and is conservative
             # beyond). Without it a condition number of 8 looks like mild
