@@ -153,8 +153,8 @@ def _is_draws_csv(name: str) -> bool:
 
     When `laplace_sample` gets no explicit `mode=`, cmdstanpy runs its own
     optimize step into the SAME output directory, dropping an `-opt-...` CSV
-    (fewer columns, one row) beside the draws CSV. `_chain_frames` below
-    already excludes it the same way; the sidecar's `files` list must too, or
+    (fewer columns, one row) beside the draws CSV. `_ordered_draws_files`
+    below excludes it before recording the sidecar's `files` list, or
     `draws.load` stacks arrays of two different shapes and dies with a bare
     numpy `ValueError` instead of a `RunError` naming the run.
     """
@@ -253,17 +253,6 @@ def persist_run(run_id: str, method: str, fit) -> None:
     # the durable copy, so keeping both doubles every run's disk footprint.
     if runstore.csv_paths(run_id):
         runstore.clear_live(run_id)
-
-
-def _load_idata(run_id: str):
-    import arviz as az
-
-    p = runstore.idata_path(run_id)
-    if not p.exists():
-        warning = runstore.read_meta(run_id).get("persist_warning")
-        detail = f" ({warning})" if warning else ""
-        raise RunError(f"run {run_id!r} has no draws (inference.nc missing){detail}")
-    return az.from_netcdf(str(p))
 
 
 # Default ceiling on summary rows. arviz emits one row per parameter ELEMENT, so
@@ -583,24 +572,31 @@ def run_diagnostics(run_id: str) -> dict:
 
 
 def _idata_with_loglik(run_id: str, var_name: str):
-    """Load a run's idata, ensuring a `log_likelihood` group exists.
+    """An arviz DataTree with a `log_likelihood` group, built from typed draws.
 
-    Stan models expose the pointwise log-likelihood as a generated quantity
-    (conventionally `log_lik`); from_cmdstanpy files it under `posterior`, so
-    lift it into the `log_likelihood` group that arviz.loo/compare expect.
+    arviz is needed only for PSIS-LOO, which CmdStan has no equivalent for, so the
+    object is constructed here rather than persisted. Stan models expose the
+    pointwise log-likelihood as a generated quantity (conventionally `log_lik`),
+    which arviz wants in its own group rather than under `posterior`.
     """
-    import xarray as xr
+    import arviz as az
 
-    idata = _load_idata(run_id)
-    if "log_likelihood" in idata.children:
-        return idata
-    if var_name not in idata.posterior:
+    d = draws.load(run_id)
+    if var_name not in d.params:
         raise RunError(
             f"run {run_id!r} has no log-likelihood: model must emit a generated "
-            f"quantity named {var_name!r}"
+            f"quantity named {var_name!r} (have: {', '.join(sorted(d.params))})"
         )
-    idata["log_likelihood"] = xr.Dataset({var_name: idata.posterior[var_name]})
-    return idata
+    posterior = {k: v for k, v in d.params.items() if k != var_name}
+    # arviz 1.2's from_dict takes one nested {group: {var: array}} dict, not
+    # per-group keyword arguments (the signature the brief was written
+    # against, and still in use by az.compare/az.loo elsewhere in this file).
+    return az.from_dict(
+        {
+            "posterior": posterior or {var_name: d.params[var_name]},
+            "log_likelihood": {var_name: d.params[var_name]},
+        }
+    )
 
 
 def run_loo(run_id: str, var_name: str = "log_lik") -> dict:
@@ -664,25 +660,6 @@ def _json_safe(record: dict) -> dict:
 # chains and scaled by each draw's width, since capping per chain per parameter
 # really admits max_draws x chains x params x vector-length numbers.
 DEFAULT_MAX_DRAWS = 100
-
-
-def _chain_frames(run_id: str):
-    """Per-chain draw frames from a run's raw CmdStan CSVs (one file per chain,
-    excluding the laplace optimization CSV)."""
-    import pandas as pd
-
-    paths = [p for p in runstore.csv_paths(run_id) if "-opt-" not in p]
-    if not paths:
-        raise RunError(f"run {run_id!r} has no persisted draws (no CSVs)")
-    return [pd.read_csv(p, comment="#") for p in paths]
-
-
-def _draws_df(run_id: str):
-    """Concatenated draws from a run's raw CmdStan CSVs (excludes the laplace
-    optimization CSV). Fallback source for methods with no inference.nc."""
-    import pandas as pd
-
-    return pd.concat(_chain_frames(run_id), ignore_index=True)
 
 
 def _thin_step(n: int, thin: int, budget: int) -> int:
@@ -917,12 +894,6 @@ _MIN_FISHER_Z = 4.0  # ...and firmly established given the effective sample size
 # multi-way degeneracy effectively unreachable.
 _EIGEN_ESS_RATIO = 4
 _EIGEN_GAP = 1.5  # min relative gap to the next eigenvalue before naming loadings
-
-
-def _bridgestan_names(source, data) -> list[str]:
-    import density
-
-    return density.get_model(source, data).param_names()
 
 
 def _constrained_matrix(d: draws.Draws, bs_names: list[str]) -> np.ndarray:

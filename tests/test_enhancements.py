@@ -1946,3 +1946,39 @@ def test_persist_run_gq_from_variational_excludes_leading_row(tmp_path, monkeypa
     d = diagnostics.draws.load(rid)
     assert d.n_draw == 2
     assert d.params["log_lik"].tolist() == [[0.1, 0.2]]
+
+
+# --- diagnostics: PSIS-LOO builds its DataTree on demand from typed draws ---
+def test_idata_with_loglik_is_built_from_typed_arrays(tmp_path, monkeypatch):
+    """PSIS-LOO is the only remaining consumer that needs an arviz object, so it
+    constructs one on demand instead of reading inference.nc."""
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    rid = "sample-0001"
+    runstore.write_meta(rid, {"method": "sample", "status": "done"})
+    csvdir = runstore.run_dir(rid, create=True) / "csv"
+    csvdir.mkdir(parents=True, exist_ok=True)
+    (csvdir / "a.csv").write_text(
+        "# c\nlp__,theta,log_lik.1,log_lik.2\n-1,0.5,-0.7,-0.8\n-1,0.6,-0.6,-0.9\n"
+    )
+    diagnostics.draws.schema_path(rid).write_text(
+        json.dumps(
+            {
+                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "files": ["a.csv"],
+                "params": {
+                    "theta": {"dims": [], "cols": [1]},
+                    "log_lik": {"dims": [2], "cols": [2, 3]},
+                },
+                "sampler_stats": {"lp__": {"dims": [], "cols": [0]}},
+            }
+        )
+    )
+    idata = diagnostics._idata_with_loglik(rid, "log_lik")
+    assert "log_likelihood" in idata.children
+    assert idata.log_likelihood["log_lik"].shape == (1, 2, 2)
+
+
+def test_missing_loglik_still_raises_a_clear_error(tmp_path, monkeypatch):
+    rid = _typed_run(tmp_path, monkeypatch)
+    with pytest.raises(errors.RunError, match="log_lik"):
+        diagnostics._idata_with_loglik(rid, "log_lik")
