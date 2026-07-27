@@ -277,6 +277,27 @@ def test_verdict_flags_issues():
     assert len(v["issues"]) == 2
 
 
+def test_verdict_unknown_when_nothing_was_measured():
+    """An empty diagnostics dict means every reader failed, not that the run is
+    clean -- reporting "pass" there would be a false-clean on the headline
+    field, exactly what the readers' own *_warning keys exist to avoid."""
+    assert diagnostics._verdict({}) == {"verdict": "unknown", "issues": []}
+    # a *_warning key alone, with none of the measured keys, is still nothing
+    # measured -- the warning key itself is not one of the checked keys.
+    assert diagnostics._verdict({"convergence_warning": "boom"}) == {
+        "verdict": "unknown",
+        "issues": [],
+    }
+
+
+def test_verdict_stays_pass_when_a_warning_accompanies_measured_stats():
+    """A *_warning key must not, by itself, flip a partially-measured run to
+    "warn" -- that would read as "the model is pathological" when the truth is
+    "one statistic could not be checked"."""
+    v = diagnostics._verdict({"divergences": 0, "sampler_stats_warning": "boom"})
+    assert v == {"verdict": "pass", "issues": []}
+
+
 def test_extract_draws_by_chain(tmp_path, monkeypatch):
     rid = _typed_run_wide(tmp_path, monkeypatch)
     out = diagnostics.extract_draws(rid, "theta", by_chain=True)
@@ -285,8 +306,10 @@ def test_extract_draws_by_chain(tmp_path, monkeypatch):
 
 
 def test_convergence_reads_the_same_stansummary_output_as_the_summary(tmp_path, monkeypatch):
-    """The summary and the verdict must not be able to disagree: today one goes
-    through az.summary() and the other through az.summary(kind='diagnostics')."""
+    """The summary and the verdict must not be able to disagree: before this
+    migration one went through az.summary() and the other through
+    az.summary(kind='diagnostics'); both now read the identical stansummary()
+    call, via draws.schema/draws.element_labels for the name/dims lookup."""
     rid = _typed_run(tmp_path, monkeypatch)
     monkeypatch.setattr(
         diagnostics.stansummary,
@@ -305,10 +328,22 @@ def test_convergence_reads_the_same_stansummary_output_as_the_summary(tmp_path, 
     assert got["min_ess_tail"] == 148.5
 
 
-def test_sampler_stats_reads_typed_arrays_and_reports_ebfmi(tmp_path, monkeypatch):
+def test_convergence_reports_a_warning_when_stansummary_itself_raises(tmp_path, monkeypatch):
+    """The missing-sidecar case (draws.schema raising) isn't the only way into
+    _convergence's warning path -- a sidecar can exist and stansummary can
+    still fail on its own (e.g. the binary crashing on a malformed CSV)."""
+    rid = _typed_run(tmp_path, monkeypatch)
+
+    def _boom(paths, **kw):
+        raise errors.RunError("boom")
+
+    monkeypatch.setattr(diagnostics.stansummary, "summarize", _boom)
+    assert diagnostics._convergence(rid) == {"convergence_warning": "R-hat/ESS unavailable: boom"}
+
+
+def test_sampler_stats_reads_typed_arrays_and_reports_ebfmi():
     """E-BFMI is not in stansummary (only in `diagnose`, as prose), so it stays
     computed from energy__ -- fed a clean array rather than a DataTree."""
-    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     rng = np.random.default_rng(0)
     d = diagnostics.draws.Draws(
         params={},
@@ -316,7 +351,7 @@ def test_sampler_stats_reads_typed_arrays_and_reports_ebfmi(tmp_path, monkeypatc
             "divergent__": np.array([[0.0, 1.0], [1.0, 0.0]]),
             "treedepth__": np.array([[3.0, 10.0], [10.0, 4.0]]),
             "accept_stat__": np.array([[0.8, 0.9], [0.7, 1.0]]),
-            "energy__": rng.normal(size=(2, 50)),
+            "energy__": rng.normal(size=(2, 2)),
         },
         n_chain=2,
         n_draw=2,
@@ -460,13 +495,19 @@ def test_run_diagnostics_on_sample_run_without_sidecar_does_not_raise(tmp_path, 
     failing the call. A sample run with no draws_schema.json sidecar (predates
     the typed draws layer, or its persist_run write failed) must keep that
     behavior: both _convergence and _sampler_stats read the sidecar, and each
-    must turn its RunError into a warning key rather than letting it propagate."""
+    must turn its RunError into a warning key rather than letting it propagate.
+
+    The verdict must be "unknown", not "pass": nothing was actually measured
+    here, and a silent "pass" on the headline field is a false-clean.
+    """
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     runstore.write_meta("sample-0001", {"method": "sample", "status": "done"})
     diag = diagnostics.run_diagnostics("sample-0001")
     assert diag["method"] == "sample"
     assert "convergence_warning" in diag
     assert "sampler_stats_warning" in diag
+    assert diag["verdict"] == "unknown"
+    assert diag["issues"] == []
 
 
 def _write_csv_run(run_id):
@@ -1126,9 +1167,15 @@ def test_ebfmi_is_reported_not_swallowed(tmp_path, monkeypatch):
     """az.bfmi raises TypeError on an arviz 1.2 DataTree, and a bare `except:
     pass` turned that into E-BFMI silently absent from every sample run — for the
     diagnostic most specific to funnel geometry. `_sampler_stats` now feeds it a
-    plain (chain, draw) `energy__` array off the typed draws layer instead, so
-    that DataTree can no longer reach it -- this guards the `except Exception`
-    around the az.bfmi call staying narrow enough to still report a real failure."""
+    plain (chain, draw) `energy__` array off the typed draws layer instead of an
+    idata, so that DataTree can no longer reach it at all -- verified end to end
+    through `run_diagnostics`, on a real (if minimal) sample run's sidecar and
+    CSVs rather than a hand-built `Draws`.
+
+    The `except Exception` around the az.bfmi call itself staying narrow enough
+    to still report a genuine failure is covered separately, by
+    `test_sampler_stats_reports_ebfmi_warning_when_bfmi_raises`.
+    """
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     _write_run_with_stats("sample-0001", diverging=False, tree_depth=3)
     # stansummary's binary is not available in the offline suite; this test is
@@ -1137,6 +1184,29 @@ def test_ebfmi_is_reported_not_swallowed(tmp_path, monkeypatch):
     d = diagnostics.run_diagnostics("sample-0001")
     assert d.get("min_ebfmi") is not None
     assert "ebfmi_warning" not in d
+
+
+def test_sampler_stats_reports_ebfmi_warning_when_bfmi_raises(monkeypatch):
+    """A diagnostic that quietly returns nothing on failure reads as "checked
+    and fine" -- the exact bug this code's own comment argues against. Forces
+    az.bfmi to raise (a stand-in for the arviz-1.2-DataTree TypeError this
+    replaced) and checks the `except Exception` around it still surfaces a
+    warning rather than swallowing it a second way."""
+    import arviz as az
+
+    def _boom(*a, **kw):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(az, "bfmi", _boom)
+    d = diagnostics.draws.Draws(
+        params={},
+        sampler_stats={"energy__": np.zeros((2, 50))},
+        n_chain=2,
+        n_draw=50,
+    )
+    got = diagnostics._sampler_stats(d, {})
+    assert "min_ebfmi" not in got
+    assert got["ebfmi_warning"] == "E-BFMI unavailable: boom"
 
 
 # --- posterior geometry ---

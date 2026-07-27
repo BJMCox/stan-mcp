@@ -29,6 +29,7 @@ for optimize).
 """
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -487,19 +488,74 @@ def _sampler_stats(d: draws.Draws, meta: dict) -> dict:
     return out
 
 
+# Each entry pairs a diagnostic key with the check that turns it into an issue
+# string (or None). This is the ONE place the six key names are listed:
+# `_verdict` also uses it to tell "nothing was measured" from "measured and
+# clean", rather than keeping a second, separately-maintained key list.
+_VERDICT_CHECKS: tuple[tuple[str, Callable[[dict], str | None]], ...] = (
+    (
+        "max_rhat",
+        lambda d: (
+            f"R-hat {d['max_rhat']} > {_RHAT_MAX} (worst: {d.get('max_rhat_param')})"
+            if d["max_rhat"] > _RHAT_MAX
+            else None
+        ),
+    ),
+    (
+        "min_ess_bulk",
+        lambda d: (
+            f"low bulk ESS {d['min_ess_bulk']} < {_ESS_MIN}"
+            if d["min_ess_bulk"] < _ESS_MIN
+            else None
+        ),
+    ),
+    (
+        "min_ess_tail",
+        lambda d: (
+            f"low tail ESS {d['min_ess_tail']} < {_ESS_MIN}"
+            if d["min_ess_tail"] < _ESS_MIN
+            else None
+        ),
+    ),
+    (
+        "divergences",
+        lambda d: f"{d['divergences']} divergent transition(s)" if d["divergences"] > 0 else None,
+    ),
+    (
+        "treedepth_saturations",
+        lambda d: (
+            f"{d['treedepth_saturations']} iteration(s) hit max_treedepth"
+            if d["treedepth_saturations"] > 0
+            else None
+        ),
+    ),
+    (
+        "min_ebfmi",
+        lambda d: (
+            f"E-BFMI {d['min_ebfmi']} < {_EBFMI_MIN}" if d["min_ebfmi"] < _EBFMI_MIN else None
+        ),
+    ),
+)
+
+
 def _verdict(d: dict) -> dict:
-    issues: list[str] = []
-    if (r := d.get("max_rhat")) is not None and r > _RHAT_MAX:
-        issues.append(f"R-hat {r} > {_RHAT_MAX} (worst: {d.get('max_rhat_param')})")
-    for key, label in (("min_ess_bulk", "bulk"), ("min_ess_tail", "tail")):
-        if (e := d.get(key)) is not None and e < _ESS_MIN:
-            issues.append(f"low {label} ESS {e} < {_ESS_MIN}")
-    if d.get("divergences", 0) > 0:
-        issues.append(f"{d['divergences']} divergent transition(s)")
-    if d.get("treedepth_saturations", 0) > 0:
-        issues.append(f"{d['treedepth_saturations']} iteration(s) hit max_treedepth")
-    if (b := d.get("min_ebfmi")) is not None and b < _EBFMI_MIN:
-        issues.append(f"E-BFMI {b} < {_EBFMI_MIN}")
+    """Pass/warn/unknown verdict from whichever of `_VERDICT_CHECKS`'s keys
+    landed in `d`.
+
+    `unknown`, not `pass`, when NONE of them are present: an empty diagnostics
+    dict here means every reader failed (both `_convergence` and
+    `_sampler_stats` recorded a `*_warning` instead of a statistic, or
+    `_convergence` ran but matched nothing), and reporting "pass" on the
+    headline field for a run nothing was actually checked on is a false-clean
+    -- the exact failure mode the comments on those two readers argue
+    against. A `*_warning` alongside SOME measured keys is left alone: it
+    already says what was missed, and folding it into `issues` would flip a
+    partially-checked run to "warn" and read as "the model is pathological"
+    when the truth is "one thing could not be checked".
+    """
+    if not any(key in d for key, _ in _VERDICT_CHECKS):
+        return {"verdict": "unknown", "issues": []}
+    issues = [msg for key, check in _VERDICT_CHECKS if key in d and (msg := check(d))]
     return {"verdict": "pass" if not issues else "warn", "issues": issues}
 
 

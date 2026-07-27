@@ -114,13 +114,16 @@ def test_live_method_diagnostics(tmp_path, monkeypatch):
         started = mgr.start_run(BERNOULLI, DATA, method=method, seed=7)
         result = asyncio.run(mgr.await_run(started["run_id"], timeout=120))
         assert result["status"] == "done", f"{method} did not finish"
-        # run_diagnostics must not raise despite no inference.nc, and carry the scalar
+        # run_diagnostics must not raise for a non-sample method, and must carry
+        # the method-specific scalar (these methods never reach the sample-only
+        # convergence/sampler-stats branch, so that's all there is to check).
         diag = diagnostics.run_diagnostics(started["run_id"])
         assert diag["method"] == method
         assert key in diag, f"{method} missing {key}: {diag}"
         # raw draws persisted (these fits have no .runset; must come from live/)
         assert runstore.csv_paths(started["run_id"]), f"{method} lost its CSVs"
-        # summary + draws work via the typed-draws fallback (no inference.nc for these)
+        # summary + draws work via the typed draws layer (the only record for
+        # every method now; none of them ever get an inference.nc)
         summ = diagnostics.run_summary(started["run_id"], params=["theta"])
         assert any(r["param"] == "theta" for r in summ["summary"])
         draws = diagnostics.extract_draws(started["run_id"], "theta")
@@ -377,13 +380,12 @@ def test_live_generate_quantities(tmp_path, monkeypatch):
     assert result_gq["status"] == "done"
     run_id_gq = started_gq["run_id"]
 
-    # Reality as of arviz 1.2 / arviz-base: its from_cmdstanpy converter calls
-    # fit.method_variables(), which cmdstanpy's CmdStanGQ does not implement,
-    # so the arviz conversion in diagnostics.persist_run fails (recorded as
-    # persist_warning) and inference.nc is never written for GQ runs. Output
-    # is still retrievable via the persisted raw CmdStan CSVs
-    # (runstore.csv_paths). If a future arviz version maps CmdStanGQ cleanly,
-    # prefer asserting through run_summary/extract_draws instead.
+    # persist_run no longer does any arviz conversion for any method -- the
+    # draws_schema.json sidecar plus the persisted raw CmdStan CSVs
+    # (runstore.csv_paths) are the only record now, for every draws-producing
+    # method including generate_quantities. extract_draws can still fail here
+    # if the sidecar itself couldn't be written for this GQ run; if so, the raw
+    # CSVs must still be there to fall back on.
     try:
         diagnostics.extract_draws(run_id_gq, "y_sim")
     except errors.RunError:
