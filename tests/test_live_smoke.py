@@ -196,7 +196,12 @@ def test_live_pathologies_localize_funnel_neck(tmp_path, monkeypatch):
     )
     result = asyncio.run(mgr.await_run(started["run_id"], timeout=180))
     assert result["status"] == "done", result["meta"].get("stderr", "")[:500]
-    if diagnostics.run_diagnostics(started["run_id"]).get("divergences", 0) == 0:
+    diag = diagnostics.run_diagnostics(started["run_id"])
+    # E-BFMI is the diagnostic most specific to this geometry: it must be present
+    # (it was silently swallowed for every run) and must flag the funnel.
+    assert diag.get("min_ebfmi") is not None, diag.get("ebfmi_warning")
+    assert diag["min_ebfmi"] < 0.3
+    if diag.get("divergences", 0) == 0:
         pytest.skip("this seed produced no divergences; nothing to localize")
     out = diagnostics.run_pathologies(started["run_id"], permutations=400)
     assert out["ranking"][0]["param"] == "v"

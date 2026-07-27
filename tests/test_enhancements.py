@@ -794,3 +794,27 @@ def test_pathologies_validates_top_k(tmp_path, monkeypatch):
     _write_divergent_run("sample-0001")
     with pytest.raises(errors.ValidationError):
         diagnostics.run_pathologies("sample-0001", top_k=0)
+
+
+def test_ebfmi_is_reported_not_swallowed(tmp_path, monkeypatch):
+    """az.bfmi raises TypeError on an arviz 1.2 DataTree, and a bare `except:
+    pass` turned that into E-BFMI silently absent from every sample run — for the
+    diagnostic most specific to funnel geometry."""
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    import arviz as az
+
+    rng = np.random.default_rng(0)
+    idata = az.from_dict(
+        {
+            "posterior": {"theta": rng.normal(size=(2, 200))},
+            "sample_stats": {
+                "energy": rng.normal(size=(2, 200)),
+                "diverging": np.zeros((2, 200), dtype=bool),
+            },
+        }
+    )
+    runstore.write_meta("sample-0001", {"method": "sample", "status": "done"})
+    idata.to_netcdf(str(runstore.idata_path("sample-0001")))
+    d = diagnostics.run_diagnostics("sample-0001")
+    assert d.get("min_ebfmi") is not None
+    assert "ebfmi_warning" not in d

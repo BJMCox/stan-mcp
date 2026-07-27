@@ -267,13 +267,21 @@ def _sampler_stats(idata, meta) -> dict:
     if accept is not None:
         out["mean_accept_stat"] = round(float(accept.values.mean()), 4)
 
-    if _pick("energy") is not None:
+    energy = _pick("energy")
+    if energy is not None:
+        # Pass the energy DataArray, NOT the whole idata: under arviz 1.2 that is
+        # a DataTree, and az.bfmi(tree) raises TypeError every time — which a bare
+        # `except: pass` here turned into E-BFMI silently missing from every run,
+        # for the diagnostic most specific to funnel geometry (measured on Neal's
+        # funnel: min E-BFMI 0.06 against 1.01 for its non-centered twin).
         try:
-            bfmi = [v for v in (_finite(b) for b in az.bfmi(idata)) if v is not None]
+            bfmi = [v for v in (_finite(b) for b in np.asarray(az.bfmi(energy))) if v is not None]
             if bfmi:
                 out["min_ebfmi"] = round(min(bfmi), 4)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # Surfaced, never swallowed: a diagnostic that quietly returns nothing
+            # reads as "checked and fine".
+            out["ebfmi_warning"] = f"E-BFMI unavailable: {exc}"
     return out
 
 
