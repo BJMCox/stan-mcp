@@ -19,8 +19,9 @@ cxx-compiler = "*"
 make = "*"
 numpy = "*"
 arviz = "*"
+# xarray stays: arviz is built on it. netcdf4 does not -- it was needed only by
+# the to_netcdf/from_netcdf calls the draws sidecar replaced.
 xarray = "*"
-netcdf4 = "*"
 pytest = "*"
 pytest-asyncio = "*"
 ruff = "*"
