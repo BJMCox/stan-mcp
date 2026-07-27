@@ -14,10 +14,14 @@ import errors
 import runstore
 
 
-def _run(tmp_path, monkeypatch, *, files, params, stats, rows_per_chain, draw_row_offset=0):
+def _run(tmp_path, monkeypatch, *, files, params, stats, rows_per_chain, draw_row_offset=None):
     """A run directory with hand-written CSVs and a matching sidecar.
 
     `rows_per_chain` maps a filename to a list of rows (each a list of floats).
+    `draw_row_offset` defaults to None, meaning OMITTED from the sidecar (not
+    written as 0) -- most fixtures here predate that field, so leaving it out
+    by default keeps them exercising `load()`'s `sc.get(..., 0)` fallback
+    rather than a value nobody asked for.
     """
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     rid = "sample-0001"
@@ -29,17 +33,15 @@ def _run(tmp_path, monkeypatch, *, files, params, stats, rows_per_chain, draw_ro
     for name, rows in rows_per_chain.items():
         body = "\n".join(",".join(str(v) for v in r) for r in rows)
         (csvdir / name).write_text(f"# comment\n{header}\n{body}\n")
-    draws.schema_path(rid).write_text(
-        json.dumps(
-            {
-                "schema": draws.SCHEMA_VERSION,
-                "files": files,
-                "params": params,
-                "sampler_stats": stats,
-                "draw_row_offset": draw_row_offset,
-            }
-        )
-    )
+    sidecar = {
+        "schema": draws.SCHEMA_VERSION,
+        "files": files,
+        "params": params,
+        "sampler_stats": stats,
+    }
+    if draw_row_offset is not None:
+        sidecar["draw_row_offset"] = draw_row_offset
+    draws.schema_path(rid).write_text(json.dumps(sidecar))
     return rid
 
 
@@ -105,11 +107,11 @@ def test_draw_row_offset_skips_variational_mean_row(tmp_path, monkeypatch):
     assert d.params["theta"].tolist() == [[1.0, 2.0, 3.0]]
 
 
-def test_draw_row_offset_defaults_to_zero_when_absent(tmp_path, monkeypatch):
-    """A sidecar written before draw_row_offset existed must not silently
-    misread -- but this is enforced by the schema version check, not by
-    load() itself; at the current schema version the field is always present
-    (this only checks .get's default is harmless when it IS present as 0)."""
+def test_draw_row_offset_absent_from_sidecar_reads_every_row(tmp_path, monkeypatch):
+    """load() must not require draw_row_offset to be present -- a real,
+    version-2 sidecar always has it (diagnostics._sidecar_from_fit always sets
+    it), but load()'s own `.get(..., 0)` default is what's under test here, so
+    the field is genuinely OMITTED (not passed as an explicit 0)."""
     rid = _run(
         tmp_path,
         monkeypatch,
@@ -117,8 +119,9 @@ def test_draw_row_offset_defaults_to_zero_when_absent(tmp_path, monkeypatch):
         params={"theta": {"dims": [], "cols": [0]}},
         stats={},
         rows_per_chain={"a.csv": [[1.0], [2.0]]},
-        draw_row_offset=0,
+        # draw_row_offset omitted entirely -- see _run's docstring
     )
+    assert "draw_row_offset" not in json.loads(draws.schema_path(rid).read_text())
     assert draws.load(rid).params["theta"].tolist() == [[1.0, 2.0]]
 
 

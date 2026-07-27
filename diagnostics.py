@@ -73,7 +73,39 @@ def _csv_columns(fit) -> list[str]:
         return list(fit.column_names)
 
 
-def _sidecar_from_fit(fit, method: str) -> dict:
+def _draw_row_offset(method: str, run_id: str) -> int:
+    """How many leading data rows in each of this run's draws CSVs are NOT
+    draws. Checked directly against cmdstanpy's own row assembly for every
+    method that reaches here (cmdstanpy 1.3.0):
+
+    `variational` (`stanfit/vb.py`) splits `draws_np[0]` off as the
+    variational mean and only treats `draws_np[1:]` as the sample. `sample`
+    (`mcmc.py`), `pathfinder` and `laplace` (`pathfinder.py` / `laplace.py`,
+    both via `parse_comments_header_and_draws`) use every data row as a draw,
+    no leading row skipped.
+
+    `generate_quantities` (`gq.py`) usually does too -- EXCEPT when its
+    source run (`method_args.from_run_id`) was `variational`: cmdstanpy's
+    `generate_quantities` re-evaluates the generated-quantities block once
+    per row of the source fit, including a variational source's mean row, so
+    that extra row lands in the GQ run's OWN output CSV too. `gq.py`'s
+    `_draws_start` computes `draw1 = 1` for a `CmdStanVB` previous_fit and
+    applies it to `self._draws[start_idx:, :, :]` -- the GQ run's own
+    assembled draws, not merely a slice of the source's. Resolved via the
+    source run's persisted `method` (`runstore.read_meta`), not
+    `isinstance(fit.previous_fit, CmdStanVB)`, so this does not depend on a
+    cmdstanpy internal that could be renamed.
+    """
+    if method == "variational":
+        return 1
+    if method == "generate_quantities":
+        from_run_id = runstore.read_meta(run_id).get("method_args", {}).get("from_run_id")
+        if from_run_id and runstore.read_meta(from_run_id).get("method") == "variational":
+            return 1
+    return 0
+
+
+def _sidecar_from_fit(fit, method: str, run_id: str) -> dict:
     """The draws sidecar body for a fit: dims and CSV column indices per variable.
 
     `cols` is written in the order that fills the array ROW-MAJOR, because
@@ -83,15 +115,7 @@ def _sidecar_from_fit(fit, method: str) -> dict:
     mislabels rather than raises. Doing the permutation once, here, is what lets
     every reader use a plain reshape with no order= argument.
 
-    `draw_row_offset` records how many leading data rows in each of this run's
-    draws CSVs are NOT draws. Checked directly against cmdstanpy's own row
-    assembly for every method that reaches here (cmdstanpy 1.3.0):
-    `variational` (`stanfit/vb.py`) splits `draws_np[0]` off as the
-    variational mean and only treats `draws_np[1:]` as the sample -- the
-    ONE exception. `sample` (`mcmc.py`), `pathfinder` and `laplace`
-    (`pathfinder.py` / `laplace.py`, both via `parse_comments_header_and_draws`)
-    and `generate_quantities` (`gq.py`) all use every data row as a draw, no
-    leading row skipped.
+    See `_draw_row_offset` for `draw_row_offset`.
     """
     cols = _csv_columns(fit)
     index = {name: i for i, name in enumerate(cols)}
@@ -112,7 +136,7 @@ def _sidecar_from_fit(fit, method: str) -> dict:
         "schema": draws.SCHEMA_VERSION,
         "params": params,
         "sampler_stats": stats,
-        "draw_row_offset": 1 if method == "variational" else 0,
+        "draw_row_offset": _draw_row_offset(method, run_id),
     }
 
 
@@ -192,7 +216,7 @@ def persist_run(run_id: str, method: str, fit) -> None:
     # the live fit's own column names, and it is the only record of chain order and
     # of which CSVs hold draws.
     try:
-        sidecar = _sidecar_from_fit(fit, method)
+        sidecar = _sidecar_from_fit(fit, method, run_id)
         files = _ordered_draws_files(fit, run_id)
         if not files:
             # Can happen if CSV persistence above failed (already recorded as

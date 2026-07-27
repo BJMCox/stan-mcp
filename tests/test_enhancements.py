@@ -1087,7 +1087,7 @@ def test_sidecar_records_cols_in_row_major_fill_order():
             {"raw_header": "lp__,divergent__,theta,m.1.1,m.2.1,m.1.2,m.2.2"}
         )
 
-    sc = diagnostics._sidecar_from_fit(_Fit(), "sample")
+    sc = diagnostics._sidecar_from_fit(_Fit(), "sample", "sample-0001")
     assert sc["schema"] == diagnostics.draws.SCHEMA_VERSION
     assert sc["params"]["theta"] == {"dims": [], "cols": [2]}
     # row-major fill order for (2,2): m[1,1], m[1,2], m[2,1], m[2,2]
@@ -1104,14 +1104,59 @@ def test_sidecar_records_draw_row_offset_one_for_variational_only():
     draw (cmdstanpy stanfit/vb.py: draws_np[0] is the mean, draws_np[1:] the
     sample) -- checked directly against cmdstanpy's row-assembly source for
     every method that reaches persist_run, not assumed from method_diagnostics
-    or other constructor-visible similarities."""
+    or other constructor-visible similarities.
+
+    generate_quantities is excluded from this table on purpose: its offset is
+    NOT a fixed per-method constant (see
+    test_draw_row_offset_for_generate_quantities_depends_on_source_method) --
+    it is 0 unless its source run (method_args.from_run_id) was itself
+    variational, in which case cmdstanpy re-evaluates the generated-quantities
+    block at the source's mean row too, landing that same extra row in the GQ
+    run's own output CSV.
+    """
 
     class _Fit:
         metadata = InferenceMetadata({"raw_header": "lp__,theta"})
 
-    for method in ("sample", "pathfinder", "laplace", "generate_quantities"):
-        assert diagnostics._sidecar_from_fit(_Fit(), method)["draw_row_offset"] == 0
-    assert diagnostics._sidecar_from_fit(_Fit(), "variational")["draw_row_offset"] == 1
+    # run_id is never dereferenced for these methods -- only generate_quantities
+    # looks it up (to resolve its source run's method) -- so any string is fine.
+    for method in ("sample", "pathfinder", "laplace"):
+        assert diagnostics._sidecar_from_fit(_Fit(), method, "irrelevant")["draw_row_offset"] == 0
+    assert (
+        diagnostics._sidecar_from_fit(_Fit(), "variational", "irrelevant")["draw_row_offset"] == 1
+    )
+
+
+def test_draw_row_offset_for_generate_quantities_depends_on_source_method(tmp_path, monkeypatch):
+    """generate_quantities re-evaluates the generated-quantities block once per
+    row of its source run -- including a variational source's mean row
+    (cmdstanpy gq.py: _draws_start computes draw1=1 for a CmdStanVB
+    previous_fit and applies it to the GQ run's OWN assembled draws, not just
+    a slice of the source's) -- so a GQ run built from_run_id from a
+    variational run inherits offset 1 in its own CSV; from any other method,
+    offset 0. Resolved via the source run's persisted method, not
+    isinstance(fit.previous_fit, CmdStanVB)."""
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    runstore.write_meta("sample-0001", {"method": "sample", "status": "done"})
+    runstore.write_meta("variational-0001", {"method": "variational", "status": "done"})
+    runstore.write_meta(
+        "generate_quantities-0001",
+        {
+            "method": "generate_quantities",
+            "status": "done",
+            "method_args": {"from_run_id": "sample-0001"},
+        },
+    )
+    runstore.write_meta(
+        "generate_quantities-0002",
+        {
+            "method": "generate_quantities",
+            "status": "done",
+            "method_args": {"from_run_id": "variational-0001"},
+        },
+    )
+    assert diagnostics._draw_row_offset("generate_quantities", "generate_quantities-0001") == 0
+    assert diagnostics._draw_row_offset("generate_quantities", "generate_quantities-0002") == 1
 
 
 def test_csv_columns_falls_back_to_column_names_without_cmdstan_config():
@@ -1234,7 +1279,7 @@ def test_persist_run_fails_the_run_when_sidecar_write_fails(tmp_path, monkeypatc
     live = runstore.live_dir(rid, create=True)
     (live / "model_1.csv").write_text("# c\nlp__,theta\n-1,0.5\n")
 
-    def boom(fit, method):
+    def boom(fit, method, run_id):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(diagnostics, "_sidecar_from_fit", boom)
@@ -1248,7 +1293,12 @@ def test_persist_run_fails_the_run_when_sidecar_write_fails(tmp_path, monkeypatc
     # the CSVs must survive the failure -- they're still worth keeping
     assert runstore.csv_paths(rid) == [str(runstore.run_dir(rid) / "csv" / "model_1.csv")]
     meta = runstore.read_meta(rid)
-    assert "boom" in meta["persist_warning"]
+    # exact suffix, not `in`: a TypeError from a signature mismatch also
+    # contains the function's own name ("boom() takes ... arguments") and
+    # would satisfy an `in` check just as well, which is exactly how this
+    # test went vacuous once already (a prior round's boom(fit) took a
+    # TypeError for the intended RuntimeError without anyone noticing).
+    assert meta["persist_warning"] == "draws schema not written: boom"
 
 
 def test_persist_run_fails_when_no_draws_csvs_are_persisted(tmp_path, monkeypatch):
@@ -1293,3 +1343,35 @@ def test_persist_run_writes_variational_sidecar_excluding_mean_row(tmp_path, mon
     d = diagnostics.draws.load(rid)
     assert d.n_draw == 2
     assert d.params["theta"].tolist() == [[0.5, 0.7]]
+
+
+def test_persist_run_gq_from_variational_excludes_leading_row(tmp_path, monkeypatch):
+    """A generate_quantities run whose from_run_id names a variational run
+    inherits that run's leading mean-evaluation row in its OWN output CSV
+    (cmdstanpy gq.py's _draws_start/_assemble_generated_quantities), so its
+    sidecar must record draw_row_offset=1 too -- not the 0 that would be
+    right for a GQ run built from any other method."""
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    runstore.write_meta("variational-0001", {"method": "variational", "status": "done"})
+    rid = "generate_quantities-0001"
+    runstore.write_meta(
+        rid,
+        {
+            "method": "generate_quantities",
+            "status": "done",
+            "method_args": {"from_run_id": "variational-0001"},
+        },
+    )
+    live = runstore.live_dir(rid, create=True)
+    # row 0 is GQ evaluated at the variational source's mean (999.0 sentinel)
+    (live / "model.csv").write_text("# c\nlog_lik\n999.0\n0.1\n0.2\n")
+
+    class _Fit:
+        metadata = InferenceMetadata({"raw_header": "log_lik"})
+
+    diagnostics.persist_run(rid, "generate_quantities", _Fit())
+    sc = json.loads(diagnostics.draws.schema_path(rid).read_text())
+    assert sc["draw_row_offset"] == 1
+    d = diagnostics.draws.load(rid)
+    assert d.n_draw == 2
+    assert d.params["log_lik"].tolist() == [[0.1, 0.2]]
