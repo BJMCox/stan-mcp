@@ -149,15 +149,20 @@ def test_prune_refuses_keep_zero(tmp_path, monkeypatch):
 
 
 # --- diagnostics: extract_draws reads the typed draws layer ---
-def _typed_run(tmp_path, monkeypatch, method="sample"):
-    """A run with a sidecar: one scalar and one length-2 vector, 2 chains x 2 draws."""
+def _typed_run(tmp_path, monkeypatch, method="sample", ragged=False):
+    """A run with a sidecar: one scalar and one length-2 vector, 2 chains x 2 draws.
+
+    ragged=True drops chain b's second draw -- 2 draws vs 1, the shape a
+    cancelled run leaves behind -- so `Draws.truncated_to` is set.
+    """
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     rid = f"{method}-0001"
     runstore.write_meta(rid, {"method": method, "status": "done"})
     csvdir = runstore.run_dir(rid, create=True) / "csv"
     csvdir.mkdir(parents=True, exist_ok=True)
     (csvdir / "a.csv").write_text("# c\nlp__,theta,z.1,z.2\n-1,0.1,10,20\n-2,0.2,11,21\n")
-    (csvdir / "b.csv").write_text("# c\nlp__,theta,z.1,z.2\n-3,0.3,12,22\n-4,0.4,13,23\n")
+    b_body = "-3,0.3,12,22\n" if ragged else "-3,0.3,12,22\n-4,0.4,13,23\n"
+    (csvdir / "b.csv").write_text(f"# c\nlp__,theta,z.1,z.2\n{b_body}")
     diagnostics.draws.schema_path(rid).write_text(
         json.dumps(
             {
@@ -838,6 +843,23 @@ def test_run_summary_for_variational_never_calls_stansummary(tmp_path, monkeypat
     assert rows["theta"]["n"] == 4
     # not MCMC chains, so no convergence statistics are invented
     assert "r_hat" not in rows["theta"] and "ess_bulk" not in rows["theta"]
+
+
+def test_run_summary_surfaces_ragged_chain_truncation(tmp_path, monkeypatch):
+    """A cancelled run leaves chains of unequal length. `_summary_from_draws`
+    must surface that truncation rather than silently reporting statistics
+    over the shortened array with no sign anything was dropped."""
+    rid = _typed_run(tmp_path, monkeypatch, method="variational", ragged=True)
+    out = diagnostics.run_summary(rid)
+    assert out["chains_truncated_to"] == 1
+
+
+def test_run_summary_omits_chains_truncated_to_when_chains_are_even(tmp_path, monkeypatch):
+    """Paired negative: a key that is always present would pass the test above
+    while being wrong."""
+    rid = _typed_run(tmp_path, monkeypatch, method="variational")
+    out = diagnostics.run_summary(rid)
+    assert "chains_truncated_to" not in out
 
 
 # The ceiling bounds what the WHOLE call returns. Capping per chain per
