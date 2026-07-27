@@ -46,7 +46,11 @@ def _to_float(raw: str) -> float:
 
 def parse(text: str) -> dict[str, dict[str, float]]:
     """`{cmdstan_name: {column: value}}` from stansummary's --csv_filename output."""
-    lines = [ln for ln in text.splitlines() if ln.strip()]
+    # stansummary appends trailing `#`-prefixed commentary after the data (model
+    # name, warmup/sampling timing, a glossary of the column meanings) — legitimate
+    # non-data lines, not malformed rows. Stan identifiers can't start with `#`, so
+    # this filter never hides a real parameter.
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
     if not lines:
         raise RunError(
             "stansummary produced an empty summary; it leaves a 0-byte CSV behind when it fails"
@@ -55,12 +59,25 @@ def parse(text: str) -> dict[str, dict[str, float]]:
     out: dict[str, dict[str, float]] = {}
     for ln in lines[1:]:
         parts = ln.split(",")
-        if len(parts) != len(header):
-            continue
         # Stan identifiers cannot contain a comma, so splitting on it is safe;
         # stansummary quotes the name column.
         name = parts[0].strip().strip('"')
+        if len(parts) != len(header):
+            # A column-count mismatch means the output is malformed. We must not
+            # guess which parameter went missing by silently dropping the row —
+            # that would return a summary with one parameter quietly absent and
+            # zero signal that it happened.
+            raise RunError(
+                f"stansummary row {name!r} has {len(parts)} columns, expected "
+                f"{len(header)} (matching the header); malformed output cannot "
+                "be safely parsed"
+            )
         out[name] = {k: _to_float(v) for k, v in zip(header[1:], parts[1:], strict=True)}
+    if not out:
+        # A header with no data rows is the same "invisible damage" as the
+        # 0-byte-CSV case above, reached through a second path: don't let it
+        # parse as a model with zero parameters.
+        raise RunError("stansummary produced a header but no parameter rows")
     return out
 
 

@@ -42,6 +42,44 @@ def test_parse_rejects_empty_output():
         stansummary.parse("")
 
 
+def test_parse_rejects_header_only_output():
+    """A header with zero data rows is the same invisible-damage failure as the
+    0-byte-CSV case, reached through a second, unguarded path: it must not
+    silently parse as a model with no parameters."""
+    with pytest.raises(errors.RunError, match="no parameter rows"):
+        stansummary.parse("name,Mean,ESS_bulk,R_hat\n")
+
+
+def test_parse_rejects_row_with_too_few_columns():
+    """A dropped column must raise, not vanish silently — the message names
+    the offending row."""
+    text = 'name,Mean,ESS_bulk,R_hat\n"theta",1.5,10\n'
+    with pytest.raises(errors.RunError, match="theta"):
+        stansummary.parse(text)
+
+
+def test_parse_rejects_row_with_too_many_columns():
+    text = 'name,Mean,ESS_bulk,R_hat\n"theta",1.5,10,1.0,999\n'
+    with pytest.raises(errors.RunError, match="theta"):
+        stansummary.parse(text)
+
+
+def test_parse_ignores_trailing_comment_lines():
+    """The real binary appends `#`-prefixed commentary (model name, timing,
+    a column-meaning glossary) after the data rows. These are not malformed
+    rows and must not raise — only genuine column-count mismatches should."""
+    text = (
+        "name,Mean,ESS_bulk,R_hat\n"
+        '"theta",1.5,10,1.0\n'
+        "# Inference for Stan model: _9531cf59c37e1977_model\n"
+        "# 2 chains: each with iter=300; warmup=300; thin=1; 300 iterations saved.\n"
+        "# \n"
+        "# Samples were drawn using hmc with nuts.\n"
+    )
+    got = stansummary.parse(text)
+    assert got == {"theta": {"Mean": 1.5, "ESS_bulk": 10.0, "R_hat": 1.0}}
+
+
 def test_summarize_requires_csvs():
     with pytest.raises(errors.RunError, match="at least one"):
         stansummary.summarize([])
