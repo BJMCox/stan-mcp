@@ -14,7 +14,7 @@ import errors
 import runstore
 
 
-def _run(tmp_path, monkeypatch, *, files, params, stats, rows_per_chain):
+def _run(tmp_path, monkeypatch, *, files, params, stats, rows_per_chain, draw_row_offset=0):
     """A run directory with hand-written CSVs and a matching sidecar.
 
     `rows_per_chain` maps a filename to a list of rows (each a list of floats).
@@ -30,7 +30,15 @@ def _run(tmp_path, monkeypatch, *, files, params, stats, rows_per_chain):
         body = "\n".join(",".join(str(v) for v in r) for r in rows)
         (csvdir / name).write_text(f"# comment\n{header}\n{body}\n")
     draws.schema_path(rid).write_text(
-        json.dumps({"schema": 1, "files": files, "params": params, "sampler_stats": stats})
+        json.dumps(
+            {
+                "schema": draws.SCHEMA_VERSION,
+                "files": files,
+                "params": params,
+                "sampler_stats": stats,
+                "draw_row_offset": draw_row_offset,
+            }
+        )
     )
     return rid
 
@@ -76,6 +84,42 @@ def test_row_major_cols_place_matrix_elements_correctly(tmp_path, monkeypatch):
     m = draws.load(rid).params["m"]
     assert m.shape == (1, 1, 2, 2)
     assert m[0, 0].tolist() == [[11.0, 12.0], [21.0, 22.0]]
+
+
+def test_draw_row_offset_skips_variational_mean_row(tmp_path, monkeypatch):
+    """variational's first data row is cmdstanpy's own mean-field mean
+    (stanfit/vb.py: draws_np[0]), not a draw. draw_row_offset records how many
+    leading rows to skip so it is never counted as one."""
+    rid = _run(
+        tmp_path,
+        monkeypatch,
+        files=["a.csv"],
+        params={"theta": {"dims": [], "cols": [0]}},
+        stats={},
+        # row 0 is the mean (999.0, a sentinel far from the real draws below)
+        rows_per_chain={"a.csv": [[999.0], [1.0], [2.0], [3.0]]},
+        draw_row_offset=1,
+    )
+    d = draws.load(rid)
+    assert d.n_draw == 3
+    assert d.params["theta"].tolist() == [[1.0, 2.0, 3.0]]
+
+
+def test_draw_row_offset_defaults_to_zero_when_absent(tmp_path, monkeypatch):
+    """A sidecar written before draw_row_offset existed must not silently
+    misread -- but this is enforced by the schema version check, not by
+    load() itself; at the current schema version the field is always present
+    (this only checks .get's default is harmless when it IS present as 0)."""
+    rid = _run(
+        tmp_path,
+        monkeypatch,
+        files=["a.csv"],
+        params={"theta": {"dims": [], "cols": [0]}},
+        stats={},
+        rows_per_chain={"a.csv": [[1.0], [2.0]]},
+        draw_row_offset=0,
+    )
+    assert draws.load(rid).params["theta"].tolist() == [[1.0, 2.0]]
 
 
 def test_ragged_chains_truncate_to_shortest_and_say_so(tmp_path, monkeypatch):

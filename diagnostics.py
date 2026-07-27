@@ -73,7 +73,7 @@ def _csv_columns(fit) -> list[str]:
         return list(fit.column_names)
 
 
-def _sidecar_from_fit(fit) -> dict:
+def _sidecar_from_fit(fit, method: str) -> dict:
     """The draws sidecar body for a fit: dims and CSV column indices per variable.
 
     `cols` is written in the order that fills the array ROW-MAJOR, because
@@ -82,6 +82,16 @@ def _sidecar_from_fit(fit) -> dict:
     reshaping plainly puts `m.2.1`'s values into `m[1,2]` — a silent transpose that
     mislabels rather than raises. Doing the permutation once, here, is what lets
     every reader use a plain reshape with no order= argument.
+
+    `draw_row_offset` records how many leading data rows in each of this run's
+    draws CSVs are NOT draws. Checked directly against cmdstanpy's own row
+    assembly for every method that reaches here (cmdstanpy 1.3.0):
+    `variational` (`stanfit/vb.py`) splits `draws_np[0]` off as the
+    variational mean and only treats `draws_np[1:]` as the sample -- the
+    ONE exception. `sample` (`mcmc.py`), `pathfinder` and `laplace`
+    (`pathfinder.py` / `laplace.py`, both via `parse_comments_header_and_draws`)
+    and `generate_quantities` (`gq.py`) all use every data row as a draw, no
+    leading row skipped.
     """
     cols = _csv_columns(fit)
     index = {name: i for i, name in enumerate(cols)}
@@ -98,7 +108,12 @@ def _sidecar_from_fit(fit) -> dict:
         params[name] = {"dims": list(shape), "cols": ordered}
 
     stats = {name: {"dims": [], "cols": [i]} for i, name in enumerate(cols) if name.endswith("__")}
-    return {"schema": draws.SCHEMA_VERSION, "params": params, "sampler_stats": stats}
+    return {
+        "schema": draws.SCHEMA_VERSION,
+        "params": params,
+        "sampler_stats": stats,
+        "draw_row_offset": 1 if method == "variational" else 0,
+    }
 
 
 def _is_draws_csv(name: str) -> bool:
@@ -177,8 +192,17 @@ def persist_run(run_id: str, method: str, fit) -> None:
     # the live fit's own column names, and it is the only record of chain order and
     # of which CSVs hold draws.
     try:
-        sidecar = _sidecar_from_fit(fit)
-        sidecar["files"] = _ordered_draws_files(fit, run_id)
+        sidecar = _sidecar_from_fit(fit, method)
+        files = _ordered_draws_files(fit, run_id)
+        if not files:
+            # Can happen if CSV persistence above failed (already recorded as
+            # csv_warning) or found nothing to copy. A sidecar with files: []
+            # would still write "successfully" and leave status="done" for a
+            # run draws.load can never open (min([]) on an empty file list)
+            # -- exactly the unqualified-success failure mode this whole
+            # try/except exists to prevent.
+            raise RunError(f"run {run_id!r} has no persisted draws CSVs to record in the sidecar")
+        sidecar["files"] = files
         draws.schema_path(run_id).write_text(json.dumps(sidecar, indent=2))
     except Exception as exc:  # noqa: BLE001
         meta = runstore.read_meta(run_id)

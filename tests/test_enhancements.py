@@ -1087,7 +1087,7 @@ def test_sidecar_records_cols_in_row_major_fill_order():
             {"raw_header": "lp__,divergent__,theta,m.1.1,m.2.1,m.1.2,m.2.2"}
         )
 
-    sc = diagnostics._sidecar_from_fit(_Fit())
+    sc = diagnostics._sidecar_from_fit(_Fit(), "sample")
     assert sc["schema"] == diagnostics.draws.SCHEMA_VERSION
     assert sc["params"]["theta"] == {"dims": [], "cols": [2]}
     # row-major fill order for (2,2): m[1,1], m[1,2], m[2,1], m[2,2]
@@ -1096,6 +1096,22 @@ def test_sidecar_records_cols_in_row_major_fill_order():
     assert sc["sampler_stats"]["lp__"] == {"dims": [], "cols": [0]}
     assert sc["sampler_stats"]["divergent__"] == {"dims": [], "cols": [1]}
     assert "theta" not in sc["sampler_stats"]
+    assert sc["draw_row_offset"] == 0
+
+
+def test_sidecar_records_draw_row_offset_one_for_variational_only():
+    """variational's first data row is cmdstanpy's own mean-field mean, not a
+    draw (cmdstanpy stanfit/vb.py: draws_np[0] is the mean, draws_np[1:] the
+    sample) -- checked directly against cmdstanpy's row-assembly source for
+    every method that reaches persist_run, not assumed from method_diagnostics
+    or other constructor-visible similarities."""
+
+    class _Fit:
+        metadata = InferenceMetadata({"raw_header": "lp__,theta"})
+
+    for method in ("sample", "pathfinder", "laplace", "generate_quantities"):
+        assert diagnostics._sidecar_from_fit(_Fit(), method)["draw_row_offset"] == 0
+    assert diagnostics._sidecar_from_fit(_Fit(), "variational")["draw_row_offset"] == 1
 
 
 def test_csv_columns_falls_back_to_column_names_without_cmdstan_config():
@@ -1218,7 +1234,7 @@ def test_persist_run_fails_the_run_when_sidecar_write_fails(tmp_path, monkeypatc
     live = runstore.live_dir(rid, create=True)
     (live / "model_1.csv").write_text("# c\nlp__,theta\n-1,0.5\n")
 
-    def boom(fit):
+    def boom(fit, method):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(diagnostics, "_sidecar_from_fit", boom)
@@ -1233,3 +1249,47 @@ def test_persist_run_fails_the_run_when_sidecar_write_fails(tmp_path, monkeypatc
     assert runstore.csv_paths(rid) == [str(runstore.run_dir(rid) / "csv" / "model_1.csv")]
     meta = runstore.read_meta(rid)
     assert "boom" in meta["persist_warning"]
+
+
+def test_persist_run_fails_when_no_draws_csvs_are_persisted(tmp_path, monkeypatch):
+    """If CSV persistence produced nothing at all (e.g. its own csv_warning
+    already fired, or the run's live/ never had any files), the sidecar must
+    not write "successfully" with files: [] -- draws.load would hit min([])
+    on an empty CSV list and die with a bare ValueError, not a RunError
+    naming the run."""
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    rid = "sample-0001"
+    runstore.write_meta(rid, {"method": "sample", "status": "done"})
+    # no live/ dir at all -> the CSV-persist step copies nothing, csv/ stays empty
+
+    class _Fit:
+        metadata = InferenceMetadata({"raw_header": "lp__,theta"})
+
+    with pytest.raises(errors.RunError, match="no persisted draws CSVs"):
+        diagnostics.persist_run(rid, "sample", _Fit())
+
+    meta = runstore.read_meta(rid)
+    assert "persist_warning" in meta
+
+
+def test_persist_run_writes_variational_sidecar_excluding_mean_row(tmp_path, monkeypatch):
+    """End-to-end through persist_run/draws.load: variational's first CSV data
+    row is cmdstanpy's own mean-field mean (stanfit/vb.py: draws_np[0]), not a
+    draw. Verifies draw_row_offset is both written by persist_run AND honoured
+    by draws.load, rather than each layer's unit test alone."""
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    rid = "variational-0001"
+    runstore.write_meta(rid, {"method": "variational", "status": "done"})
+    live = runstore.live_dir(rid, create=True)
+    # row 0 is cmdstanpy's variational mean (999.0 sentinel); rows 1.. are draws
+    (live / "model.csv").write_text("# c\nlp__,theta\n0,999.0\n-1,0.5\n-1,0.7\n")
+
+    class _Fit:
+        metadata = InferenceMetadata({"raw_header": "lp__,theta"})
+
+    diagnostics.persist_run(rid, "variational", _Fit())
+    sc = json.loads(diagnostics.draws.schema_path(rid).read_text())
+    assert sc["draw_row_offset"] == 1
+    d = diagnostics.draws.load(rid)
+    assert d.n_draw == 2
+    assert d.params["theta"].tolist() == [[0.5, 0.7]]

@@ -26,7 +26,7 @@ import numpy as np
 import runstore
 from errors import RunError
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -96,13 +96,27 @@ def _read_csv(path: Path) -> np.ndarray:
 
 def load(run_id: str) -> Draws:
     sc = schema(run_id)
+    # variational's first data row is cmdstanpy's own mean-field mean, not a
+    # draw (cmdstanpy stanfit/vb.py: draws_np[0] is the mean, draws_np[1:] the
+    # sample) -- every other method's rows are all draws, so this is 0 for
+    # them. Recorded at persist time (diagnostics._sidecar_from_fit) since
+    # this reader must stay method-agnostic.
+    offset = sc.get("draw_row_offset", 0)
     csvdir = runstore.run_dir(run_id) / "csv"
     per_chain = []
     for name in sc["files"]:
         p = csvdir / name
         if not p.exists():
             raise RunError(f"run {run_id!r} is missing its draws CSV {name!r}")
-        per_chain.append(_read_csv(p))
+        rows = _read_csv(p)
+        if offset:
+            rows = rows[offset:]
+            if rows.shape[0] == 0:
+                raise RunError(
+                    f"run {run_id!r}'s draws CSV {name!r} has no draws left after "
+                    f"skipping its leading {offset} summary row(s)"
+                )
+        per_chain.append(rows)
 
     lengths = [a.shape[0] for a in per_chain]
     n_draw = min(lengths)
