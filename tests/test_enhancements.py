@@ -1,5 +1,7 @@
 """Tests for the post-review enhancements (handles, repro, diagnostics, cancel)."""
 
+import json
+
 import numpy as np
 import pytest
 
@@ -1062,3 +1064,58 @@ def test_sample_defaults_to_round_tripping_output_precision():
     seen.clear()
     mgr._runner("sample", _Model(), {}, {"chains": 2, "sig_figs": 8})
     assert seen["sig_figs"] == 8
+
+
+def test_sidecar_records_cols_in_row_major_fill_order():
+    """CmdStan's CSV header is column-major and numpy.reshape is row-major, so the
+    sidecar must record the permutation. Recording the contiguous run instead
+    transposes silently: L.2.1's values land in L[1,2]."""
+
+    class _Var:
+        def __init__(self, dims):
+            self.dimensions = dims
+
+    class _Meta:
+        stan_vars = {"theta": _Var(()), "m": _Var((2, 2))}
+
+    class _Fit:
+        metadata = _Meta()
+        # CmdStan order: first index varies fastest
+        column_names = ("lp__", "divergent__", "theta", "m.1.1", "m.2.1", "m.1.2", "m.2.2")
+
+    sc = diagnostics._sidecar_from_fit(_Fit())
+    assert sc["schema"] == diagnostics.draws.SCHEMA_VERSION
+    assert sc["params"]["theta"] == {"dims": [], "cols": [2]}
+    # row-major fill order for (2,2): m[1,1], m[1,2], m[2,1], m[2,2]
+    #                          cols:      3        5        4        6
+    assert sc["params"]["m"] == {"dims": [2, 2], "cols": [3, 5, 4, 6]}
+    assert sc["sampler_stats"]["lp__"] == {"dims": [], "cols": [0]}
+    assert sc["sampler_stats"]["divergent__"] == {"dims": [], "cols": [1]}
+    assert "theta" not in sc["sampler_stats"]
+
+
+def test_persist_run_writes_a_sidecar_and_no_netcdf(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    rid = "sample-0001"
+    runstore.write_meta(rid, {"method": "sample", "status": "done"})
+    live = runstore.live_dir(rid, create=True)
+    (live / "chain_1.csv").write_text("# c\nlp__,divergent__,theta\n-1,0,0.5\n")
+
+    class _Var:
+        dimensions = ()
+
+    class _Meta:
+        stan_vars = {"theta": _Var()}
+
+    class _Fit:
+        metadata = _Meta()
+        column_names = ("lp__", "divergent__", "theta")
+
+    diagnostics.persist_run(rid, "sample", _Fit())
+    sc = json.loads(diagnostics.draws.schema_path(rid).read_text())
+    assert sc["files"] == ["chain_1.csv"]
+    assert sc["params"]["theta"]["cols"] == [2]
+    assert not runstore.idata_path(rid).exists()
+    # and the typed layer can read what was just written
+    d = diagnostics.draws.load(rid)
+    assert d.params["theta"].tolist() == [[0.5]]

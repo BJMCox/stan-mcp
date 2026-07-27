@@ -4,9 +4,10 @@ persist_run: after a run finishes, convert its fit to persistent storage —
 optimize writes an estimate.json (optimized_params_dict); draws-producing
 methods first persist the raw CmdStan CSVs (source of truth; enables
 generate_quantities reuse via runstore.csv_paths), best-effort and
-independent of arviz, then convert via arviz.from_cmdstanpy to inference.nc,
-recording a persist_warning in meta.json if the conversion fails (a
-csv_warning is recorded separately if CSV persistence itself fails).
+independent of the sidecar, then write a draws_schema.json sidecar (dims and
+row-major CSV column indices per variable, from the fit's own column names),
+recording a persist_warning in meta.json if that write fails (a csv_warning
+is recorded separately if CSV persistence itself fails).
 run_summary: draws-producing methods -> arviz summary (mean, sd, HDI,
 bulk/tail ESS, R-hat) over inference.nc; optimize -> the stored estimate.
 run_diagnostics: optimize -> lp__ from the estimate; draws-producing methods ->
@@ -18,10 +19,13 @@ extract_draws: flattened draws for one parameter from inference.nc (draws-
 producing methods only; not available for optimize).
 """
 
+import json
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+import draws
 import runstore
 from errors import RunError, ValidationError
 
@@ -46,6 +50,52 @@ def _method_diagnostics(method: str, fit) -> dict:
         # versions. Returning {} on failure left the method with no diagnostics
         # at all and no sign that anything was meant to be there.
         return {"method_diagnostics_warning": f"{method} diagnostics unavailable: {exc}"}
+
+
+def _csv_columns(fit) -> list[str]:
+    """The fit's CSV column names in CmdStan's own dot notation (`m.1.1`).
+
+    NOT `fit.column_names`: cmdstanpy documents that property as "names munged
+    to array notation, e.g. `beta[1]` not `beta.1`" (confirmed live: a matrix
+    parameter comes back as `m[1,1]`, `m[2,1]`, ...), which cannot be looked up
+    against the `name + "." + ".".join(idx)` strings `draws.element_labels`
+    builds — every non-scalar variable would KeyError and lose its sidecar
+    entirely. `metadata.cmdstan_config["raw_header"]` is cmdstanpy's own
+    unmunged copy of the CSV header row it parsed, so it always matches.
+    Falls back to `column_names` for fakes/mocks that only set that attribute.
+    """
+    try:
+        return fit.metadata.cmdstan_config["raw_header"].split(",")
+    except (AttributeError, KeyError, TypeError):
+        return list(fit.column_names)
+
+
+def _sidecar_from_fit(fit) -> dict:
+    """The draws sidecar body for a fit: dims and CSV column indices per variable.
+
+    `cols` is written in the order that fills the array ROW-MAJOR, because
+    numpy.reshape is row-major while CmdStan's CSV header is column-major
+    (`m.1.1, m.2.1, m.1.2, ...`). Recording the contiguous column run instead and
+    reshaping plainly puts `m.2.1`'s values into `m[1,2]` — a silent transpose that
+    mislabels rather than raises. Doing the permutation once, here, is what lets
+    every reader use a plain reshape with no order= argument.
+    """
+    cols = _csv_columns(fit)
+    index = {name: i for i, name in enumerate(cols)}
+    dims = {name: tuple(v.dimensions) for name, v in fit.metadata.stan_vars.items()}
+
+    params: dict[str, dict] = {}
+    for name, shape in dims.items():
+        if not shape:
+            params[name] = {"dims": [], "cols": [index[name]]}
+            continue
+        ordered = []
+        for _, cmdstan_name in draws.element_labels(name, shape):
+            ordered.append(index[cmdstan_name])
+        params[name] = {"dims": list(shape), "cols": ordered}
+
+    stats = {name: {"dims": [], "cols": [i]} for i, name in enumerate(cols) if name.endswith("__")}
+    return {"schema": draws.SCHEMA_VERSION, "params": params, "sampler_stats": stats}
 
 
 def persist_run(run_id: str, method: str, fit) -> None:
@@ -73,14 +123,17 @@ def persist_run(run_id: str, method: str, fit) -> None:
         meta["method_diagnostics"] = md
         runstore.write_meta(run_id, meta)
 
-    import arviz as az
-
+    # The draws sidecar replaces inference.nc: it covers all six methods (arviz's
+    # from_cmdstanpy raises on variational/pathfinder/laplace), it is written from
+    # the live fit's own column names, and it is the only record of chain order and
+    # of which CSVs hold draws.
     try:
-        idata = az.from_cmdstanpy(fit)
-        idata.to_netcdf(str(runstore.idata_path(run_id)))
-    except Exception as exc:  # non-sample methods may not map cleanly
+        sidecar = _sidecar_from_fit(fit)
+        sidecar["files"] = [Path(p).name for p in runstore.csv_paths(run_id)]
+        draws.schema_path(run_id).write_text(json.dumps(sidecar, indent=2))
+    except Exception as exc:  # noqa: BLE001
         meta = runstore.read_meta(run_id)
-        meta["persist_warning"] = f"arviz conversion failed: {exc}"
+        meta["persist_warning"] = f"draws schema not written: {exc}"
         runstore.write_meta(run_id, meta)
 
     # Last, once nothing else needs to read the fit's CSVs: drop live/. csv/ is
