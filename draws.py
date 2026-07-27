@@ -35,8 +35,13 @@ class Draws:
 
     The approximate methods have no chain structure and come back with one chain,
     rather than a special case for every caller to remember.
+
+    Carries its own `run_id` so a helper handed only a `Draws` can still name the
+    run in an error. Without it `matrix` was the one failure in this module whose
+    message identified nothing.
     """
 
+    run_id: str
     params: dict[str, np.ndarray]
     sampler_stats: dict[str, np.ndarray]
     n_chain: int
@@ -53,6 +58,12 @@ def schema(run_id: str) -> dict:
 
     Separate from `load` so a summary sourced from stansummary can get names and
     dims without parsing megabytes of CSV that stansummary has already read.
+
+    Validated means: present, JSON-parseable, the version this build reads, and
+    carrying every key its readers then index WITHOUT a `.get` — `files`, `params`
+    and `sampler_stats`, each of the latter two's specs with `dims` and `cols`.
+    Checking only the version left a malformed sidecar to raise a bare `KeyError`
+    from inside `load` or `csv_files`, naming a dict key rather than the run.
     """
     p = schema_path(run_id)
     if not p.exists():
@@ -64,12 +75,35 @@ def schema(run_id: str) -> dict:
         sc = json.loads(p.read_text())
     except json.JSONDecodeError as exc:
         raise RunError(f"run {run_id!r} has an unreadable draws_schema.json: {exc}") from exc
+    if not isinstance(sc, dict):
+        raise RunError(
+            f"run {run_id!r} has a draws_schema.json holding {type(sc).__name__}, "
+            "not an object — re-run the model"
+        )
     got = sc.get("schema")
     if got != SCHEMA_VERSION:
         raise RunError(
             f"run {run_id!r} has draws_schema version {got!r}, but this build reads "
             f"version {SCHEMA_VERSION} — re-run the model"
         )
+    for key, kind in (("files", list), ("params", dict), ("sampler_stats", dict)):
+        if key not in sc:
+            raise RunError(
+                f"run {run_id!r} has a malformed draws_schema.json: no {key!r} — re-run the model"
+            )
+        if not isinstance(sc[key], kind):
+            raise RunError(
+                f"run {run_id!r} has a malformed draws_schema.json: {key!r} is a "
+                f"{type(sc[key]).__name__}, expected a {kind.__name__} — re-run the model"
+            )
+    for group in ("params", "sampler_stats"):
+        for name, spec in sc[group].items():
+            missing = [k for k in ("dims", "cols") if not isinstance(spec, dict) or k not in spec]
+            if missing:
+                raise RunError(
+                    f"run {run_id!r} has a malformed draws_schema.json: entry "
+                    f"{group}.{name} is missing {', '.join(missing)} — re-run the model"
+                )
     return sc
 
 
@@ -151,6 +185,7 @@ def load(run_id: str) -> Draws:
         return out
 
     return Draws(
+        run_id=run_id,
         params=build("params"),
         sampler_stats=build("sampler_stats"),
         n_chain=arr.shape[0],
@@ -197,5 +232,5 @@ def matrix(d: Draws) -> tuple[np.ndarray, list[str]]:
             cols.append(values.reshape(-1))
             names.append(label)
     if not cols:
-        raise RunError("run has no parameters to build a draw matrix from")
+        raise RunError(f"run {d.run_id!r} has no parameters to build a draw matrix from")
     return np.column_stack(cols), names

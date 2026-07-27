@@ -379,6 +379,7 @@ def test_sampler_stats_reads_typed_arrays_and_reports_ebfmi():
     computed from energy__ -- fed a clean array rather than a DataTree."""
     rng = np.random.default_rng(0)
     d = diagnostics.draws.Draws(
+        run_id="sample-0001",
         params={},
         sampler_stats={
             "divergent__": np.array([[0.0, 1.0], [1.0, 0.0]]),
@@ -1448,6 +1449,7 @@ def test_sampler_stats_reports_ebfmi_warning_when_bfmi_raises(monkeypatch):
 
     monkeypatch.setattr(az, "bfmi", _boom)
     d = diagnostics.draws.Draws(
+        run_id="sample-0001",
         params={},
         sampler_stats={"energy__": np.zeros((2, 50))},
         n_chain=2,

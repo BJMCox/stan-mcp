@@ -176,6 +176,54 @@ def test_stale_sidecar_referencing_a_missing_column_raises(tmp_path, monkeypatch
         draws.load(rid)
 
 
+def test_malformed_sidecar_names_the_missing_key_and_the_run(tmp_path, monkeypatch):
+    """`schema()` promises a VALIDATED sidecar. Checking only the version left a
+    sidecar missing `files`/`params`/`sampler_stats`, or a spec missing
+    `cols`/`dims`, to raise a bare KeyError from inside `load` — naming a dict key
+    rather than the run, and not a RunError at all."""
+    rid = _run(
+        tmp_path,
+        monkeypatch,
+        files=["a.csv"],
+        params={"theta": {"dims": [], "cols": [0]}},
+        stats={},
+        rows_per_chain={"a.csv": [[1.0]]},
+    )
+    good = json.loads(draws.schema_path(rid).read_text())
+
+    for key in ("files", "params", "sampler_stats"):
+        draws.schema_path(rid).write_text(json.dumps({k: v for k, v in good.items() if k != key}))
+        with pytest.raises(errors.RunError, match=rf"no '{key}'"):
+            draws.load(rid)
+
+    # a spec missing `cols` is the same class of gap, one level down
+    draws.schema_path(rid).write_text(json.dumps({**good, "params": {"theta": {"dims": []}}}))
+    with pytest.raises(errors.RunError, match="params.theta is missing cols"):
+        draws.load(rid)
+
+    # every message must name the run, not just the key
+    draws.schema_path(rid).write_text(json.dumps({k: v for k, v in good.items() if k != "files"}))
+    with pytest.raises(errors.RunError, match=rid):
+        draws.csv_files(rid)
+
+
+def test_matrix_error_names_the_run(tmp_path, monkeypatch):
+    """`matrix` was the one failure in this module whose message identified
+    nothing — the function has no run_id of its own, so `Draws` carries it."""
+    rid = _run(
+        tmp_path,
+        monkeypatch,
+        files=["a.csv"],
+        params={},
+        stats={"lp__": {"dims": [], "cols": [0]}},
+        rows_per_chain={"a.csv": [[1.0]]},
+    )
+    d = draws.load(rid)
+    assert d.run_id == rid
+    with pytest.raises(errors.RunError, match=rid):
+        draws.matrix(d)
+
+
 def test_element_labels_are_stan_syntax_and_paired_with_cmdstan_names():
     assert list(draws.element_labels("theta", ())) == [("theta", "theta")]
     assert list(draws.element_labels("z", (2,))) == [("z[1]", "z.1"), ("z[2]", "z.2")]
