@@ -701,8 +701,17 @@ _MIN_FISHER_Z = 4.0  # ...and firmly established given the effective sample size
 # The sample correlation matrix over p dims from n_eff effective draws is
 # ill-conditioned BY CONSTRUCTION once p is a meaningful fraction of n_eff: the
 # smallest eigenvalue collapses toward zero from noise alone. Eigen output is
-# suppressed unless p is comfortably below n_eff / this.
-_EIGEN_ESS_RATIO = 10
+# suppressed unless p is below n_eff / this.
+#
+# 4 (i.e. p/n_eff <= 0.25) rather than a stricter guess, from measuring what
+# independent data actually yields: condition number 3.7 at p/n_eff = 0.10, 8.0
+# at 0.25, 19.5 at 0.40, 219.6 at 0.80. Only 0.8 breaches the threshold at which
+# a condition number is reported as an issue, so 0.25 keeps noise a comfortable
+# 12x clear of it. A stricter ratio of 10 suppressed the eigen block on every
+# real run tried — including a 151-dimension model at ESS 673, which would have
+# needed near-perfect mixing to qualify — making the one statistic that catches
+# multi-way degeneracy effectively unreachable.
+_EIGEN_ESS_RATIO = 4
 _EIGEN_GAP = 1.5  # min relative gap to the next eigenvalue before naming loadings
 
 
@@ -781,6 +790,19 @@ def _fisher_z(r: float, n_eff: float) -> float:
 
 def _block_of(name: str) -> str:
     return name.split(".")[0].split("[")[0]
+
+
+def _mp_condition(p: int, n_eff: float) -> float:
+    """Condition number independent parameters alone would give at this p/n_eff.
+
+    Marchenko-Pastur: the sample eigenvalues of independent data spread to
+    (1 -/+ sqrt(p/n))^2, so some conditioning is structural rather than a finding.
+    Reported alongside the observed value so a moderate one is not over-read."""
+    ratio = p / n_eff if n_eff > 0 else 1.0
+    if ratio >= 1.0:
+        return float("inf")
+    s = np.sqrt(ratio)
+    return float(((1 + s) / (1 - s)) ** 2)
 
 
 def run_geometry(
@@ -947,6 +969,11 @@ def run_geometry(
         eig: dict = {
             "condition_number": round(float(ev[-1]) / lo, 1),
             "min_eigenvalue": round(float(ev[0]), 5),
+            # What independent parameters alone would produce at this p/n_eff
+            # (Marchenko-Pastur; matches measurement to ~0.4 and is conservative
+            # beyond). Without it a condition number of 8 looks like mild
+            # degeneracy when at p/n_eff = 0.25 it is exactly what noise gives.
+            "noise_condition_number": round(_mp_condition(p, ess_min), 1),
         }
         if ev.size > 1 and ev[1] > 0 and ev[1] / lo >= _EIGEN_GAP:
             w = np.linalg.eigh(R)[1][:, 0]

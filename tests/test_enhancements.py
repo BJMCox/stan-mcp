@@ -899,10 +899,23 @@ def test_geometry_eigen_suppressed_when_dims_rival_ess(tmp_path, monkeypatch):
     """A sample correlation matrix is ill-conditioned by construction when p is
     not small next to n_eff, so the condition number would be pure artifact."""
     rng = np.random.default_rng(3)
-    cols = {f"b{i}": rng.normal(size=200) for i in range(40)}
+    cols = {f"b{i}": rng.normal(size=200) for i in range(80)}
     rid = _geom_run(monkeypatch, tmp_path, cols, n_chain=2, n_draw=100)
     g = diagnostics.run_geometry(rid)
     assert "eigen" not in g and "suppressed" in g["eigen_note"]
+
+
+def test_geometry_reports_the_noise_condition_number(tmp_path, monkeypatch):
+    """A condition number is only readable next to what noise alone would give:
+    at p/n_eff = 0.25 independent parameters already produce about 8."""
+    rng = np.random.default_rng(11)
+    cols = {f"b{i}": rng.normal(size=2000) for i in range(6)}
+    rid = _geom_run(monkeypatch, tmp_path, cols)
+    eig = diagnostics.run_geometry(rid)["eigen"]
+    assert eig["noise_condition_number"] > 1.0
+    # 6 dims against ~2000 effective draws is a negligible ratio, so both the
+    # observed and the structural figure must be small.
+    assert eig["condition_number"] < 10 and eig["noise_condition_number"] < 2
 
 
 def test_geometry_eigen_finds_three_way_degeneracy(tmp_path, monkeypatch):
