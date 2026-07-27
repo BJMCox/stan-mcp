@@ -63,8 +63,9 @@ def _method_diagnostics(method: str, fit) -> dict:
         return {"method_diagnostics_warning": f"{method} diagnostics unavailable: {exc}"}
 
 
-def _csv_columns(fit) -> list[str]:
-    """The fit's CSV column names in CmdStan's own dot notation (`m.1.1`).
+def _csv_columns(fit) -> tuple[list[str], str]:
+    """The fit's CSV column names in CmdStan's own dot notation (`m.1.1`), plus
+    which header source they came from.
 
     NOT `fit.column_names`: cmdstanpy documents that property as "names munged
     to array notation, e.g. `beta[1]` not `beta.1`" (confirmed live: a matrix
@@ -74,11 +75,15 @@ def _csv_columns(fit) -> list[str]:
     entirely. `metadata.cmdstan_config["raw_header"]` is cmdstanpy's own
     unmunged copy of the CSV header row it parsed, so it always matches.
     Falls back to `column_names` for fakes/mocks that only set that attribute.
+
+    The source name is returned so `_sidecar_from_fit` can report it: a lookup
+    miss against the munged fallback means something quite different from a miss
+    against the unmunged `raw_header`, and the fix differs accordingly.
     """
     try:
-        return fit.metadata.cmdstan_config["raw_header"].split(",")
+        return fit.metadata.cmdstan_config["raw_header"].split(","), "raw_header"
     except (AttributeError, KeyError, TypeError):
-        return list(fit.column_names)
+        return list(fit.column_names), "column_names"
 
 
 def _draw_row_offset(method: str, run_id: str) -> int:
@@ -124,19 +129,42 @@ def _sidecar_from_fit(fit, method: str, run_id: str) -> dict:
     every reader use a plain reshape with no order= argument.
 
     See `_draw_row_offset` for `draw_row_offset`.
+
+    A column that cannot be placed raises a RunError naming the variable, the
+    element, and the header source. Sampling itself has already SUCCEEDED by the
+    time this runs, so a bare `KeyError: 'm[1,1]'` propagating up through
+    `persist_run` landed such a run at status="failed" with a cryptic message and
+    no hint that the header source was the problem.
     """
-    cols = _csv_columns(fit)
+    cols, header_source = _csv_columns(fit)
     index = {name: i for i, name in enumerate(cols)}
     dims = {name: tuple(v.dimensions) for name, v in fit.metadata.stan_vars.items()}
+
+    def column_of(var: str, cmdstan_name: str) -> int:
+        try:
+            return index[cmdstan_name]
+        except KeyError as exc:
+            hint = (
+                "cmdstanpy munges `column_names` to array notation (`m[1,1]`, not "
+                "CmdStan's own `m.1.1`), so no non-scalar variable can be placed "
+                "from it; the fit exposed no cmdstan_config['raw_header'] to use "
+                "instead"
+                if header_source == "column_names"
+                else "the header does not carry every element of the fit's own declared variables"
+            )
+            raise RunError(
+                f"run {run_id!r}: could not place element {cmdstan_name!r} of "
+                f"parameter {var!r} (dims {list(dims[var])}) against the fit's "
+                f"{header_source} header — {hint}. Sampling succeeded and the "
+                "run's CSVs are persisted, but its draws cannot be typed."
+            ) from exc
 
     params: dict[str, dict] = {}
     for name, shape in dims.items():
         if not shape:
-            params[name] = {"dims": [], "cols": [index[name]]}
+            params[name] = {"dims": [], "cols": [column_of(name, name)]}
             continue
-        ordered = []
-        for _, cmdstan_name in draws.element_labels(name, shape):
-            ordered.append(index[cmdstan_name])
+        ordered = [column_of(name, cn) for _, cn in draws.element_labels(name, shape)]
         params[name] = {"dims": list(shape), "cols": ordered}
 
     stats = {name: {"dims": [], "cols": [i]} for i, name in enumerate(cols) if name.endswith("__")}

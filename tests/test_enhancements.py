@@ -1816,7 +1816,8 @@ def test_csv_columns_falls_back_to_column_names_without_cmdstan_config():
     """Belt-and-braces only: no real cmdstanpy fit reaches this branch (its
     InferenceMetadata always carries cmdstan_config['raw_header']), but a
     fake/mock that sets only `.column_names` must not crash `_sidecar_from_fit`
-    outright."""
+    outright. The source name comes back too, so a lookup miss can say which
+    header it missed against."""
 
     class _Meta:
         pass  # no cmdstan_config
@@ -1825,7 +1826,48 @@ def test_csv_columns_falls_back_to_column_names_without_cmdstan_config():
         metadata = _Meta()
         column_names = ("lp__", "theta")
 
-    assert diagnostics._csv_columns(_Fit()) == ["lp__", "theta"]
+    assert diagnostics._csv_columns(_Fit()) == (["lp__", "theta"], "column_names")
+
+
+def test_csv_columns_reports_raw_header_as_its_source():
+    """The paired positive: `raw_header` must not be mislabelled as the fallback,
+    or the error message above would send a reader to the wrong cause."""
+
+    class _Fit:
+        metadata = InferenceMetadata({"raw_header": "lp__,theta"})
+
+    assert diagnostics._csv_columns(_Fit()) == (["lp__", "theta"], "raw_header")
+
+
+def test_sidecar_from_fit_names_the_element_it_cannot_place(tmp_path, monkeypatch):
+    """The `column_names` fallback is munged (`m[1,1]`, not `m.1.1`), so a
+    non-scalar variable cannot be placed from it at all.
+
+    `pixi.toml` pins cmdstanpy loosely, so one upstream rename of
+    cmdstan_config['raw_header'] drops every real fit onto this branch. It used
+    to raise a bare `KeyError: 'm[1,1]'`, which `persist_run` re-raised — landing
+    a run whose SAMPLING SUCCEEDED at status="failed" with a cryptic message. The
+    error must instead name the variable, the element, and the header source.
+    """
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    rid = "sample-0001"
+    runstore.write_meta(rid, {"method": "sample", "status": "done"})
+
+    class _Meta:
+        # no cmdstan_config -> the column_names fallback
+        stan_vars = InferenceMetadata({"raw_header": "lp__,m.1.1,m.2.1,m.1.2,m.2.2"}).stan_vars
+
+    class _Fit:
+        metadata = _Meta()
+        column_names = ("lp__", "m[1,1]", "m[2,1]", "m[1,2]", "m[2,2]")
+
+    with pytest.raises(errors.RunError) as exc:
+        diagnostics._sidecar_from_fit(_Fit(), "sample", rid)
+    msg = str(exc.value)
+    assert "m.1.1" in msg  # the element it could not place
+    assert "'m'" in msg and "[2, 2]" in msg  # the variable and its dims
+    assert "column_names" in msg  # which header source was used
+    assert "Sampling succeeded" in msg  # not a sampling failure
 
 
 def test_persist_run_writes_a_sidecar_and_no_netcdf(tmp_path, monkeypatch):
