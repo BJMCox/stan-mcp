@@ -11,8 +11,11 @@ step it is NOT best-effort: a failure records a persist_warning in meta.json
 (a csv_warning is recorded separately if CSV persistence itself fails) and
 then raises, which `sample.py`'s caller turns into status="failed" rather
 than letting the run rest at "done" with unreadable draws.
-run_summary: draws-producing methods -> arviz summary (mean, sd, HDI,
-bulk/tail ESS, R-hat) over inference.nc; optimize -> the stored estimate.
+run_summary: sample -> CmdStan's own `stansummary` (mean, sd, mad, 90% ETI,
+bulk/tail ESS, R-hat, MCSE) over the run's draws CSVs, relabelled into Stan
+syntax; the other draws-producing methods -> numpy moments/quantiles over the
+typed draws (no R-hat/ESS -- they are not MCMC chains); optimize -> the stored
+estimate.
 run_diagnostics: optimize -> lp__ from the estimate; draws-producing methods ->
 worst R-hat, min bulk/tail ESS, divergences, tree-depth saturations, mean
 accept stat, E-BFMI, plus a pass/warn verdict with an issues list.
@@ -31,6 +34,7 @@ import numpy as np
 
 import draws
 import runstore
+import stansummary
 from errors import RunError, ValidationError
 
 
@@ -259,30 +263,6 @@ def _load_idata(run_id: str):
     return az.from_netcdf(str(p))
 
 
-def _coerce_numbers(rec: dict) -> dict:
-    """arviz.summary formats numbers as strings; return machine-usable floats."""
-    out: dict = {}
-    for k, v in rec.items():
-        if k == "param":
-            out[k] = v
-            continue
-        try:
-            out[k] = float(v)
-        except (TypeError, ValueError):
-            out[k] = v
-    return out
-
-
-def _param_columns(columns, params):
-    """CSV columns that are model params (not `__` diagnostics), optionally
-    filtered to a requested set (matching base name for indexed params)."""
-    cols = [c for c in columns if not c.endswith("__")]
-    if params:
-        want = set(params)
-        cols = [c for c in cols if c in want or c.split(".")[0] in want]
-    return cols
-
-
 # Default ceiling on summary rows. arviz emits one row per parameter ELEMENT, so
 # a single vector[500] is 500 rows x 9 fields. The summary is the tool you
 # actually reach for — raw draws are near-useless to read — so it is the one that
@@ -323,50 +303,90 @@ def _cap_rows(records: list[dict], max_rows: int) -> dict:
     }
 
 
-def _summary_from_csv(run_id: str, params, max_rows: int) -> dict:
-    df = _draws_df(run_id)
-    cols = _param_columns(df.columns, params)
-    recs = []
-    for c in cols:
-        v = df[c].to_numpy(dtype=float)
-        recs.append(
-            {
-                "param": c,
-                "mean": round(float(v.mean()), 6),
-                "sd": round(float(v.std(ddof=1)), 6) if v.size > 1 else 0.0,
-                "q5": round(float(np.quantile(v, 0.05)), 6),
-                "q50": round(float(np.quantile(v, 0.5)), 6),
-                "q95": round(float(np.quantile(v, 0.95)), 6),
-                "n": int(v.size),
-            }
-        )
-    # No R-hat/ESS: approximate methods are not MCMC chains.
-    return {**_cap_rows(recs, max_rows), "source": "csv"}
+# stansummary column -> our output key. `MAD` is new; `mcse_sd` is gone because
+# stansummary reports a single MCSE. `q5`/`q95` is a 90% equal-tailed interval
+# replacing the 89% one arviz produced -- still an ETI, and it matches the naming
+# the CSV path already used.
+_SUMMARY_COLUMNS = {
+    "Mean": "mean",
+    "StdDev": "sd",
+    "MAD": "mad",
+    "5%": "q5",
+    "50%": "q50",
+    "95%": "q95",
+    "ESS_bulk": "ess_bulk",
+    "ESS_tail": "ess_tail",
+    "R_hat": "r_hat",
+    "MCSE": "mcse",
+}
+
+
+def _wanted(name: str, params) -> bool:
+    return not params or name in set(params)
+
+
+def _summary_from_stansummary(run_id: str, params, max_rows: int) -> dict:
+    """Statistics from CmdStan's own implementation, relabelled into Stan syntax.
+
+    Only the sidecar is read here, not the draws: stansummary has already parsed
+    the CSVs, so loading them again to learn names and dims would be wasted work.
+    """
+    sc = draws.schema(run_id)
+    stats = stansummary.summarize(draws.csv_files(run_id))
+    records = []
+    for name, spec in sc["params"].items():
+        if not _wanted(name, params):
+            continue
+        for stan_label, cmdstan_name in draws.element_labels(name, tuple(spec["dims"])):
+            row = stats.get(cmdstan_name)
+            if row is None:
+                continue
+            rec: dict[str, Any] = {"param": stan_label}
+            for src, dst in _SUMMARY_COLUMNS.items():
+                if src in row:
+                    rec[dst] = round(row[src], 6)
+            records.append(rec)
+    return _cap_rows(records, max_rows)
+
+
+def _summary_from_draws(run_id: str, params, max_rows: int) -> dict:
+    """Moments and quantiles for the approximate methods.
+
+    No R-hat or ESS: variational/pathfinder/laplace draws are not MCMC chains, and
+    stansummary would happily report both anyway.
+    """
+    d = draws.load(run_id)
+    records = []
+    for name, arr in d.params.items():
+        if not _wanted(name, params):
+            continue
+        for label, values in draws.elements(name, arr):
+            v = values.reshape(-1)
+            records.append(
+                {
+                    "param": label,
+                    "mean": round(float(v.mean()), 6),
+                    "sd": round(float(v.std(ddof=1)), 6) if v.size > 1 else 0.0,
+                    "q5": round(float(np.quantile(v, 0.05)), 6),
+                    "q50": round(float(np.quantile(v, 0.5)), 6),
+                    "q95": round(float(np.quantile(v, 0.95)), 6),
+                    "n": int(v.size),
+                }
+            )
+    out = _cap_rows(records, max_rows)
+    if d.truncated_to is not None:
+        out["chains_truncated_to"] = d.truncated_to
+    return out
 
 
 def run_summary(run_id: str, params=None, max_rows: int = DEFAULT_MAX_ROWS) -> dict:
     meta = runstore.read_meta(run_id)
-    if meta.get("method") == "optimize":
+    method = meta.get("method")
+    if method == "optimize":
         return {"estimate": runstore.load_estimate(run_id)}
-    import arviz as az
-
-    try:
-        idata = _load_idata(run_id)
-    except RunError:
-        # variational / pathfinder / laplace have no inference.nc; summarize the CSVs.
-        return _summary_from_csv(run_id, params, max_rows)
-    # Intervals stay arviz's default 89% ETI (eti89_lb/eti89_ub), deliberately:
-    # quantiles are transformation invariant (exp(ETI(log x)) == ETI(x)), stable
-    # from few draws, and well defined when the posterior is multimodal. An HDI
-    # is none of those, and its parameterization dependence is disqualifying for
-    # a harness that sees the same parameter constrained and unconstrained.
-    # Do NOT reach for az.summary(ci_kind="hdi") if this is ever revisited: as of
-    # arviz 1.2 it renames the columns to hdi89_* but returns the ETI quantiles
-    # unchanged (verified against az.hdi on Exponential(1): summary gives
-    # [0.0557, 2.855], the true HDI is [0.0002, 2.215]). az.hdi is the real one.
-    df = az.summary(idata, var_names=params)
-    records = df.reset_index().rename(columns={"index": "param"}).to_dict("records")
-    return _cap_rows([_coerce_numbers(r) for r in records], max_rows)
+    if method == "sample":
+        return _summary_from_stansummary(run_id, params, max_rows)
+    return _summary_from_draws(run_id, params, max_rows)
 
 
 # Standard Stan-workflow thresholds for the pass/warn verdict.

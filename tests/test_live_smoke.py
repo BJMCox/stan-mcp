@@ -120,9 +120,8 @@ def test_live_method_diagnostics(tmp_path, monkeypatch):
         assert key in diag, f"{method} missing {key}: {diag}"
         # raw draws persisted (these fits have no .runset; must come from live/)
         assert runstore.csv_paths(started["run_id"]), f"{method} lost its CSVs"
-        # summary + draws work via the CSV fallback (no inference.nc for these)
+        # summary + draws work via the typed-draws fallback (no inference.nc for these)
         summ = diagnostics.run_summary(started["run_id"], params=["theta"])
-        assert summ["source"] == "csv"
         assert any(r["param"] == "theta" for r in summ["summary"])
         draws = diagnostics.extract_draws(started["run_id"], "theta")
         assert len(draws["draws"]) > 0

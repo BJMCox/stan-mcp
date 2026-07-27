@@ -380,13 +380,14 @@ def _write_csv_run(run_id):
 
 
 def test_csv_summary_for_non_idata_run(tmp_path, monkeypatch):
-    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    _write_csv_run("variational-0001")
-    s = diagnostics.run_summary("variational-0001")
-    assert s["source"] == "csv"
-    assert {r["param"] for r in s["summary"]} == {"theta", "beta.1", "beta.2"}  # lp__ excluded
+    """Approximate methods get numpy moments over the typed draws layer -- Stan
+    labels, not arviz's dot notation."""
+    rid = _typed_run(tmp_path, monkeypatch, method="variational")
+    s = diagnostics.run_summary(rid)
+    assert {r["param"] for r in s["summary"]} == {"theta", "z[1]", "z[2]"}  # lp__ excluded
     theta = next(r for r in s["summary"] if r["param"] == "theta")
-    assert abs(theta["mean"] - 0.6) < 1e-9
+    assert abs(theta["mean"] - 0.25) < 1e-9
+    assert theta["n"] == 4
 
 
 def _write_typed_csv_run(run_id):
@@ -467,12 +468,6 @@ def test_list_runs_status_and_method_filters(tmp_path, monkeypatch):
     assert [r["run_id"] for r in runstore.list_runs(status="done", method="sample")] == [
         "sample-0001"
     ]
-
-
-def test_summary_numbers_coerced_to_float():
-    r = diagnostics._coerce_numbers({"param": "theta", "mean": "0.585", "sd": "0.1"})
-    assert r["param"] == "theta"
-    assert r["mean"] == 0.585 and isinstance(r["mean"], float)
 
 
 def test_prune_skips_running(tmp_path, monkeypatch):
@@ -679,16 +674,30 @@ def test_extract_draws_caps_result_size(tmp_path, monkeypatch):
 # parameter ELEMENT, so one big vector is hundreds of rows.
 def test_run_summary_caps_rows(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    import arviz as az
-
-    idata = az.from_dict({"posterior": {"beta": np.zeros((2, 10, 50))}})
-    runstore.write_meta("sample-0001", {"method": "sample", "status": "done"})
-    idata.to_netcdf(str(runstore.idata_path("sample-0001")))
-
-    out = diagnostics.run_summary("sample-0001", max_rows=10)
+    rid = "sample-0001"
+    runstore.write_meta(rid, {"method": "sample", "status": "done"})
+    csvdir = runstore.run_dir(rid, create=True) / "csv"
+    csvdir.mkdir(parents=True, exist_ok=True)
+    (csvdir / "a.csv").write_text("# c\nlp__,beta.1\n-1,0\n")  # stansummary is mocked below
+    diagnostics.draws.schema_path(rid).write_text(
+        json.dumps(
+            {
+                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "files": ["a.csv"],
+                "params": {"beta": {"dims": [50], "cols": list(range(1, 51))}},
+                "sampler_stats": {"lp__": {"dims": [], "cols": [0]}},
+            }
+        )
+    )
+    monkeypatch.setattr(
+        diagnostics.stansummary,
+        "summarize",
+        lambda paths, **kw: {f"beta.{i}": {"Mean": 0.0} for i in range(1, 51)},
+    )
+    out = diagnostics.run_summary(rid, max_rows=10)
     assert len(out["summary"]) == 10
     assert out["truncated"]["total"] == 50 and out["truncated"]["shown"] == 10
-    full = diagnostics.run_summary("sample-0001", max_rows=0)
+    full = diagnostics.run_summary(rid, max_rows=0)
     assert len(full["summary"]) == 50 and "truncated" not in full
 
 
@@ -715,15 +724,120 @@ def test_run_summary_truncation_without_convergence_columns(tmp_path, monkeypatc
 
 def test_run_summary_csv_fallback_caps_rows(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    runstore.write_meta("variational-0001", {"method": "variational", "status": "done"})
-    csvdir = runstore.run_dir("variational-0001", create=True) / "csv"
+    rid = "variational-0001"
+    runstore.write_meta(rid, {"method": "variational", "status": "done"})
+    csvdir = runstore.run_dir(rid, create=True) / "csv"
     csvdir.mkdir(parents=True, exist_ok=True)
-    cols = ",".join(f"beta.{i}" for i in range(20))
+    cols = ",".join(f"beta.{i}" for i in range(1, 21))
     row = ",".join("0.5" for _ in range(20))
     (csvdir / "c-1.csv").write_text(f"lp__,{cols}\n0,{row}\n0,{row}\n")
-    out = diagnostics.run_summary("variational-0001", max_rows=5)
-    assert out["source"] == "csv" and len(out["summary"]) == 5
+    diagnostics.draws.schema_path(rid).write_text(
+        json.dumps(
+            {
+                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "files": ["c-1.csv"],
+                "params": {"beta": {"dims": [20], "cols": list(range(1, 21))}},
+                "sampler_stats": {"lp__": {"dims": [], "cols": [0]}},
+            }
+        )
+    )
+    out = diagnostics.run_summary(rid, max_rows=5)
+    assert len(out["summary"]) == 5
     assert out["truncated"]["total"] == 20
+
+
+def test_run_summary_for_sample_comes_from_stansummary(tmp_path, monkeypatch):
+    """CmdStan is the reference implementation, and its names are relabelled into
+    Stan syntax on the way out."""
+    rid = _typed_run(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        diagnostics.stansummary,
+        "summarize",
+        lambda paths, **kw: {
+            "lp__": {"Mean": -2.5},
+            "theta": {
+                "Mean": 0.25,
+                "StdDev": 0.13,
+                "MAD": 0.1,
+                "5%": 0.1,
+                "50%": 0.25,
+                "95%": 0.4,
+                "ESS_bulk": 900.0,
+                "ESS_tail": 403.871,
+                "R_hat": 1.001,
+                "MCSE": 0.004,
+            },
+            "z.1": {
+                "Mean": 11.5,
+                "StdDev": 1.3,
+                "MAD": 1.0,
+                "5%": 10.0,
+                "50%": 11.5,
+                "95%": 13.0,
+                "ESS_bulk": 800.0,
+                "ESS_tail": 350.0,
+                "R_hat": 1.02,
+                "MCSE": 0.05,
+            },
+            "z.2": {
+                "Mean": 21.5,
+                "StdDev": 1.3,
+                "MAD": 1.0,
+                "5%": 20.0,
+                "50%": 21.5,
+                "95%": 23.0,
+                "ESS_bulk": 700.0,
+                "ESS_tail": 300.0,
+                "R_hat": 1.00,
+                "MCSE": 0.05,
+            },
+        },
+    )
+    out = diagnostics.run_summary(rid)
+    rows = {r["param"]: r for r in out["summary"]}
+    # Stan syntax, 1-based; sampler stats excluded
+    assert set(rows) == {"theta", "z[1]", "z[2]"}
+    assert rows["theta"]["ess_tail"] == 403.871
+    assert rows["theta"]["q5"] == 0.1 and rows["theta"]["q95"] == 0.4
+    assert rows["z[1]"]["r_hat"] == 1.02
+    assert "eti89_lb" not in rows["theta"]
+
+
+def test_run_summary_params_filter_and_worst_first_truncation(tmp_path, monkeypatch):
+    rid = _typed_run(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        diagnostics.stansummary,
+        "summarize",
+        lambda paths, **kw: {
+            "theta": {"Mean": 0.25, "ESS_bulk": 900.0, "R_hat": 1.001},
+            "z.1": {"Mean": 11.5, "ESS_bulk": 800.0, "R_hat": 1.20},
+            "z.2": {"Mean": 21.5, "ESS_bulk": 700.0, "R_hat": 1.00},
+        },
+    )
+    assert [r["param"] for r in diagnostics.run_summary(rid, params=["theta"])["summary"]] == [
+        "theta"
+    ]
+    out = diagnostics.run_summary(rid, max_rows=1)
+    assert out["summary"][0]["param"] == "z[1]"  # worst r_hat kept
+    assert out["truncated"]["total"] == 3
+
+
+def test_run_summary_for_variational_never_calls_stansummary(tmp_path, monkeypatch):
+    """stansummary does not refuse non-MCMC input: handed variational draws it
+    reports R_hat 0.999997 for what are IID samples. The gate must be ours."""
+    rid = _typed_run(tmp_path, monkeypatch, method="variational")
+
+    def _boom(*a, **k):
+        raise AssertionError("stansummary must not be called for variational runs")
+
+    monkeypatch.setattr(diagnostics.stansummary, "summarize", _boom)
+    out = diagnostics.run_summary(rid)
+    rows = {r["param"]: r for r in out["summary"]}
+    assert set(rows) == {"theta", "z[1]", "z[2]"}
+    assert rows["theta"]["mean"] == pytest.approx(0.25)
+    assert rows["theta"]["n"] == 4
+    # not MCMC chains, so no convergence statistics are invented
+    assert "r_hat" not in rows["theta"] and "ess_bulk" not in rows["theta"]
 
 
 # The ceiling bounds what the WHOLE call returns. Capping per chain per
