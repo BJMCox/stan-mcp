@@ -16,9 +16,11 @@ bulk/tail ESS, R-hat, MCSE) over the run's draws CSVs, relabelled into Stan
 syntax; the other draws-producing methods -> numpy moments/quantiles over the
 typed draws (no R-hat/ESS -- they are not MCMC chains); optimize -> the stored
 estimate.
-run_diagnostics: optimize -> lp__ from the estimate; draws-producing methods ->
-worst R-hat, min bulk/tail ESS, divergences, tree-depth saturations, mean
-accept stat, E-BFMI, plus a pass/warn verdict with an issues list.
+run_diagnostics: sample -> worst R-hat/min bulk-tail ESS (stansummary) plus
+divergences, tree-depth saturations, mean accept stat, E-BFMI (typed sampler
+stats), with a pass/warn verdict; the other draws-producing methods -> just
+the method-specific scalars captured at persist time; optimize -> lp__ from
+the estimate.
 run_loo / compare_runs: PSIS-LOO cross-validation and multi-run ranking (models
 must emit a `log_lik` generated quantity).
 extract_draws: flattened draws for one parameter from the typed draws layer
@@ -405,64 +407,75 @@ def _finite(x):
     return f if math.isfinite(f) else None
 
 
-def _convergence(idata) -> dict:
-    """Worst R-hat and smallest bulk/tail ESS across all posterior params."""
-    import arviz as az
+def _convergence(run_id: str) -> dict:
+    """Worst R-hat and smallest bulk/tail ESS over all parameter elements.
 
+    Same stansummary output the summary uses, so the two cannot disagree. Sampler
+    stats (`lp__` and friends) are excluded: they are not model parameters and their
+    R-hat is not what the verdict is about.
+    """
     try:
-        summ: Any = az.summary(idata, kind="diagnostics")
-    except Exception as exc:  # noqa: BLE001
-        # Legitimately unavailable for a single chain, where R-hat is undefined —
-        # but an arviz API change lands here too, and silently dropping R-hat and
-        # ESS, the two headline diagnostics, is exactly how E-BFMI went missing.
+        sc = draws.schema(run_id)
+        stats = stansummary.summarize(draws.csv_files(run_id))
+    except RunError as exc:
+        # Surfaced, never swallowed: silently dropping R-hat and ESS, the two
+        # headline diagnostics, is exactly how E-BFMI went missing. A run with no
+        # sidecar (predates the typed draws layer, or the sidecar write failed)
+        # lands here too, degrading to the method-diagnostics fallback rather
+        # than raising out of run_diagnostics.
         return {"convergence_warning": f"R-hat/ESS unavailable: {exc}"}
+
+    worst_rhat: tuple[float, str] | None = None
+    min_bulk: float | None = None
+    min_tail: float | None = None
+    for name, spec in sc["params"].items():
+        for stan_label, cmdstan_name in draws.element_labels(name, tuple(spec["dims"])):
+            row = stats.get(cmdstan_name)
+            if row is None:
+                continue
+            if (r := _finite(row.get("R_hat"))) is not None:
+                if worst_rhat is None or r > worst_rhat[0]:
+                    worst_rhat = (r, stan_label)
+            if (b := _finite(row.get("ESS_bulk"))) is not None:
+                min_bulk = b if min_bulk is None else min(min_bulk, b)
+            if (t := _finite(row.get("ESS_tail"))) is not None:
+                min_tail = t if min_tail is None else min(min_tail, t)
+
     out: dict = {}
-    if "r_hat" in summ.columns:
-        s = summ["r_hat"].dropna()
-        if len(s):
-            out["max_rhat"] = round(float(s.max()), 4)
-            out["max_rhat_param"] = str(s.idxmax())
-    for col, key in (("ess_bulk", "min_ess_bulk"), ("ess_tail", "min_ess_tail")):
-        if col in summ.columns:
-            s = summ[col].dropna()
-            if len(s):
-                out[key] = round(float(s.min()), 1)
+    if worst_rhat is not None:
+        out["max_rhat"] = round(worst_rhat[0], 4)
+        out["max_rhat_param"] = worst_rhat[1]
+    if min_bulk is not None:
+        out["min_ess_bulk"] = round(min_bulk, 1)
+    if min_tail is not None:
+        out["min_ess_tail"] = round(min_tail, 1)
     return out
 
 
-def _sampler_stats(idata, meta) -> dict:
-    import arviz as az
-
-    ss = idata.sample_stats
+def _sampler_stats(d: draws.Draws, meta: dict) -> dict:
+    ss = d.sampler_stats
     out: dict = {}
 
-    def _pick(*names):
-        for n in names:
-            if n in ss:
-                return ss[n]
-        return None
+    if (div := ss.get("divergent__")) is not None:
+        out["divergences"] = int(np.asarray(div).sum())
 
-    div = _pick("diverging", "divergent")
-    if div is not None:
-        out["divergences"] = int(div.values.sum())
-
-    td = _pick("tree_depth", "treedepth")
-    if td is not None:
+    if (td := ss.get("treedepth__")) is not None:
         max_td = int(meta.get("method_args", {}).get("max_treedepth", 10))
         out["max_treedepth"] = max_td
-        out["treedepth_saturations"] = int((td.values >= max_td).sum())
+        out["treedepth_saturations"] = int((np.asarray(td) >= max_td).sum())
 
-    accept = _pick("acceptance_rate", "accept_stat", "mean_accept_stat")
-    if accept is not None:
-        out["mean_accept_stat"] = round(float(accept.values.mean()), 4)
+    if (accept := ss.get("accept_stat__")) is not None:
+        out["mean_accept_stat"] = round(float(np.asarray(accept).mean()), 4)
 
-    energy = _pick("energy")
-    if energy is not None:
-        # Pass the energy DataArray, NOT the whole idata: under arviz 1.2 that is
-        # a DataTree, and az.bfmi(tree) raises TypeError every time — which a bare
-        # `except: pass` here turned into E-BFMI silently missing from every run,
-        # for the diagnostic most specific to funnel geometry (measured on Neal's
-        # funnel: min E-BFMI 0.06 against 1.01 for its non-centered twin).
+    if (energy := ss.get("energy__")) is not None:
+        import arviz as az
+
+        # E-BFMI is not in stansummary (only in `diagnose`, as prose), so it stays
+        # an arviz call -- now on a clean (chain, draw) array rather than a
+        # DataTree. Passing the whole idata (arviz 1.2: a DataTree) raised
+        # TypeError every time, which a bare `except: pass` turned into E-BFMI
+        # silently missing from every run (measured on Neal's funnel: min E-BFMI
+        # 0.06 against 1.01 for its non-centered twin).
         try:
             bfmi = [v for v in (_finite(b) for b in np.asarray(az.bfmi(energy))) if v is not None]
             if bfmi:
@@ -497,17 +510,15 @@ def run_diagnostics(run_id: str) -> dict:
         est = runstore.load_estimate(run_id)
         return {"method": "optimize", "lp__": est.get("lp__")}
     out: dict = {"method": method}
-    # HMC-style convergence/sampler diagnostics require inference.nc, which arviz
-    # only writes for sample runs; VI/pathfinder/laplace fall back to the
-    # method-specific scalars captured at persist time.
-    try:
-        idata = _load_idata(run_id)
-    except RunError:
-        idata = None
-    if idata is not None:
-        out.update(_convergence(idata))
-        if "sample_stats" in idata:
-            out.update(_sampler_stats(idata, meta))
+    # HMC-style convergence/sampler diagnostics are only meaningful for sample
+    # runs (stansummary's R-hat/ESS assume MCMC chains); VI/pathfinder/laplace
+    # fall back to the method-specific scalars captured at persist time.
+    if method == "sample":
+        out.update(_convergence(run_id))
+        try:
+            out.update(_sampler_stats(draws.load(run_id), meta))
+        except RunError as exc:
+            out["sampler_stats_warning"] = f"sampler statistics unavailable: {exc}"
         out.update(_verdict(out))
     md = meta.get("method_diagnostics")
     if md:

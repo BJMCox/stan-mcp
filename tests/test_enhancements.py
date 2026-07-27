@@ -284,29 +284,102 @@ def test_extract_draws_by_chain(tmp_path, monkeypatch):
     assert len(out["draws"]) == 2 and len(out["draws"][0]) == 10  # 2 chains x 10 draws
 
 
-# --- diagnostics over a full idata with a sample_stats group (offline) ---
-def _write_run_with_stats(run_id, *, diverging, tree_depth, max_td=10):
-    import arviz as az
+def test_convergence_reads_the_same_stansummary_output_as_the_summary(tmp_path, monkeypatch):
+    """The summary and the verdict must not be able to disagree: today one goes
+    through az.summary() and the other through az.summary(kind='diagnostics')."""
+    rid = _typed_run(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        diagnostics.stansummary,
+        "summarize",
+        lambda paths, **kw: {
+            "lp__": {"R_hat": 9.9, "ESS_bulk": 1.0, "ESS_tail": 1.0},  # must be ignored
+            "theta": {"R_hat": 1.001, "ESS_bulk": 900.0, "ESS_tail": 500.0},
+            "z.1": {"R_hat": 1.05, "ESS_bulk": 120.0, "ESS_tail": 148.5},
+            "z.2": {"R_hat": 1.00, "ESS_bulk": 700.0, "ESS_tail": 600.0},
+        },
+    )
+    got = diagnostics._convergence(rid)
+    assert got["max_rhat"] == 1.05
+    assert got["max_rhat_param"] == "z[1]"  # Stan syntax, and not lp__
+    assert got["min_ess_bulk"] == 120.0
+    assert got["min_ess_tail"] == 148.5
 
+
+def test_sampler_stats_reads_typed_arrays_and_reports_ebfmi(tmp_path, monkeypatch):
+    """E-BFMI is not in stansummary (only in `diagnose`, as prose), so it stays
+    computed from energy__ -- fed a clean array rather than a DataTree."""
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    rng = np.random.default_rng(0)
+    d = diagnostics.draws.Draws(
+        params={},
+        sampler_stats={
+            "divergent__": np.array([[0.0, 1.0], [1.0, 0.0]]),
+            "treedepth__": np.array([[3.0, 10.0], [10.0, 4.0]]),
+            "accept_stat__": np.array([[0.8, 0.9], [0.7, 1.0]]),
+            "energy__": rng.normal(size=(2, 50)),
+        },
+        n_chain=2,
+        n_draw=2,
+    )
+    got = diagnostics._sampler_stats(d, {"method_args": {"max_treedepth": 10}})
+    assert got["divergences"] == 2
+    assert got["treedepth_saturations"] == 2
+    assert got["mean_accept_stat"] == 0.85
+    assert "min_ebfmi" in got and "ebfmi_warning" not in got
+
+
+# --- diagnostics over a typed sample run with sampler stats (offline) ---
+def _write_run_with_stats(run_id, *, diverging, tree_depth, max_td=10):
+    """A typed sample run: one scalar param (theta) plus the raw CmdStan sampler
+    stats columns (`divergent__`, `treedepth__`, `accept_stat__`, `energy__`)
+    run_diagnostics now reads directly off the typed draws layer, no idata."""
     rng = np.random.default_rng(0)
     nchain, ndraw = 2, 1000
-    post = {"theta": rng.normal(size=(nchain, ndraw))}
-    ss = {
-        "diverging": np.full((nchain, ndraw), diverging, dtype=bool),
-        "tree_depth": np.full((nchain, ndraw), tree_depth),
-        "energy": rng.normal(size=(nchain, ndraw)),
-        "acceptance_rate": np.full((nchain, ndraw), 0.9),
-    }
-    idata = az.from_dict({"posterior": post, "sample_stats": ss})
     runstore.write_meta(
         run_id, {"method": "sample", "status": "done", "method_args": {"max_treedepth": max_td}}
     )
-    idata.to_netcdf(str(runstore.idata_path(run_id)))
+    csvdir = runstore.run_dir(run_id, create=True) / "csv"
+    csvdir.mkdir(parents=True, exist_ok=True)
+    theta = rng.normal(size=(nchain, ndraw))
+    energy = rng.normal(size=(nchain, ndraw))
+    files = []
+    for chain in range(nchain):
+        rows = "\n".join(
+            f"{theta[chain, i]},{int(diverging)},{tree_depth},0.9,{energy[chain, i]}"
+            for i in range(ndraw)
+        )
+        name = f"chain{chain}.csv"
+        (csvdir / name).write_text(
+            f"# c\ntheta,divergent__,treedepth__,accept_stat__,energy__\n{rows}\n"
+        )
+        files.append(name)
+    diagnostics.draws.schema_path(run_id).write_text(
+        json.dumps(
+            {
+                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "files": files,
+                "params": {"theta": {"dims": [], "cols": [0]}},
+                "sampler_stats": {
+                    "divergent__": {"dims": [], "cols": [1]},
+                    "treedepth__": {"dims": [], "cols": [2]},
+                    "accept_stat__": {"dims": [], "cols": [3]},
+                    "energy__": {"dims": [], "cols": [4]},
+                },
+            }
+        )
+    )
 
 
 def test_diagnostics_clean_run_passes(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     _write_run_with_stats("sample-0001", diverging=False, tree_depth=3)
+    # stansummary's binary is not available in the offline suite; R-hat/ESS are
+    # what this test is actually about, so they are controlled directly.
+    monkeypatch.setattr(
+        diagnostics.stansummary,
+        "summarize",
+        lambda paths, **kw: {"theta": {"R_hat": 1.001, "ESS_bulk": 900.0, "ESS_tail": 850.0}},
+    )
     diag = diagnostics.run_diagnostics("sample-0001")
     assert diag["divergences"] == 0
     assert diag["treedepth_saturations"] == 0
@@ -318,6 +391,11 @@ def test_diagnostics_clean_run_passes(tmp_path, monkeypatch):
 def test_diagnostics_bad_run_warns(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     _write_run_with_stats("sample-0001", diverging=True, tree_depth=10, max_td=10)
+    monkeypatch.setattr(
+        diagnostics.stansummary,
+        "summarize",
+        lambda paths, **kw: {"theta": {"R_hat": 1.001, "ESS_bulk": 900.0, "ESS_tail": 850.0}},
+    )
     diag = diagnostics.run_diagnostics("sample-0001")
     assert diag["divergences"] == 2000
     assert diag["treedepth_saturations"] == 2000
@@ -362,9 +440,10 @@ def test_persist_run_copies_csvs_from_live(tmp_path, monkeypatch):
     assert runstore.read_meta(run_id).get("method_diagnostics") == {"is_resampled": True}
 
 
-def test_run_diagnostics_falls_back_without_idata(tmp_path, monkeypatch):
+def test_run_diagnostics_for_approximate_method_has_no_hmc_verdict(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    # VI/pathfinder/laplace have no inference.nc; run_diagnostics must not raise.
+    # VI/pathfinder/laplace never reach the sample-only convergence/sampler-stats
+    # branch, so they carry only their method-specific scalars, no verdict.
     runstore.write_meta(
         "variational-0001",
         {"method": "variational", "status": "done", "method_diagnostics": {"eta": 1.0}},
@@ -372,7 +451,22 @@ def test_run_diagnostics_falls_back_without_idata(tmp_path, monkeypatch):
     diag = diagnostics.run_diagnostics("variational-0001")
     assert diag["method"] == "variational"
     assert diag["eta"] == 1.0
-    assert "verdict" not in diag  # no HMC verdict without draws
+    assert "verdict" not in diag  # no HMC verdict for a non-sample method
+
+
+def test_run_diagnostics_on_sample_run_without_sidecar_does_not_raise(tmp_path, monkeypatch):
+    """Before the migration, a run with no persisted draws (missing
+    inference.nc) degraded to the method-diagnostics fallback rather than
+    failing the call. A sample run with no draws_schema.json sidecar (predates
+    the typed draws layer, or its persist_run write failed) must keep that
+    behavior: both _convergence and _sampler_stats read the sidecar, and each
+    must turn its RunError into a warning key rather than letting it propagate."""
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    runstore.write_meta("sample-0001", {"method": "sample", "status": "done"})
+    diag = diagnostics.run_diagnostics("sample-0001")
+    assert diag["method"] == "sample"
+    assert "convergence_warning" in diag
+    assert "sampler_stats_warning" in diag
 
 
 def _write_csv_run(run_id):
@@ -1031,22 +1125,15 @@ def test_pathologies_validates_top_k(tmp_path, monkeypatch):
 def test_ebfmi_is_reported_not_swallowed(tmp_path, monkeypatch):
     """az.bfmi raises TypeError on an arviz 1.2 DataTree, and a bare `except:
     pass` turned that into E-BFMI silently absent from every sample run — for the
-    diagnostic most specific to funnel geometry."""
+    diagnostic most specific to funnel geometry. `_sampler_stats` now feeds it a
+    plain (chain, draw) `energy__` array off the typed draws layer instead, so
+    that DataTree can no longer reach it -- this guards the `except Exception`
+    around the az.bfmi call staying narrow enough to still report a real failure."""
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    import arviz as az
-
-    rng = np.random.default_rng(0)
-    idata = az.from_dict(
-        {
-            "posterior": {"theta": rng.normal(size=(2, 200))},
-            "sample_stats": {
-                "energy": rng.normal(size=(2, 200)),
-                "diverging": np.zeros((2, 200), dtype=bool),
-            },
-        }
-    )
-    runstore.write_meta("sample-0001", {"method": "sample", "status": "done"})
-    idata.to_netcdf(str(runstore.idata_path("sample-0001")))
+    _write_run_with_stats("sample-0001", diverging=False, tree_depth=3)
+    # stansummary's binary is not available in the offline suite; this test is
+    # about E-BFMI, not R-hat/ESS, so the summary call is stubbed out entirely.
+    monkeypatch.setattr(diagnostics.stansummary, "summarize", lambda paths, **kw: {})
     d = diagnostics.run_diagnostics("sample-0001")
     assert d.get("min_ebfmi") is not None
     assert "ebfmi_warning" not in d
