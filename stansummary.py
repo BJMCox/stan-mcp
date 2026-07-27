@@ -11,6 +11,12 @@ whose only job is to load that same CSV into a pandas DataFrame.
 Only ever call this for `method == "sample"`. `stansummary` does not refuse other
 input: handed a variational run it reports `R_hat 0.999997` and `ESS_bulk 991.432`
 for IID approximate draws — meaningless numbers in valid-looking output.
+
+Every failure of this module's public surface (`summarize`, `parse`) is a
+`RunError`. That is a contract, not an accident: `diagnostics._convergence`
+degrades a failure here into a warning so `run_diagnostics` still answers, and a
+third-party exception type leaking through instead used to escape both
+`run_diagnostics` and `run_geometry` as an unhandled `ValueError`.
 """
 
 from __future__ import annotations
@@ -29,9 +35,30 @@ _TIMEOUT_S = 300
 
 
 def _binary() -> Path:
-    import cmdstanpy
+    """Path to CmdStan's `stansummary`, or a `RunError` saying how to get one.
 
-    p = Path(cmdstanpy.cmdstan_path()) / "bin" / "stansummary"
+    `cmdstanpy.cmdstan_path()` raises a bare `ValueError` when CmdStan is absent
+    ("No CmdStan installation found", "No CmdStan directory, path ... does not
+    exist") — a third-party type no caller of this module catches, which is how
+    it used to propagate out of `run_diagnostics` and `run_geometry` instead of
+    degrading to a warning.
+
+    Resolve-and-report only, deliberately NOT `toolchain.ensure_cmdstan()`: that
+    *installs* CmdStan on demand, so routing a read-only diagnostic through it
+    would kick off a multi-minute download as a side effect of asking for R-hat.
+    The remediation wording is `toolchain`'s, so the hint is the same either way.
+    """
+    try:
+        import cmdstanpy
+
+        root = Path(cmdstanpy.cmdstan_path())
+    except Exception as exc:  # noqa: BLE001 - surfaced as a remediation message
+        raise RunError(
+            "CmdStan is not available, so its stansummary cannot be run "
+            f'({exc}). Run `python -c "import cmdstanpy; '
+            'cmdstanpy.install_cmdstan()"` manually.'
+        ) from exc
+    p = root / "bin" / "stansummary"
     if not p.exists():
         raise RunError(f"CmdStan's stansummary binary is not present at {p}")
     return p
@@ -104,7 +131,17 @@ def summarize(
             # "Unrecognized parameter(s): '..._1[csv]'".
             *csv_paths,
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_TIMEOUT_S)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_TIMEOUT_S)
+        except subprocess.TimeoutExpired as exc:
+            # TimeoutExpired is not a RunError and would escape this module's
+            # contract exactly as cmdstan_path()'s ValueError did.
+            raise RunError(
+                f"stansummary did not finish within {_TIMEOUT_S}s over "
+                f"{len(csv_paths)} draws CSV(s)"
+            ) from exc
+        except OSError as exc:
+            raise RunError(f"could not execute stansummary at {cmd[0]}: {exc}") from exc
         if proc.returncode != 0:
             # Check the EXIT CODE, never the file: a failure still creates the
             # output path, empty, which would parse as a model with no parameters.

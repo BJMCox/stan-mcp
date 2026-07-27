@@ -100,6 +100,37 @@ def test_summarize_raises_on_nonzero_exit(monkeypatch, tmp_path):
         stansummary.summarize(["a.csv"])
 
 
+def test_binary_reports_a_missing_cmdstan_as_a_run_error(monkeypatch):
+    """cmdstanpy.cmdstan_path() raises a bare ValueError when CmdStan is absent.
+
+    Nothing above this module catches ValueError, so it used to propagate out of
+    run_diagnostics AND run_geometry instead of degrading to a warning. The
+    message must also carry the remediation hint, not just the raw exception.
+    """
+    import cmdstanpy
+
+    def _no_cmdstan():
+        raise ValueError("No CmdStan directory, path /nonexistent does not exist.")
+
+    monkeypatch.setattr(cmdstanpy, "cmdstan_path", _no_cmdstan)
+    with pytest.raises(errors.RunError, match="install_cmdstan"):
+        stansummary._binary()
+
+
+def test_summarize_reports_a_timeout_as_a_run_error(monkeypatch, tmp_path):
+    """TimeoutExpired is not a RunError and would escape this module's contract
+    exactly as cmdstan_path()'s ValueError did."""
+    import subprocess
+
+    def _timeout(*a, **k):
+        raise subprocess.TimeoutExpired(cmd="stansummary", timeout=stansummary._TIMEOUT_S)
+
+    monkeypatch.setattr(stansummary, "_binary", lambda: tmp_path / "stansummary")
+    monkeypatch.setattr(subprocess, "run", _timeout)
+    with pytest.raises(errors.RunError, match=f"within {stansummary._TIMEOUT_S}s"):
+        stansummary.summarize(["a.csv"])
+
+
 def test_summarize_passes_sig_figs_18_and_percentiles(monkeypatch, tmp_path):
     """--sig_figs defaults to 2; unset, every reported number rounds to 2 s.f."""
     import subprocess

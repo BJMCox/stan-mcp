@@ -398,22 +398,39 @@ def _finite(x):
 
 
 def _convergence(run_id: str) -> dict:
+    """`_convergence_stats`, degraded to a warning on any failure.
+
+    Surfaced, never swallowed: silently dropping R-hat and ESS, the two headline
+    diagnostics, is exactly how E-BFMI went missing. And never fatal: a run with
+    no sidecar (predates the typed draws layer, or the sidecar write failed)
+    lands here too, and must degrade to the method-diagnostics fallback rather
+    than raise out of `run_diagnostics`.
+
+    The clause is deliberately broad rather than `except RunError`. This is a
+    degrade-to-warning site by design, so what matters is that NO failure to read
+    one diagnostic becomes fatal for the whole call — independent of which layer
+    below failed and which exception type it chose. Narrowing it to `RunError`
+    is what let `cmdstanpy.cmdstan_path()`'s `ValueError` escape both
+    `run_diagnostics` and `run_geometry` on a box with no CmdStan install.
+    """
+    try:
+        return _convergence_stats(run_id)
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        return {"convergence_warning": f"R-hat/ESS unavailable: {exc}"}
+
+
+def _convergence_stats(run_id: str) -> dict:
     """Worst R-hat and smallest bulk/tail ESS over all parameter elements.
 
     Same stansummary output the summary uses, so the two cannot disagree. Sampler
     stats (`lp__` and friends) are excluded: they are not model parameters and their
     R-hat is not what the verdict is about.
+
+    Free to raise: `_convergence` is the only caller and turns any failure into a
+    `convergence_warning`.
     """
-    try:
-        sc = draws.schema(run_id)
-        stats = stansummary.summarize(draws.csv_files(run_id))
-    except RunError as exc:
-        # Surfaced, never swallowed: silently dropping R-hat and ESS, the two
-        # headline diagnostics, is exactly how E-BFMI went missing. A run with no
-        # sidecar (predates the typed draws layer, or the sidecar write failed)
-        # lands here too, degrading to the method-diagnostics fallback rather
-        # than raising out of run_diagnostics.
-        return {"convergence_warning": f"R-hat/ESS unavailable: {exc}"}
+    sc = draws.schema(run_id)
+    stats = stansummary.summarize(draws.csv_files(run_id))
 
     worst_rhat: tuple[float, str] | None = None
     min_bulk: float | None = None
@@ -1196,7 +1213,12 @@ def run_geometry(
         if eig["condition_number"] > 100:
             issues.append(f"condition number {eig['condition_number']}")
 
-    rhat = run_diagnostics(run_id).get("max_rhat")
+    # `_convergence`, not `run_diagnostics`: the same number, without spawning a
+    # second stansummary subprocess and re-parsing every CSV for sampler stats to
+    # reach one field. It also keeps this the only public entry point that is not
+    # re-entered from inside another — which is what dragged the stansummary
+    # binary into the offline geometry tests.
+    rhat = _convergence(run_id).get("max_rhat")
     if rhat is not None and rhat > _RHAT_MAX:
         out["provisional"] = (
             f"max R-hat {rhat} > {_RHAT_MAX}: the chains disagree, so there is not "

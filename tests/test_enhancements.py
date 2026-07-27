@@ -341,6 +341,39 @@ def test_convergence_reports_a_warning_when_stansummary_itself_raises(tmp_path, 
     assert diagnostics._convergence(rid) == {"convergence_warning": "R-hat/ESS unavailable: boom"}
 
 
+def test_convergence_degrades_on_a_non_run_error_too(tmp_path, monkeypatch):
+    """The handler is deliberately broad, and it has to be.
+
+    `cmdstanpy.cmdstan_path()` raises a bare ValueError when CmdStan is absent;
+    catching only RunError here let that escape run_diagnostics AND run_geometry,
+    breaking the documented promise of a "unknown" verdict when the six measured
+    keys cannot be read. Any exception type must become a warning instead.
+    """
+    rid = _typed_run(tmp_path, monkeypatch)
+
+    def _value_error(paths, **kw):
+        raise ValueError("No CmdStan directory, path /nonexistent does not exist.")
+
+    monkeypatch.setattr(diagnostics.stansummary, "summarize", _value_error)
+    got = diagnostics._convergence(rid)
+    assert "No CmdStan directory" in got["convergence_warning"]
+    assert "max_rhat" not in got
+
+
+def test_run_diagnostics_reports_unknown_when_cmdstan_is_absent(tmp_path, monkeypatch):
+    """End-to-end on the documented contract: a sample run whose stansummary
+    cannot run at all must come back with verdict "unknown", not raise."""
+    rid = _typed_run(tmp_path, monkeypatch)
+
+    def _value_error(paths, **kw):
+        raise ValueError("No CmdStan installation found.")
+
+    monkeypatch.setattr(diagnostics.stansummary, "summarize", _value_error)
+    out = diagnostics.run_diagnostics(rid)
+    assert out["verdict"] == "unknown"
+    assert "No CmdStan installation" in out["convergence_warning"]
+
+
 def test_sampler_stats_reads_typed_arrays_and_reports_ebfmi():
     """E-BFMI is not in stansummary (only in `diagnose`, as prose), so it stays
     computed from energy__ -- fed a clean array rather than a DataTree."""
@@ -1353,6 +1386,24 @@ def test_constrained_matrix_maps_bridgestan_names_via_recorded_dims(tmp_path, mo
 
 
 # --- posterior geometry ---
+def _stub_stansummary(monkeypatch, rid, rhat=1.0):
+    """Stub stansummary for a run, keyed off that run's own sidecar names.
+
+    `run_geometry` reads max R-hat through `_convergence`, which shells out to the
+    real `stansummary` binary. Without this the geometry tests are the only ones
+    in this file that reach a live toolchain: on a box without CmdStan they fail
+    outright, and on a box with one they silently run the binary against a
+    two-line fixture CSV, making their behaviour depend on the machine.
+    """
+    sc = diagnostics.draws.schema(rid)
+    rows = {
+        cmdstan_name: {"R_hat": rhat, "ESS_bulk": 1000.0, "ESS_tail": 1000.0}
+        for name, spec in sc["params"].items()
+        for _, cmdstan_name in diagnostics.draws.element_labels(name, tuple(spec["dims"]))
+    }
+    monkeypatch.setattr(diagnostics.stansummary, "summarize", lambda paths, **kw: rows)
+
+
 def _geom_run(monkeypatch, tmp_path, cols: dict, n_chain=4, n_draw=500):
     """A run whose unconstrained draws are planted. `cols` maps name -> (draws,)
     array of length n_chain*n_draw. The BridgeStan round-trip is stubbed: what
@@ -1385,6 +1436,7 @@ def _geom_run(monkeypatch, tmp_path, cols: dict, n_chain=4, n_draw=500):
         "_unconstrained_draws",
         lambda rid, d: (u3, names, {"scale": "unconstrained"}),
     )
+    _stub_stansummary(monkeypatch, rid)
     return rid
 
 
@@ -1607,6 +1659,7 @@ def test_geometry_falls_back_when_draws_cannot_be_unconstrained(tmp_path, monkey
 
     monkeypatch.setattr(_compile, "request_so", lambda *a, **k: {"status": "ready"})
     monkeypatch.setattr(density, "get_model", lambda *a, **k: _Rejecting())
+    _stub_stansummary(monkeypatch, rid)
 
     g = diagnostics.run_geometry(rid)
     assert "error" not in g, g
@@ -1616,6 +1669,35 @@ def test_geometry_falls_back_when_draws_cannot_be_unconstrained(tmp_path, monkey
     assert "Re-run" in g["scale_reason"]
     # and it still did the analysis, on all four constrained components
     assert g["n_dims"] == 4
+
+
+def test_geometry_flags_provisional_when_rhat_is_high(tmp_path, monkeypatch):
+    """With chains disagreeing there is not yet one posterior whose geometry this
+    describes, so the result must say so. Pins that the R-hat comes from
+    `_convergence` (stubbed here) rather than being invented or dropped."""
+    rng = np.random.default_rng(21)
+    cols = {"b1": rng.normal(size=2000), "b2": rng.normal(size=2000)}
+    rid = _geom_run(monkeypatch, tmp_path, cols)
+    _stub_stansummary(monkeypatch, rid, rhat=1.5)
+    g = diagnostics.run_geometry(rid)
+    assert "1.5" in g["provisional"] and "R-hat" in g["provisional"]
+
+
+def test_geometry_reads_rhat_without_reentering_run_diagnostics(tmp_path, monkeypatch):
+    """run_geometry used to call the whole of run_diagnostics for one number,
+    which spawned a second stansummary subprocess and re-parsed every CSV for
+    sampler stats it then discarded. Fail the test if that returns."""
+    rng = np.random.default_rng(22)
+    cols = {"b1": rng.normal(size=2000), "b2": rng.normal(size=2000)}
+    rid = _geom_run(monkeypatch, tmp_path, cols)
+
+    def _boom(*a, **kw):
+        raise AssertionError("run_geometry must not re-enter run_diagnostics")
+
+    monkeypatch.setattr(diagnostics, "run_diagnostics", _boom)
+    g = diagnostics.run_geometry(rid)
+    assert g["verdict"] in {"pass", "warn"}
+    assert "provisional" not in g  # the stubbed R-hat is healthy
 
 
 def test_sample_defaults_to_round_tripping_output_precision():
