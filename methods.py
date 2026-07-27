@@ -17,6 +17,10 @@ METHODS: dict[str, dict] = {
             # config.max_parallel_chains() when omitted (see sample._runner).
             "parallel_chains",
             "threads_per_chain",
+            # Output precision. Defaulted to sample._OUTPUT_SIG_FIGS (17) so
+            # constrained draws round-trip through BridgeStan; exposed so a caller
+            # can trade that back for CSV size on a very large run.
+            "sig_figs",
         },
     },
     "optimize": {"cmd": "optimize", "draws": False, "inits": True, "args": {"algorithm", "iter"}},

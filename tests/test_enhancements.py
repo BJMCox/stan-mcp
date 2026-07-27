@@ -980,3 +980,85 @@ def test_geometry_reports_preparing_not_an_error(tmp_path, monkeypatch):
 
     monkeypatch.setattr(diagnostics, "_unconstrained_draws", _pending)
     assert diagnostics.run_geometry("sample-0001")["status"] == "preparing"
+
+
+def test_geometry_falls_back_when_draws_cannot_be_unconstrained(tmp_path, monkeypatch):
+    """Stan's *_free functions validate the constraint they invert, so a draw read
+    back at limited CSV precision can be rejected: simplex_free's tolerance is 1e-8
+    and a simplex written at 6 significant figures only sums to 1 to about that.
+
+    One rejected draw used to abort the whole call, so get_run_geometry hard-failed
+    on every mixture or LKJ model. It must degrade to the constrained scale and say
+    so instead -- reported, not swallowed, and not fatal.
+    """
+    import arviz as az
+
+    import density
+
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    n_chain, n_draw = 2, 50
+    rng = np.random.default_rng(4)
+    idata = az.from_dict(
+        {
+            "posterior": {
+                "theta": rng.random((n_chain, n_draw, 3)),
+                "s": rng.random((n_chain, n_draw)),
+            }
+        }
+    )
+    runstore.write_meta("sample-0001", {"method": "sample", "status": "done"})
+    runstore.persist_inputs("sample-0001", "parameters { simplex[3] theta; real s; } model { }", {})
+    idata.to_netcdf(str(runstore.idata_path("sample-0001")))
+
+    class _Rejecting:
+        def param_names(self):
+            return ["theta.1", "theta.2", "theta.3", "s"]
+
+        def param_unc_names(self):
+            return ["theta.1", "theta.2", "s"]
+
+        def param_unc_num(self):
+            return 3
+
+        def param_unconstrain(self, _row):
+            raise RuntimeError(
+                "param_unconstrain() failed with exception: Exception: "
+                "stan::math::simplex_free: Simplex variable is not a valid simplex. "
+                "sum(Simplex variable) = 0.99999999, but should be 1"
+            )
+
+    import compile as _compile
+
+    monkeypatch.setattr(_compile, "request_so", lambda *a, **k: {"status": "ready"})
+    monkeypatch.setattr(density, "get_model", lambda *a, **k: _Rejecting())
+
+    g = diagnostics.run_geometry("sample-0001")
+    assert "error" not in g, g
+    assert g["scale"] == "constrained"
+    # the actual Stan message must survive into the reason, not be flattened away
+    assert "simplex_free" in g["scale_reason"]
+    assert "Re-run" in g["scale_reason"]
+    # and it still did the analysis, on all four constrained components
+    assert g["n_dims"] == 4
+
+
+def test_sample_defaults_to_round_tripping_output_precision():
+    """CmdStan's default 6 sig figs loses enough precision that a constrained draw
+    read back misses its constraint; 17 is where a double round-trips exactly."""
+    import sample as _sample
+
+    seen = {}
+
+    class _Model:
+        def sample(self, **kw):
+            seen.update(kw)
+            return "fit"
+
+    mgr = _sample.RunManager()
+    mgr._runner("sample", _Model(), {}, {"chains": 2})
+    assert seen["sig_figs"] == 17
+
+    # an explicit value still wins: a huge run may prefer the disk saving
+    seen.clear()
+    mgr._runner("sample", _Model(), {}, {"chains": 2, "sig_figs": 8})
+    assert seen["sig_figs"] == 8

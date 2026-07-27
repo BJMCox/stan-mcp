@@ -392,3 +392,100 @@ def test_live_generate_quantities(tmp_path, monkeypatch):
     else:
         summ = diagnostics.run_summary(run_id_gq)
         assert "summary" in summ
+
+
+# matrix elements get distinct, well-separated means (11,12,13 / 21,22,23) so a
+# row/column-major mix-up in the name-to-dim mapping is unmistakable rather than
+# merely a slightly-off number; the simplex makes the unconstrained dimension
+# differ from the constrained one (3 -> 2).
+SHAPED = """
+parameters {
+  matrix[2, 3] m;
+  simplex[3] theta;
+  real<lower=0> s;
+}
+model {
+  for (i in 1:2) { for (j in 1:3) { m[i, j] ~ normal(10 * i + j, 0.1); } }
+  theta ~ dirichlet([2.0, 5.0, 9.0]');
+  s ~ lognormal(0, 0.5);
+}
+"""
+
+
+def test_live_bridgestan_name_mapping_on_shaped_params(tmp_path, monkeypatch):
+    """The BridgeStan `m.2.1` name to arviz array-dim mapping, on a model that
+    actually has multi-dimensional and dimension-changing parameters.
+
+    This is the one line in run_geometry whose failure is silent: get it wrong
+    and every reported pair is labelled with the wrong parameter name. Nothing
+    else covers it -- the offline tests monkeypatch _unconstrained_draws away,
+    and the collinearity test's params are all scalars, so `pos` is always 0.
+
+    Checked two independent ways: against the prior means the draws must
+    concentrate on, and against CmdStan's own CSV column names, which use the
+    same `m.i.j` convention and are produced by code that shares nothing with
+    the mapping under test.
+    """
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    import asyncio
+    import time
+
+    import density
+    import diagnostics
+    import runstore
+    import sample
+
+    mgr = sample.RunManager()
+    started = mgr.start_run(
+        SHAPED,
+        {},
+        method="sample",
+        seed=2,
+        method_args={"chains": 2, "iter_warmup": 500, "iter_sampling": 500},
+    )
+    rid = started["run_id"]
+    result = asyncio.run(mgr.await_run(rid, timeout=300))
+    assert result["status"] == "done", result["meta"].get("stderr", "")[:500]
+
+    inputs = runstore.load_inputs(rid)
+    model = density.get_model(inputs["source"], inputs["data"])
+    bs_names = list(model.param_names())
+    # 6 matrix elements + 3 simplex components + 1 scalar
+    assert len(bs_names) == 10, bs_names
+
+    idata = diagnostics._load_idata(rid)
+    X = diagnostics._constrained_matrix(idata, bs_names)
+    assert X.shape == (1000, 10)
+
+    # (1) each matrix element must land on its own prior mean, 10*i + j
+    for k, nm in enumerate(bs_names):
+        if not nm.startswith("m."):
+            continue
+        i, j = (int(p) for p in nm.split(".")[1:])
+        got = float(X[:, k].mean())
+        assert abs(got - (10 * i + j)) < 0.5, f"{nm} resolved to {got}, wants {10 * i + j}"
+
+    # (2) independent oracle: CmdStan writes its CSV header with the same
+    # `m.i.j` spelling, so column nm from the CSV and column k here are the same
+    # quantity. Compared as multisets, since the two paths need not agree on the
+    # order in which chains are concatenated.
+    df = diagnostics._draws_df(rid)
+    for k, nm in enumerate(bs_names):
+        assert nm in df.columns, f"{nm} missing from CmdStan CSV: {list(df.columns)[:12]}"
+        mine = np.sort(X[:, k])
+        theirs = np.sort(df[nm].to_numpy(dtype=float))
+        assert np.allclose(mine, theirs), f"{nm} mismatch vs CmdStan CSV"
+
+    # (3) the unconstrained space is genuinely a different size: the simplex
+    # contributes 2 dims, not 3, so param_unc_names() cannot be assumed to line
+    # up with param_names().
+    assert model.param_unc_num() == 9
+    for _ in range(60):
+        geom = diagnostics.run_geometry(rid)
+        if geom.get("status") != "preparing":
+            break
+        time.sleep(3)
+    else:
+        pytest.fail("BridgeStan artifact never finished building")
+    assert geom["scale"] == "unconstrained"
+    assert geom["n_dims"] == 9, geom

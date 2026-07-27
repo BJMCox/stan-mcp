@@ -25,6 +25,18 @@ def _now() -> str:
 # index; this is the detail view, so it gets a bounded excerpt instead.
 _ERROR_EXCERPT_CHARS = 800
 
+# CmdStan writes draws at 6 significant figures by default, which is lossy enough
+# that a constrained draw read back from the CSV misses its constraint: a simplex
+# sums to 1 only to ~1e-8, exactly stan::math::simplex_free's tolerance, so
+# BridgeStan rejects about 1.5% of draws (measured: 15/1000) and run_geometry can
+# never unconstrain such a model. 17 is the digit count at which an IEEE-754 double
+# round-trips exactly, so the error becomes machine epsilon (measured max |sum-1|
+# 2.2e-16) and stays clear of the tolerance at ANY simplex dimension -- 10 would
+# suffice for simplex[3] (1e-10) but the error grows with the number of components.
+# Costs ~1.9x the CSV bytes (measured 76,631 -> 146,710 on a 2-chain 1000-draw run);
+# override via method_args.sig_figs when a large run's disk footprint matters more.
+_OUTPUT_SIG_FIGS = 17
+
 
 def _error_excerpt(stderr: str) -> str:
     text = stderr.strip()
@@ -139,6 +151,7 @@ class RunManager:
             # min(cpu_count(), chains) per run, so `max_workers` concurrent
             # runs would oversubscribe the machine several times over.
             kwargs.setdefault("parallel_chains", config.max_parallel_chains())
+            kwargs.setdefault("sig_figs", _OUTPUT_SIG_FIGS)
         cmd = methods.METHODS[method]["cmd"]
         return getattr(model, cmd)(data=data, **kwargs)
 

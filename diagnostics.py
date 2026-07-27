@@ -771,8 +771,32 @@ def _unconstrained_draws(run_id: str, idata) -> tuple[np.ndarray, list[str], dic
     m = density.get_model(source, inputs["data"])
     X = _constrained_matrix(idata, m.param_names())
     unc = np.empty((X.shape[0], m.param_unc_num()))
-    for i in range(X.shape[0]):
-        unc[i] = m.param_unconstrain(X[i])
+    try:
+        for i in range(X.shape[0]):
+            unc[i] = m.param_unconstrain(X[i])
+    except Exception as exc:  # noqa: BLE001
+        # Stan's *_free functions VALIDATE the constraint they invert, and a draw
+        # read back from a CSV only holds it to the written precision: at CmdStan's
+        # default 6 sig figs a simplex sums to 1 to about 1e-8, which IS
+        # simplex_free's tolerance, so ~1.5% of draws are rejected (measured:
+        # 15/1000) — and one rejection aborts the whole loop. Runs sampled since
+        # sample._OUTPUT_SIG_FIGS avoid it; a run recorded before that cannot be
+        # unconstrained at all, so report constrained draws and say why instead of
+        # failing the call. Same for any other constraint whose inverse validates
+        # (unit_vector, corr_matrix, cholesky_factor_corr).
+        Xc, cnames = _draw_matrix(idata)
+        return (
+            Xc.reshape(n_chain, n_draw, -1),
+            cnames,
+            {
+                "scale": "constrained",
+                "scale_reason": (
+                    f"could not unconstrain this run's draws ({exc}); reporting the "
+                    "constrained scale, on which some dependence is mechanical. "
+                    "Re-run the model to get the unconstrained geometry."
+                ),
+            },
+        )
     return unc.reshape(n_chain, n_draw, -1), list(m.param_unc_names()), {"scale": "unconstrained"}
 
 
