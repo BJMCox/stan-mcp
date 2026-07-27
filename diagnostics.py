@@ -940,7 +940,13 @@ def _constrained_matrix(d: draws.Draws, bs_names: list[str]) -> np.ndarray:
             raise RunError(f"BridgeStan names parameter {base!r}, absent from the run's draws")
         flat = arr.reshape(arr.shape[0] * arr.shape[1], -1)
         if idx:
-            pos = int(np.ravel_multi_index(tuple(int(i) - 1 for i in idx), arr.shape[2:]))
+            try:
+                pos = int(np.ravel_multi_index(tuple(int(i) - 1 for i in idx), arr.shape[2:]))
+            except ValueError as exc:
+                raise RunError(
+                    f"BridgeStan name {nm!r} does not fit parameter {base!r}'s "
+                    f"recorded dims {arr.shape[2:]!r}: {exc}"
+                ) from exc
         else:
             pos = 0
         cols.append(flat[:, pos])

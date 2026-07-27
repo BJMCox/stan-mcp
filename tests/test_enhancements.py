@@ -1317,13 +1317,20 @@ def test_sampler_stats_reports_ebfmi_warning_when_bfmi_raises(monkeypatch):
 
 def test_constrained_matrix_maps_bridgestan_names_via_recorded_dims(tmp_path, monkeypatch):
     """BridgeStan spells elements m.2.1 (1-based, column-major). Resolving that
-    against the sidecar's dims replaces ravel_multi_index over arviz's dim order."""
+    against the sidecar's dims replaces ravel_multi_index over arviz's dim order.
+
+    `m` is non-square (2x3, matching the live SHAPED model): a square fixture
+    catches a transposed reshape (every value differs) but not a stride error
+    that only shows up when the two dims are unequal.
+    """
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     rid = "sample-0001"
     runstore.write_meta(rid, {"method": "sample", "status": "done"})
     csvdir = runstore.run_dir(rid, create=True) / "csv"
     csvdir.mkdir(parents=True, exist_ok=True)
-    (csvdir / "a.csv").write_text("# c\nlp__,s,m.1.1,m.2.1,m.1.2,m.2.2\n-1,9.0,11,21,12,22\n")
+    (csvdir / "a.csv").write_text(
+        "# c\nlp__,s,m.1.1,m.2.1,m.1.2,m.2.2,m.1.3,m.2.3\n-1,9.0,11,21,12,22,13,23\n"
+    )
     diagnostics.draws.schema_path(rid).write_text(
         json.dumps(
             {
@@ -1331,7 +1338,7 @@ def test_constrained_matrix_maps_bridgestan_names_via_recorded_dims(tmp_path, mo
                 "files": ["a.csv"],
                 "params": {
                     "s": {"dims": [], "cols": [1]},
-                    "m": {"dims": [2, 2], "cols": [2, 4, 3, 5]},
+                    "m": {"dims": [2, 3], "cols": [2, 4, 6, 3, 5, 7]},
                 },
                 "sampler_stats": {"lp__": {"dims": [], "cols": [0]}},
             }
@@ -1339,9 +1346,10 @@ def test_constrained_matrix_maps_bridgestan_names_via_recorded_dims(tmp_path, mo
     )
     d = diagnostics.draws.load(rid)
     # BridgeStan's own order for this model, column-major
-    X = diagnostics._constrained_matrix(d, ["m.1.1", "m.2.1", "m.1.2", "m.2.2", "s"])
-    assert X.shape == (1, 5)
-    assert X[0].tolist() == [11.0, 21.0, 12.0, 22.0, 9.0]
+    bs_names = ["m.1.1", "m.2.1", "m.1.2", "m.2.2", "m.1.3", "m.2.3", "s"]
+    X = diagnostics._constrained_matrix(d, bs_names)
+    assert X.shape == (1, 7)
+    assert X[0].tolist() == [11.0, 21.0, 12.0, 22.0, 13.0, 23.0, 9.0]
 
 
 # --- posterior geometry ---

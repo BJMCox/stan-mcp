@@ -467,26 +467,43 @@ def test_live_bridgestan_name_mapping_on_shaped_params(tmp_path, monkeypatch):
         got = float(X[:, k].mean())
         assert abs(got - (10 * i + j)) < 0.5, f"{nm} resolved to {got}, wants {10 * i + j}"
 
-    # (2) Independent oracle: the sidecar's recorded columns must place L[i,j]
-    # where the CSV header says L.i.j is. A mapping error here mislabels
-    # parameters rather than raising, so it is checked against CmdStan's own
-    # header, produced by code that shares nothing with the mapping under test.
-    lines = [
-        ln
-        for ln in Path(diagnostics.draws.csv_files(rid)[0]).read_text().splitlines()
-        if ln and not ln.startswith("#")
-    ]
-    header = lines[0].split(",")
-    raw = np.asarray([[float(v) for v in ln.split(",")] for ln in lines[1:]])
+    # (2) Independent oracle on X itself: CmdStan writes its CSV header with the
+    # same `m.i.j`/`theta.j`/`s` spelling _constrained_matrix resolves against,
+    # so column `nm` from the raw CSV and column `k` of X are the same quantity
+    # -- for every one of the 10 bs_names, not just `m`. Read every chain's CSV
+    # in the sidecar's own file order and concatenate, then compare as sorted
+    # multisets, since the two paths need not agree on how chains are ordered.
+    csv_paths = diagnostics.draws.csv_files(rid)
+    header = None
+    chain_rows = []
+    for p in csv_paths:
+        lines = [ln for ln in Path(p).read_text().splitlines() if ln and not ln.startswith("#")]
+        if header is None:
+            header = lines[0].split(",")
+        chain_rows.append(np.asarray([[float(v) for v in ln.split(",")] for ln in lines[1:]]))
+    assert header is not None  # csv_paths is never empty for a done sample run
+    raw = np.concatenate(chain_rows, axis=0)
+    assert raw.shape[0] == X.shape[0], f"chain-count mismatch: raw {raw.shape} vs X {X.shape}"
+    for k, nm in enumerate(bs_names):
+        col = header.index(nm)
+        mine, theirs = np.sort(X[:, k]), np.sort(raw[:, col])
+        assert np.allclose(mine, theirs), f"{nm} mismatch vs CmdStan CSV"
+
+    # (3) Independent oracle on the sidecar specifically, one layer below (2):
+    # its recorded columns must place m[i,j] where the CSV header says m.i.j
+    # is. Checked against chain 0's own raw rows -- `d.params["m"]`'s first axis
+    # is chain 0, the same file as `chain_rows[0]`, by the sidecar's own file
+    # order -- so this does not depend on (2)'s cross-chain concatenation.
     for i in range(2):
         for j in range(3):
             col = header.index(f"m.{i + 1}.{j + 1}")
-            assert np.allclose(d.params["m"][0, :, i, j], raw[:, col]), f"m[{i + 1},{j + 1}]"
+            got = d.params["m"][0, :, i, j]
+            assert np.allclose(got, chain_rows[0][:, col]), f"m[{i + 1},{j + 1}]"
             # and the value must be the prior mean for THAT element, so a
             # transpose is caught by magnitude and not only by equality
-            assert abs(float(d.params["m"][0, :, i, j].mean()) - (10 * (i + 1) + (j + 1))) < 0.5
+            assert abs(float(got.mean()) - (10 * (i + 1) + (j + 1))) < 0.5
 
-    # (3) the unconstrained space is genuinely a different size: the simplex
+    # (4) the unconstrained space is genuinely a different size: the simplex
     # contributes 2 dims, not 3, so param_unc_names() cannot be assumed to line
     # up with param_names().
     assert model.param_unc_num() == 9
