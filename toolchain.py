@@ -29,7 +29,7 @@ def ensure_bridgestan() -> str:
         raise ToolchainError(
             "BridgeStan source tree unavailable and could not be downloaded "
             f"({exc}). Check network access or run "
-            "`python -c \"from bridgestan.compile import get_bridgestan_path; "
+            '`python -c "from bridgestan.compile import get_bridgestan_path; '
             'get_bridgestan_path()"` manually.'
         ) from exc
 
@@ -44,6 +44,6 @@ def ensure_cmdstan() -> str:
         except Exception as exc:  # noqa: BLE001
             raise ToolchainError(
                 "CmdStan not installed and install_cmdstan() failed "
-                f"({exc}). Run `python -c \"import cmdstanpy; "
+                f'({exc}). Run `python -c "import cmdstanpy; '
                 'cmdstanpy.install_cmdstan()"` manually.'
             ) from exc

@@ -25,6 +25,7 @@ pytest = "*"
 pytest-asyncio = "*"
 ruff = "*"
 pyright = "*"
+psutil = ">=7.2.2,<8"
 
 [pypi-dependencies]
 mcp = ">=1.0"

@@ -17,6 +17,204 @@ DATA = {"N": 5, "y": [0, 1, 0, 1, 1]}
 
 BERNOULLI_GQ = BERNOULLI + "\ngenerated quantities { int y_sim = bernoulli_rng(theta); }\n"
 
+BERNOULLI_LL = BERNOULLI + (
+    "\ngenerated quantities {\n"
+    "  vector[N] log_lik;\n"
+    "  for (n in 1:N) log_lik[n] = bernoulli_lpmf(y[n] | theta);\n"
+    "}\n"
+)
+
+
+def _sample(mgr, stan, seed):
+    import asyncio
+
+    started = mgr.start_run(
+        stan,
+        DATA,
+        method="sample",
+        seed=seed,
+        method_args={"chains": 2, "iter_warmup": 300, "iter_sampling": 300},
+    )
+    result = asyncio.run(mgr.await_run(started["run_id"], timeout=120))
+    assert result["status"] == "done"
+    return started["run_id"]
+
+
+def test_live_full_diagnostics_verdict(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    import diagnostics
+    import sample
+
+    run_id = _sample(sample.RunManager(), BERNOULLI, 1)
+    diag = diagnostics.run_diagnostics(run_id)
+    assert diag["verdict"] in {"pass", "warn"}
+    assert "max_rhat" in diag and "min_ess_bulk" in diag
+    assert diag["divergences"] == 0
+
+
+def test_live_run_loo_and_compare(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    import diagnostics
+    import sample
+
+    mgr = sample.RunManager()
+    a = _sample(mgr, BERNOULLI_LL, 1)
+    b = _sample(mgr, BERNOULLI_LL, 2)
+    loo = diagnostics.run_loo(a)
+    assert "elpd_loo" in loo and loo["n_high_pareto_k"] == 0
+    cmp = diagnostics.compare_runs([a, b])
+    assert {r["run_id"] for r in cmp["comparison"]} == {a, b}
+
+
+def test_live_progress_and_inputs(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    import runstore
+    import sample
+
+    mgr = sample.RunManager()
+    run_id = _sample(mgr, BERNOULLI, 1)
+    prog = mgr.get_run_progress(run_id)
+    assert prog["status"] == "done" and prog["draws_written"] == 600
+    got = runstore.load_inputs(run_id)
+    assert "bernoulli" in got["source"] and got["data"] == DATA
+
+
+def test_live_compile_pedantic_warns(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    import compile as c
+
+    out = c.compile_model("parameters { real x; } model { }", warn_pedantic=True)
+    assert "error" not in out
+    assert any("was not used" in w for w in out.get("warnings", []))
+
+
+def test_live_pedantic_does_not_change_model_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    import compile as c
+
+    plain = c.compile_model(BERNOULLI)
+    pedantic = c.compile_model(BERNOULLI, warn_pedantic=True)
+    assert plain["model_id"] == pedantic["model_id"]
+    # and that canonical id matches what a run would compute
+    assert pedantic["model_id"] == c.model_id(c.resolve_source(BERNOULLI), None)
+
+
+def test_live_method_diagnostics(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    import asyncio
+
+    import diagnostics
+    import runstore
+    import sample
+
+    mgr = sample.RunManager()
+    expect = {"variational": "eta", "pathfinder": "is_resampled", "laplace": "mode_lp"}
+    for method, key in expect.items():
+        started = mgr.start_run(BERNOULLI, DATA, method=method, seed=7)
+        result = asyncio.run(mgr.await_run(started["run_id"], timeout=120))
+        assert result["status"] == "done", f"{method} did not finish"
+        # run_diagnostics must not raise despite no inference.nc, and carry the scalar
+        diag = diagnostics.run_diagnostics(started["run_id"])
+        assert diag["method"] == method
+        assert key in diag, f"{method} missing {key}: {diag}"
+        # raw draws persisted (these fits have no .runset; must come from live/)
+        assert runstore.csv_paths(started["run_id"]), f"{method} lost its CSVs"
+        # summary + draws work via the CSV fallback (no inference.nc for these)
+        summ = diagnostics.run_summary(started["run_id"], params=["theta"])
+        assert summ["source"] == "csv"
+        assert any(r["param"] == "theta" for r in summ["summary"])
+        draws = diagnostics.extract_draws(started["run_id"], "theta")
+        assert draws["source"] == "csv" and len(draws["draws"]) > 0
+
+
+def test_live_inits_from_prior_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    import asyncio
+
+    import sample
+
+    mgr = sample.RunManager()
+    first = _sample(mgr, BERNOULLI, 1)
+    # warm-start a second run from the first run's posterior mean
+    started = mgr.start_run(
+        BERNOULLI,
+        DATA,
+        method="sample",
+        seed=2,
+        method_args={"chains": 2, "iter_warmup": 300, "iter_sampling": 300},
+        inits_from=first,
+    )
+    result = asyncio.run(mgr.await_run(started["run_id"], timeout=120))
+    assert result["status"] == "done"
+
+
+def test_live_concurrent_runs_same_model(tmp_path, monkeypatch):
+    """Two concurrent runs of one model must not disturb each other's binary.
+
+    Regression: recording last-use by touching the `.stan` made cmdstanpy see a
+    source newer than the exe and relink it while the first run's chains were
+    executing that very file, so the kernel killed them all
+    (`retcodes=[-1, -1, -1, -1]`)."""
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    import asyncio
+
+    import sample
+
+    mgr = sample.RunManager(max_workers=2)
+    args = {"chains": 2, "iter_warmup": 300, "iter_sampling": 1500}
+    a = mgr.start_run(BERNOULLI, DATA, method="sample", seed=1, method_args=args)
+    # starts while `a` is still sampling, and resolves to the same model_id
+    b = mgr.start_run(BERNOULLI, DATA, method="sample", seed=2, method_args=args)
+    for started in (a, b):
+        result = asyncio.run(mgr.await_run(started["run_id"], timeout=180))
+        assert result["status"] == "done", result["meta"].get("stderr", "")[:500]
+
+
+FUNNEL = """
+parameters { real v; vector[9] x; }
+model { v ~ normal(0, 3); x ~ normal(0, exp(v/2)); }
+"""
+
+
+def test_live_pathologies_localize_funnel_neck(tmp_path, monkeypatch):
+    """Neal's funnel, centered. The divergences must point at the log-scale
+    parameter `v` and downward — the neck is at low `v` — not at any of the nine
+    `x` it governs."""
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    import asyncio
+
+    import diagnostics
+    import sample
+
+    mgr = sample.RunManager()
+    started = mgr.start_run(
+        FUNNEL,
+        None,
+        method="sample",
+        seed=5,
+        method_args={"chains": 4, "iter_warmup": 1000, "iter_sampling": 1000},
+    )
+    result = asyncio.run(mgr.await_run(started["run_id"], timeout=180))
+    assert result["status"] == "done", result["meta"].get("stderr", "")[:500]
+    if diagnostics.run_diagnostics(started["run_id"]).get("divergences", 0) == 0:
+        pytest.skip("this seed produced no divergences; nothing to localize")
+    out = diagnostics.run_pathologies(started["run_id"], permutations=400)
+    assert out["ranking"][0]["param"] == "v"
+    assert out["ranking"][0]["direction"] == "below"
+    assert out["separation"]["margin"] > 3
+
+
+def test_live_validate_data(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    import density
+    import errors
+
+    ok = density.validate_data(BERNOULLI, DATA)
+    assert ok["ok"] is True and ok["param_unc_num"] == 1
+    # missing required data (N, y) should be rejected at build time
+    with pytest.raises((errors.StanMcpError, Exception)):
+        density.validate_data(BERNOULLI, {})
+
 
 def test_compile_model_returns_artifacts(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
@@ -65,7 +263,9 @@ def test_live_sample_run(tmp_path, monkeypatch):
 
     mgr = sample.RunManager()
     started = mgr.start_run(
-        BERNOULLI, DATA, method="sample",
+        BERNOULLI,
+        DATA,
+        method="sample",
         method_args={"chains": 2, "iter_warmup": 200, "iter_sampling": 200},
     )
     result = asyncio.run(mgr.await_run(started["run_id"], timeout=120))
@@ -88,7 +288,9 @@ def test_live_generate_quantities(tmp_path, monkeypatch):
     mgr = sample.RunManager()
 
     started_a = mgr.start_run(
-        BERNOULLI, DATA, method="sample",
+        BERNOULLI,
+        DATA,
+        method="sample",
         method_args={"chains": 2, "iter_warmup": 200, "iter_sampling": 200},
     )
     result_a = asyncio.run(mgr.await_run(started_a["run_id"], timeout=120))
@@ -96,7 +298,9 @@ def test_live_generate_quantities(tmp_path, monkeypatch):
     run_id_a = started_a["run_id"]
 
     started_gq = mgr.start_run(
-        BERNOULLI_GQ, DATA, method="generate_quantities",
+        BERNOULLI_GQ,
+        DATA,
+        method="generate_quantities",
         method_args={"from_run_id": run_id_a},
     )
     result_gq = asyncio.run(mgr.await_run(started_gq["run_id"], timeout=120))

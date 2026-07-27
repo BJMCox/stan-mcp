@@ -10,9 +10,7 @@ def test_unknown_method_raises():
 
 
 def test_filters_and_injects_common():
-    kw = methods.build_kwargs(
-        "sample", 42, None, {"chains": 4, "iter_sampling": 500}
-    )
+    kw = methods.build_kwargs("sample", 42, None, {"chains": 4, "iter_sampling": 500})
     assert kw == {"chains": 4, "iter_sampling": 500, "seed": 42}
 
 

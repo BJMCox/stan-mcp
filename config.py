@@ -26,6 +26,25 @@ def home() -> Path:
 MODEL_LRU_SIZE = int(os.environ.get("STAN_MCP_LRU_SIZE") or 8)
 
 
+def max_workers() -> int:
+    """Size of the background run thread pool (STAN_MCP_MAX_WORKERS, default 2)."""
+    return int(os.environ.get("STAN_MCP_MAX_WORKERS") or 2)
+
+
+def max_parallel_chains() -> int:
+    """Per-run cap on concurrently executing CmdStan chain subprocesses.
+
+    CmdStanPy defaults `parallel_chains` to `min(cpu_count(), chains)`, so with
+    a pool of `max_workers` concurrent runs the machine can end up running
+    `max_workers * cpu_count` compute-bound processes. Divide the box between
+    the pool slots instead (STAN_MCP_MAX_PARALLEL_CHAINS to override).
+    """
+    override = os.environ.get("STAN_MCP_MAX_PARALLEL_CHAINS")
+    if override:
+        return max(1, int(override))
+    return max(1, (os.cpu_count() or 2) // max(1, max_workers()))
+
+
 def _ensured(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
