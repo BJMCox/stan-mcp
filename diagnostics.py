@@ -5,9 +5,12 @@ optimize writes an estimate.json (optimized_params_dict); draws-producing
 methods first persist the raw CmdStan CSVs (source of truth; enables
 generate_quantities reuse via runstore.csv_paths), best-effort and
 independent of the sidecar, then write a draws_schema.json sidecar (dims and
-row-major CSV column indices per variable, from the fit's own column names),
-recording a persist_warning in meta.json if that write fails (a csv_warning
-is recorded separately if CSV persistence itself fails).
+row-major CSV column indices per variable, from the fit's own column names).
+The sidecar is the only record of a run's dims/columns, so unlike the CSV
+step it is NOT best-effort: a failure records a persist_warning in meta.json
+(a csv_warning is recorded separately if CSV persistence itself fails) and
+then raises, which `sample.py`'s caller turns into status="failed" rather
+than letting the run rest at "done" with unreadable draws.
 run_summary: draws-producing methods -> arviz summary (mean, sd, HDI,
 bulk/tail ESS, R-hat) over inference.nc; optimize -> the stored estimate.
 run_diagnostics: optimize -> lp__ from the estimate; draws-producing methods ->
@@ -98,6 +101,52 @@ def _sidecar_from_fit(fit) -> dict:
     return {"schema": draws.SCHEMA_VERSION, "params": params, "sampler_stats": stats}
 
 
+def _is_draws_csv(name: str) -> bool:
+    """CmdStan draws CSVs, not `laplace`'s internal-optimize mode CSV.
+
+    When `laplace_sample` gets no explicit `mode=`, cmdstanpy runs its own
+    optimize step into the SAME output directory, dropping an `-opt-...` CSV
+    (fewer columns, one row) beside the draws CSV. `_chain_frames` below
+    already excludes it the same way; the sidecar's `files` list must too, or
+    `draws.load` stacks arrays of two different shapes and dies with a bare
+    numpy `ValueError` instead of a `RunError` naming the run.
+    """
+    return "-opt-" not in name
+
+
+def _ordered_draws_files(fit, run_id: str) -> list[str]:
+    """Persisted draws CSV filenames, in true per-chain run order.
+
+    NOT a filename sort of `csv/`: past 9 chains that puts "_10" before "_2",
+    silently permuting chains relative to the run (chain-symmetric statistics
+    are unaffected, but a per-chain reader like `extract_draws(by_chain=True)`
+    would mislabel them). `fit.runset.csv_files` is cmdstanpy's own
+    per-chain-ordered list, so it is used verbatim where present.
+    `CmdStanPathfinder`/`CmdStanLaplace` expose no `.runset`, so the fallback
+    sorts by the filename's trailing `_<chain>` id numerically — falling back
+    to a plain name sort where that suffix is absent, e.g. the single
+    unsuffixed CSV variational/pathfinder/laplace write.
+    """
+    persisted = [Path(p).name for p in runstore.csv_paths(run_id)]
+    want = set(persisted)
+
+    if hasattr(fit, "runset"):
+        try:
+            ordered = [Path(p).name for p in fit.runset.csv_files]
+        except Exception:  # noqa: BLE001
+            ordered = []
+        ordered = [n for n in ordered if _is_draws_csv(n) and n in want]
+        if ordered:
+            return ordered
+
+    def chain_key(name: str):
+        stem = name.rsplit(".", 1)[0]
+        tail = stem.rsplit("_", 1)[-1]
+        return (0, int(tail)) if tail.isdigit() else (1, stem)
+
+    return sorted((n for n in persisted if _is_draws_csv(n)), key=chain_key)
+
+
 def persist_run(run_id: str, method: str, fit) -> None:
     if method == "optimize":
         runstore.persist_estimate(run_id, dict(fit.optimized_params_dict))
@@ -129,12 +178,20 @@ def persist_run(run_id: str, method: str, fit) -> None:
     # of which CSVs hold draws.
     try:
         sidecar = _sidecar_from_fit(fit)
-        sidecar["files"] = [Path(p).name for p in runstore.csv_paths(run_id)]
+        sidecar["files"] = _ordered_draws_files(fit, run_id)
         draws.schema_path(run_id).write_text(json.dumps(sidecar, indent=2))
     except Exception as exc:  # noqa: BLE001
         meta = runstore.read_meta(run_id)
         meta["persist_warning"] = f"draws schema not written: {exc}"
         runstore.write_meta(run_id, meta)
+        # Unlike the arviz conversion this replaces (whose failure still left
+        # CSV-derived fallbacks readable for variational/pathfinder/laplace),
+        # the sidecar is now the ONLY record of a run's dims/column layout —
+        # without it the run's draws cannot be read at all. Such a run must
+        # not rest at status="done" with only this field to notice by, so
+        # re-raise into `_execute`'s existing failure path (status="failed",
+        # the CSVs already persisted above are kept, not lost).
+        raise RunError(f"draws schema not written for run {run_id!r}: {exc}") from exc
 
     # Last, once nothing else needs to read the fit's CSVs: drop live/. csv/ is
     # the durable copy, so keeping both doubles every run's disk footprint.
