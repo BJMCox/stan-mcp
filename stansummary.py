@@ -1,0 +1,98 @@
+"""CmdStan's own `stansummary`, as plain dicts.
+
+MCMC moments, R-hat and ESS come from CmdStan rather than arviz because CmdStan is
+the reference implementation and the two disagree: on `sample-0013`'s `theta`,
+arviz's Dataset `method="tail"` gives 506.52 where `stansummary` and arviz's own
+bare-array path at `prob=(0.05, 0.95)` both give 403.87.
+
+We shell out and parse the `-c` CSV rather than calling cmdstanpy's `fit.summary()`,
+whose only job is to load that same CSV into a pandas DataFrame.
+
+Only ever call this for `method == "sample"`. `stansummary` does not refuse other
+input: handed a variational run it reports `R_hat 0.999997` and `ESS_bulk 991.432`
+for IID approximate draws — meaningless numbers in valid-looking output.
+"""
+
+from __future__ import annotations
+
+import subprocess
+import tempfile
+from pathlib import Path
+
+from errors import RunError
+
+# stansummary's own default is 2 significant figures, which would silently round
+# every number this tool reports. 18 is CmdStan's maximum and matches the output
+# precision runs are now sampled at.
+SIG_FIGS = 18
+_TIMEOUT_S = 300
+
+
+def _binary() -> Path:
+    import cmdstanpy
+
+    p = Path(cmdstanpy.cmdstan_path()) / "bin" / "stansummary"
+    if not p.exists():
+        raise RunError(f"CmdStan's stansummary binary is not present at {p}")
+    return p
+
+
+def _to_float(raw: str) -> float:
+    try:
+        return float(raw)
+    except ValueError:
+        return float("nan")
+
+
+def parse(text: str) -> dict[str, dict[str, float]]:
+    """`{cmdstan_name: {column: value}}` from stansummary's --csv_filename output."""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        raise RunError(
+            "stansummary produced an empty summary; it leaves a 0-byte CSV behind when it fails"
+        )
+    header = [h.strip() for h in lines[0].split(",")]
+    out: dict[str, dict[str, float]] = {}
+    for ln in lines[1:]:
+        parts = ln.split(",")
+        if len(parts) != len(header):
+            continue
+        # Stan identifiers cannot contain a comma, so splitting on it is safe;
+        # stansummary quotes the name column.
+        name = parts[0].strip().strip('"')
+        out[name] = {k: _to_float(v) for k, v in zip(header[1:], parts[1:], strict=True)}
+    return out
+
+
+def summarize(
+    csv_paths: list[str],
+    percentiles: tuple[int, ...] = (5, 50, 95),
+    sig_figs: int = SIG_FIGS,
+) -> dict[str, dict[str, float]]:
+    if not csv_paths:
+        raise RunError("stansummary needs at least one draws CSV")
+    with tempfile.TemporaryDirectory() as td:
+        # --csv_filename requires a path that does not yet exist.
+        out = Path(td) / "summary.csv"
+        cmd = [
+            str(_binary()),
+            "--sig_figs",
+            str(sig_figs),
+            "--percentiles",
+            ",".join(str(p) for p in percentiles),
+            "--csv_filename",
+            str(out),
+            # Input files LAST: --include_param and friends are greedy and will
+            # consume a positional path if any option precedes it, failing with
+            # "Unrecognized parameter(s): '..._1[csv]'".
+            *csv_paths,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_TIMEOUT_S)
+        if proc.returncode != 0:
+            # Check the EXIT CODE, never the file: a failure still creates the
+            # output path, empty, which would parse as a model with no parameters.
+            detail = (proc.stderr or proc.stdout or "").strip()[:400]
+            raise RunError(f"stansummary failed (exit {proc.returncode}): {detail}")
+        if not out.exists():
+            raise RunError("stansummary reported success but wrote no summary")
+        return parse(out.read_text())
