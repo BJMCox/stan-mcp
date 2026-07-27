@@ -148,51 +148,117 @@ def test_prune_refuses_keep_zero(tmp_path, monkeypatch):
     assert runstore.run_dir("sample-0001").is_dir()  # nothing deleted
 
 
-# --- diagnostics: extract_draws stable shape + thin validation ---
-def _write_sample_run(run_id):
-    import arviz as az
-
-    idata = az.from_dict(
-        {
-            "posterior": {
-                "theta": np.arange(20.0).reshape(2, 10),
-                "beta": np.arange(2 * 10 * 3, dtype=float).reshape(2, 10, 3),
+# --- diagnostics: extract_draws reads the typed draws layer ---
+def _typed_run(tmp_path, monkeypatch, method="sample"):
+    """A run with a sidecar: one scalar and one length-2 vector, 2 chains x 2 draws."""
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    rid = f"{method}-0001"
+    runstore.write_meta(rid, {"method": method, "status": "done"})
+    csvdir = runstore.run_dir(rid, create=True) / "csv"
+    csvdir.mkdir(parents=True, exist_ok=True)
+    (csvdir / "a.csv").write_text("# c\nlp__,theta,z.1,z.2\n-1,0.1,10,20\n-2,0.2,11,21\n")
+    (csvdir / "b.csv").write_text("# c\nlp__,theta,z.1,z.2\n-3,0.3,12,22\n-4,0.4,13,23\n")
+    diagnostics.draws.schema_path(rid).write_text(
+        json.dumps(
+            {
+                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "files": ["a.csv", "b.csv"],
+                "params": {"theta": {"dims": [], "cols": [1]}, "z": {"dims": [2], "cols": [2, 3]}},
+                "sampler_stats": {"lp__": {"dims": [], "cols": [0]}},
             }
-        }
+        )
     )
-    runstore.write_meta(run_id, {"method": "sample", "status": "done"})
-    idata.to_netcdf(str(runstore.idata_path(run_id)))
+    return rid
 
 
-def test_extract_draws_scalar_is_flat_list(tmp_path, monkeypatch):
-    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    _write_sample_run("sample-0001")
-    out = diagnostics.extract_draws("sample-0001", "theta")
-    assert len(out["draws"]) == 20
-    assert isinstance(out["draws"][0], float)
+def test_extract_draws_reads_the_typed_layer(tmp_path, monkeypatch):
+    rid = _typed_run(tmp_path, monkeypatch)
+    got = diagnostics.extract_draws(rid, param="theta")
+    assert got["draws"] == [0.1, 0.2, 0.3, 0.4]
+    assert "source" not in got  # there is only one source now
 
 
-def test_extract_draws_vector_is_list_of_lists(tmp_path, monkeypatch):
-    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    _write_sample_run("sample-0001")
-    out = diagnostics.extract_draws("sample-0001", "beta")
-    assert len(out["draws"]) == 20
-    assert isinstance(out["draws"][0], list) and len(out["draws"][0]) == 3
+def test_extract_draws_by_chain_uses_sidecar_chain_order(tmp_path, monkeypatch):
+    rid = _typed_run(tmp_path, monkeypatch)
+    got = diagnostics.extract_draws(rid, param="theta", by_chain=True)
+    assert got["draws"] == [[0.1, 0.2], [0.3, 0.4]]
+
+
+def test_extract_draws_keeps_vector_shape(tmp_path, monkeypatch):
+    rid = _typed_run(tmp_path, monkeypatch)
+    got = diagnostics.extract_draws(rid, param="z")
+    assert got["draws"][0] == [10.0, 20.0]
+
+
+def test_extract_draws_unknown_param_raises(tmp_path, monkeypatch):
+    rid = _typed_run(tmp_path, monkeypatch)
+    with pytest.raises(errors.RunError, match="nope"):
+        diagnostics.extract_draws(rid, param="nope")
+
+
+def test_extract_draws_works_for_a_variational_run(tmp_path, monkeypatch):
+    """One path for all six methods: no branch on whether inference.nc exists."""
+    rid = _typed_run(tmp_path, monkeypatch, method="variational")
+    assert diagnostics.extract_draws(rid, param="theta")["draws"] == [0.1, 0.2, 0.3, 0.4]
 
 
 def test_extract_draws_single_draw_stays_a_list(tmp_path, monkeypatch):
-    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    _write_sample_run("sample-0001")
-    out = diagnostics.extract_draws("sample-0001", "theta", thin=999)
+    rid = _typed_run(tmp_path, monkeypatch)
+    out = diagnostics.extract_draws(rid, "theta", thin=999)
     assert isinstance(out["draws"], list)  # not a bare float
     assert len(out["draws"]) == 1
 
 
 def test_extract_draws_rejects_bad_thin(tmp_path, monkeypatch):
-    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    _write_sample_run("sample-0001")
+    rid = _typed_run(tmp_path, monkeypatch)
     with pytest.raises(errors.ValidationError):
-        diagnostics.extract_draws("sample-0001", "theta", thin=0)
+        diagnostics.extract_draws(rid, "theta", thin=0)
+
+
+def _typed_run_wide(tmp_path, monkeypatch, method="sample"):
+    """2 chains x 10 draws, scalar theta + 3-vector beta -- big enough that the
+    max_draws/thin math is non-trivial (the minimal 2x2 `_typed_run` above
+    collapses every budget check to a no-op)."""
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    rid = f"{method}-0001"
+    runstore.write_meta(rid, {"method": method, "status": "done"})
+    csvdir = runstore.run_dir(rid, create=True) / "csv"
+    csvdir.mkdir(parents=True, exist_ok=True)
+    header = "lp__,theta,beta.1,beta.2,beta.3"
+    for chain, offset in enumerate((0, 10)):
+        rows = "\n".join(
+            f"-1,{offset + t},{3 * (offset + t)},{3 * (offset + t) + 1},{3 * (offset + t) + 2}"
+            for t in range(10)
+        )
+        (csvdir / f"chain{chain}.csv").write_text(f"# c\n{header}\n{rows}\n")
+    diagnostics.draws.schema_path(rid).write_text(
+        json.dumps(
+            {
+                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "files": ["chain0.csv", "chain1.csv"],
+                "params": {
+                    "theta": {"dims": [], "cols": [1]},
+                    "beta": {"dims": [3], "cols": [2, 3, 4]},
+                },
+                "sampler_stats": {"lp__": {"dims": [], "cols": [0]}},
+            }
+        )
+    )
+    return rid
+
+
+def test_extract_draws_scalar_is_flat_list(tmp_path, monkeypatch):
+    rid = _typed_run_wide(tmp_path, monkeypatch)
+    out = diagnostics.extract_draws(rid, "theta")
+    assert len(out["draws"]) == 20
+    assert isinstance(out["draws"][0], float)
+
+
+def test_extract_draws_vector_is_list_of_lists(tmp_path, monkeypatch):
+    rid = _typed_run_wide(tmp_path, monkeypatch)
+    out = diagnostics.extract_draws(rid, "beta")
+    assert len(out["draws"]) == 20
+    assert isinstance(out["draws"][0], list) and len(out["draws"][0]) == 3
 
 
 # --- diagnostics: verdict logic ---
@@ -207,9 +273,8 @@ def test_verdict_flags_issues():
 
 
 def test_extract_draws_by_chain(tmp_path, monkeypatch):
-    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    _write_sample_run("sample-0001")
-    out = diagnostics.extract_draws("sample-0001", "theta", by_chain=True)
+    rid = _typed_run_wide(tmp_path, monkeypatch)
+    out = diagnostics.extract_draws(rid, "theta", by_chain=True)
     assert out["by_chain"] is True
     assert len(out["draws"]) == 2 and len(out["draws"][0]) == 10  # 2 chains x 10 draws
 
@@ -324,18 +389,39 @@ def test_csv_summary_for_non_idata_run(tmp_path, monkeypatch):
     assert abs(theta["mean"] - 0.6) < 1e-9
 
 
+def _write_typed_csv_run(run_id):
+    """`_write_csv_run`'s single-file layout, plus the sidecar `extract_draws`
+    now requires. Kept separate from `_write_csv_run` itself -- run_summary,
+    posterior_mean_inits and get_run_progress still read that fixture straight
+    off the untyped CSV and must keep working unmigrated."""
+    _write_csv_run(run_id)
+    diagnostics.draws.schema_path(run_id).write_text(
+        json.dumps(
+            {
+                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "files": ["c.csv"],
+                "params": {
+                    "theta": {"dims": [], "cols": [1]},
+                    "beta": {"dims": [2], "cols": [2, 3]},
+                },
+                "sampler_stats": {"lp__": {"dims": [], "cols": [0]}},
+            }
+        )
+    )
+
+
 def test_csv_extract_draws_for_non_idata_run(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    _write_csv_run("variational-0001")
+    _write_typed_csv_run("variational-0001")
     scalar = diagnostics.extract_draws("variational-0001", "theta")
-    assert scalar["source"] == "csv" and scalar["draws"] == [0.5, 0.7]
+    assert scalar["draws"] == [0.5, 0.7]
     vector = diagnostics.extract_draws("variational-0001", "beta")
     assert vector["draws"] == [[1.0, 2.0], [1.5, 2.5]]
 
 
 def test_csv_extract_multi_param(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    _write_csv_run("variational-0001")
+    _write_typed_csv_run("variational-0001")
     out = diagnostics.extract_draws("variational-0001", params=["theta", "beta"])
     assert set(out["draws"]) == {"theta", "beta"}
     assert out["draws"]["theta"] == [0.5, 0.7]
@@ -556,28 +642,36 @@ def test_csv_extract_by_chain(tmp_path, monkeypatch):
     csvdir.mkdir(parents=True, exist_ok=True)
     (csvdir / "c-1.csv").write_text("lp__,theta\n0,0.1\n0,0.2\n")
     (csvdir / "c-2.csv").write_text("lp__,theta\n0,0.3\n0,0.4\n")
+    diagnostics.draws.schema_path("variational-0001").write_text(
+        json.dumps(
+            {
+                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "files": ["c-1.csv", "c-2.csv"],
+                "params": {"theta": {"dims": [], "cols": [1]}},
+                "sampler_stats": {"lp__": {"dims": [], "cols": [0]}},
+            }
+        )
+    )
     out = diagnostics.extract_draws("variational-0001", "theta", by_chain=True)
     assert out["by_chain"] is True
     assert out["draws"] == [[0.1, 0.2], [0.3, 0.4]]  # chain structure preserved
 
 
 def test_extract_draws_multi_param_loads_source_once(tmp_path, monkeypatch):
-    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    _write_sample_run("sample-0001")
+    rid = _typed_run_wide(tmp_path, monkeypatch)
     calls = []
-    real = diagnostics._load_idata
-    monkeypatch.setattr(diagnostics, "_load_idata", lambda rid: (calls.append(rid), real(rid))[1])
-    diagnostics.extract_draws("sample-0001", params=["theta", "beta"])
-    assert len(calls) == 1  # not one netCDF open per parameter
+    real = diagnostics.draws.load
+    monkeypatch.setattr(diagnostics.draws, "load", lambda r: (calls.append(r), real(r))[1])
+    diagnostics.extract_draws(rid, params=["theta", "beta"])
+    assert len(calls) == 1  # not one CSV parse per parameter
 
 
 def test_extract_draws_caps_result_size(tmp_path, monkeypatch):
-    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    _write_sample_run("sample-0001")  # 2 chains x 10 draws = 20
-    out = diagnostics.extract_draws("sample-0001", "theta", max_draws=5)
+    rid = _typed_run_wide(tmp_path, monkeypatch)  # 2 chains x 10 draws = 20
+    out = diagnostics.extract_draws(rid, "theta", max_draws=5)
     assert len(out["draws"]) <= 5
     assert out["thin"] == 4
-    assert len(diagnostics.extract_draws("sample-0001", "theta", max_draws=0)["draws"]) == 20
+    assert len(diagnostics.extract_draws(rid, "theta", max_draws=0)["draws"]) == 20
 
 
 # run_summary is the tool you actually reach for (raw draws tell you little), so
@@ -636,23 +730,20 @@ def test_run_summary_csv_fallback_caps_rows(tmp_path, monkeypatch):
 # parameter instead would let it through multiplied by chains x params x
 # vector-length, which is how a "capped" call still overran a tool result.
 def test_max_draws_scales_with_vector_width(tmp_path, monkeypatch):
-    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    _write_sample_run("sample-0001")  # beta is (2 chains, 10 draws, 3)
-    out = diagnostics.extract_draws("sample-0001", "beta", max_draws=6)
+    rid = _typed_run_wide(tmp_path, monkeypatch)  # beta is (2 chains, 10 draws, 3)
+    out = diagnostics.extract_draws(rid, "beta", max_draws=6)
     assert sum(len(d) for d in out["draws"]) <= 6  # 2 draws x 3 components
 
 
 def test_max_draws_splits_across_chains(tmp_path, monkeypatch):
-    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    _write_sample_run("sample-0001")
-    out = diagnostics.extract_draws("sample-0001", "theta", by_chain=True, max_draws=4)
+    rid = _typed_run_wide(tmp_path, monkeypatch)
+    out = diagnostics.extract_draws(rid, "theta", by_chain=True, max_draws=4)
     assert sum(len(c) for c in out["draws"]) <= 4  # not 4 per chain
 
 
 def test_max_draws_splits_across_params(tmp_path, monkeypatch):
-    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    _write_sample_run("sample-0001")
-    out = diagnostics.extract_draws("sample-0001", params=["theta", "beta"], max_draws=6)
+    rid = _typed_run_wide(tmp_path, monkeypatch)
+    out = diagnostics.extract_draws(rid, params=["theta", "beta"], max_draws=6)
     theta, beta = out["draws"]["theta"], out["draws"]["beta"]
     assert len(theta) + sum(len(d) for d in beta) <= 6  # not 6 per name
 

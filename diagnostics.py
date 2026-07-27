@@ -18,8 +18,9 @@ worst R-hat, min bulk/tail ESS, divergences, tree-depth saturations, mean
 accept stat, E-BFMI, plus a pass/warn verdict with an issues list.
 run_loo / compare_runs: PSIS-LOO cross-validation and multi-run ranking (models
 must emit a `log_lik` generated quantity).
-extract_draws: flattened draws for one parameter from inference.nc (draws-
-producing methods only; not available for optimize).
+extract_draws: flattened draws for one parameter from the typed draws layer
+(draws.load) -- one path for all six draws-producing methods (not available
+for optimize).
 """
 
 import json
@@ -620,41 +621,14 @@ def _shape_draws(arr: np.ndarray) -> list:
     return arr[:, 0].tolist() if arr.shape[1] == 1 else arr.tolist()
 
 
-def _param_cols(columns, param: str) -> list[str]:
-    return [c for c in columns if c == param or c.startswith(param + ".")]
-
-
-def _from_csv_source(frames, run_id: str, param: str, thin: int, by_chain: bool, max_draws: int):
-    cols = _param_cols(frames[0].columns, param)
-    if not cols:
-        raise RunError(f"parameter {param!r} not found in run {run_id!r}")
-    if by_chain:
-        # One CmdStan CSV per chain, so the chain structure is recoverable here
-        # too — it must not be silently dropped just because there's no idata.
-        per_chain = [f[cols].to_numpy(dtype=float) for f in frames]
-        budget = _draw_budget(max_draws, len(cols), len(per_chain))
-        step = _thin_step(max(len(a) for a in per_chain), thin, budget)
-        return {
-            "param": param,
-            "by_chain": True,
-            "draws": [_shape_draws(a[::step]) for a in per_chain],
-            "source": "csv",
-            "thin": step,
-        }
-    import pandas as pd
-
-    stacked = pd.concat(frames, ignore_index=True)[cols].to_numpy(dtype=float)
-    step = _thin_step(len(stacked), thin, _draw_budget(max_draws, len(cols)))
-    return {
-        "param": param,
-        "draws": _shape_draws(stacked[::step]),
-        "source": "csv",
-        "thin": step,
-    }
-
-
-def _from_idata_source(idata, param: str, thin: int, by_chain: bool, max_draws: int):
-    arr = idata.posterior[param].values  # (chain, draw, ...)
+def _from_typed_source(
+    d: draws.Draws, run_id: str, param: str, thin: int, by_chain: bool, max_draws: int
+) -> dict:
+    arr = d.params.get(param)
+    if arr is None:
+        raise RunError(
+            f"parameter {param!r} not found in run {run_id!r} (have: {', '.join(sorted(d.params))})"
+        )
     width = int(np.prod(arr.shape[2:])) if arr.ndim > 2 else 1
     if by_chain:
         budget = _draw_budget(max_draws, width, arr.shape[0])
@@ -685,18 +659,15 @@ def extract_draws(
     if not wanted:
         raise ValidationError("extract_draws requires `param` or `params`")
 
-    # Load the draws source ONCE: doing it per parameter re-opened inference.nc
-    # (or re-parsed every CSV) for each name in `params`.
     from functools import partial
 
     # Split the ceiling across the requested parameters: it bounds the whole
     # call, so asking for N names must not return N times as much.
     per_param = max(1, max_draws // len(wanted)) if max_draws > 0 else 0
     shared = {"thin": thin, "by_chain": by_chain, "max_draws": per_param}
-    try:
-        extract = partial(_from_idata_source, _load_idata(run_id), **shared)
-    except RunError:
-        extract = partial(_from_csv_source, _chain_frames(run_id), run_id, **shared)
+    # Load the draws ONCE: doing it per parameter re-parsed every CSV for each
+    # name in `params`.
+    extract = partial(_from_typed_source, draws.load(run_id), run_id, **shared)
 
     if params:
         results = {p: extract(p) for p in wanted}

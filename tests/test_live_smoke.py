@@ -125,7 +125,7 @@ def test_live_method_diagnostics(tmp_path, monkeypatch):
         assert summ["source"] == "csv"
         assert any(r["param"] == "theta" for r in summ["summary"])
         draws = diagnostics.extract_draws(started["run_id"], "theta")
-        assert draws["source"] == "csv" and len(draws["draws"]) > 0
+        assert len(draws["draws"]) > 0
 
 
 def test_live_inits_from_prior_run(tmp_path, monkeypatch):
