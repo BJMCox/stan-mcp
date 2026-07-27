@@ -1,10 +1,24 @@
 """Run store: directory layout and persistence under STAN_MCP_HOME/runs/<run-id>/.
 
-Persists model.stan, data.json, the CmdStan CSVs, inference.nc (arviz
-InferenceData, for draws-producing methods) or estimate.json (optimize), and
-meta.json (model_id, method, method_args, status, created_at/finished_at/
-duration_s timestamps, stderr on failure). list_runs reads meta.json across run
-dirs; failed runs are persisted with status="failed" and captured stderr.
+Persists, per run:
+
+- `model.stan` / `data.json` — the exact inputs, for reproduction.
+- `csv/` — the raw CmdStan draws CSVs. The ONLY durable record of a run's
+  draws, and what `generate_quantities` reuses as `previous_fit`.
+- `draws_schema.json` — the draws sidecar (each Stan variable's dims and its
+  row-major CSV column indices, plus chain order); draws-producing methods
+  only, written by `diagnostics.persist_run` and read by `draws.py`. A few
+  hundred bytes to a few KB, holding no draws itself.
+- `estimate.json` — the stored point estimate, `optimize` only (instead of the
+  two above).
+- `live/` — where CmdStan streams output during the run; deleted once `csv/`
+  holds the durable copy.
+- `meta.json` — model_id, method, method_args, status, created_at/finished_at/
+  duration_s timestamps, stderr on failure. `list_runs` reads this across run
+  dirs; failed runs are persisted with status="failed" and captured stderr.
+
+There is no `inference.nc`: the arviz conversion that produced it is gone, and
+the sidecar above replaces it. See `idata_path`.
 
 Implemented during the build (see design "Run store").
 """
@@ -109,6 +123,13 @@ def max_seq() -> int:
 
 
 def idata_path(run_id: str) -> Path:
+    """Where the retired arviz `inference.nc` used to be written.
+
+    Nothing writes or reads this any more. It survives ONLY as the regression
+    guard that persist time never reintroduces the netcdf write: one test asserts
+    this path does not exist after `persist_run`. Deleting it would remove the
+    ability to make that assertion, which is why it is not dead code.
+    """
     return run_dir(run_id) / "inference.nc"
 
 

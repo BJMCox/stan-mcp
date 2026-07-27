@@ -229,10 +229,13 @@ async def get_run_summary(
     params: list[str] | None = None,
     max_rows: int = diagnostics.DEFAULT_MAX_ROWS,
 ) -> dict:
-    """Method-aware summary of a run (arviz summary for draws; estimate for
-    optimize). One row per parameter ELEMENT, so a big vector is many rows:
-    capped at `max_rows` (0 = unlimited), with a `truncated` block reporting the
-    true total. Name `params` to summarize specific parameters."""
+    """Method-aware summary of a run. `sample` gets mean/sd/mad/quantiles plus
+    bulk-tail ESS, R-hat and MCSE from CmdStan's own stansummary; the other
+    draws-producing methods get mean/sd/quantiles computed from the draws, with
+    no R-hat/ESS (they are not MCMC chains); optimize gets its point estimate.
+    One row per parameter ELEMENT, so a big vector is many rows: capped at
+    `max_rows` (0 = unlimited), with a `truncated` block reporting the true
+    total. Name `params` to summarize specific parameters."""
     return await asyncio.to_thread(_safe, diagnostics.run_summary, run_id, params, max_rows)
 
 
