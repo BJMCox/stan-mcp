@@ -818,3 +818,152 @@ def test_ebfmi_is_reported_not_swallowed(tmp_path, monkeypatch):
     d = diagnostics.run_diagnostics("sample-0001")
     assert d.get("min_ebfmi") is not None
     assert "ebfmi_warning" not in d
+
+
+# --- posterior geometry ---
+def _geom_run(monkeypatch, tmp_path, cols: dict, n_chain=4, n_draw=500):
+    """A run whose unconstrained draws are planted. `cols` maps name -> (draws,)
+    array of length n_chain*n_draw. The BridgeStan round-trip is stubbed: what
+    needs testing is the statistics, and the unconstraining needs a toolchain."""
+    import arviz as az
+
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    names = list(cols)
+    u3 = np.stack([cols[n] for n in names], axis=-1).reshape(n_chain, n_draw, len(names))
+    idata = az.from_dict({"posterior": {"dummy": np.zeros((n_chain, n_draw))}})
+    runstore.write_meta("sample-0001", {"method": "sample", "status": "done"})
+    idata.to_netcdf(str(runstore.idata_path("sample-0001")))
+    monkeypatch.setattr(
+        diagnostics,
+        "_unconstrained_draws",
+        lambda rid, idata: (u3, names, {"scale": "unconstrained"}),
+    )
+    return "sample-0001"
+
+
+def _correlated(rho, n, seed=0):
+    rng = np.random.default_rng(seed)
+    a = rng.normal(size=n)
+    b = rho * a + np.sqrt(max(1 - rho**2, 1e-12)) * rng.normal(size=n)
+    return a, b
+
+
+def test_geometry_catches_negative_correlation(tmp_path, monkeypatch):
+    """Fisher z carries the sign of r. Comparing the signed value against a
+    positive threshold dropped every negatively correlated pair — which is the
+    commonest form collinearity takes, two coefficients trading off."""
+    n = 2000
+    b1, b2 = _correlated(-0.99, n)
+    rid = _geom_run(monkeypatch, tmp_path, {"b1": b1, "b2": b2, "c": _correlated(0, n, 5)[0]})
+    g = diagnostics.run_geometry(rid)
+    assert g["verdict"] == "warn"
+    got = {(p["a"], p["b"]) for p in g["pairs"]}
+    assert ("b1", "b2") in got or ("b2", "b1") in got
+    assert g["pairs"][0]["r"] < -0.9  # sign preserved in the report
+    assert g["pairs"][0]["z"] > 0  # evidence is a magnitude
+
+
+def test_geometry_catches_positive_correlation(tmp_path, monkeypatch):
+    n = 2000
+    b1, b2 = _correlated(0.97, n)
+    rid = _geom_run(monkeypatch, tmp_path, {"b1": b1, "b2": b2})
+    g = diagnostics.run_geometry(rid)
+    assert g["pairs"] and g["pairs"][0]["r"] > 0.9
+
+
+def test_geometry_clean_on_independent_params(tmp_path, monkeypatch):
+    rng = np.random.default_rng(1)
+    cols = {f"b{i}": rng.normal(size=2000) for i in range(4)}
+    rid = _geom_run(monkeypatch, tmp_path, cols)
+    g = diagnostics.run_geometry(rid)
+    assert g["verdict"] == "pass" and g["pairs"] == []
+    assert g["max_abs_r_cross_block"] < 0.3  # reported even when nothing fires
+
+
+def test_geometry_collapses_within_block_pairs(tmp_path, monkeypatch):
+    """theta[1..20] is 190 of the 210 pairs; itemizing them would crowd out the
+    one cross-block pair that names the actual problem."""
+    rng = np.random.default_rng(2)
+    shared = rng.normal(size=2000)
+    cols = {f"theta[{i}]": 0.9 * shared + 0.44 * rng.normal(size=2000) for i in range(20)}
+    cols["sigma"] = rng.normal(size=2000)
+    rid = _geom_run(monkeypatch, tmp_path, cols)
+    g = diagnostics.run_geometry(rid)
+    blocks = {w["block"]: w for w in g["within_block"]}
+    assert blocks["theta"]["n_pairs"] == 190
+    assert blocks["theta"]["max_abs_r"] > 0.5
+    assert all(p["a"] != p["b"] for p in g["pairs"])
+
+
+def test_geometry_eigen_suppressed_when_dims_rival_ess(tmp_path, monkeypatch):
+    """A sample correlation matrix is ill-conditioned by construction when p is
+    not small next to n_eff, so the condition number would be pure artifact."""
+    rng = np.random.default_rng(3)
+    cols = {f"b{i}": rng.normal(size=200) for i in range(40)}
+    rid = _geom_run(monkeypatch, tmp_path, cols, n_chain=2, n_draw=100)
+    g = diagnostics.run_geometry(rid)
+    assert "eigen" not in g and "suppressed" in g["eigen_note"]
+
+
+def test_geometry_eigen_finds_three_way_degeneracy(tmp_path, monkeypatch):
+    """x3 = x1 + x2 leaves every pair moderate while the posterior is near
+    singular along x1 + x2 - x3: the blind spot pairwise cannot see."""
+    rng = np.random.default_rng(4)
+    n = 2000  # must equal n_chain * n_draw
+    b1, b2 = rng.normal(size=n), rng.normal(size=n)
+    b3 = b1 + b2 + 0.05 * rng.normal(size=n)
+    rid = _geom_run(monkeypatch, tmp_path, {"b1": b1, "b2": b2, "b3": b3})
+    g = diagnostics.run_geometry(rid)
+    assert g["eigen"]["condition_number"] > 100
+    assert {d["param"] for d in g["eigen"]["direction"]} == {"b1", "b2", "b3"}
+
+
+def test_geometry_thresholds_are_overridable(tmp_path, monkeypatch):
+    n = 2000
+    b1, b2 = _correlated(0.2, n)
+    rid = _geom_run(monkeypatch, tmp_path, {"b1": b1, "b2": b2})
+    assert diagnostics.run_geometry(rid)["pairs"] == []  # below default bar
+    loose = diagnostics.run_geometry(rid, min_abs_r=0, min_z=0)
+    assert loose["pairs"]  # 0 = unlimited, per the codebase convention
+
+
+def test_geometry_refuses_above_max_dims(tmp_path, monkeypatch):
+    rng = np.random.default_rng(6)
+    cols = {f"b{i}": rng.normal(size=400) for i in range(12)}
+    rid = _geom_run(monkeypatch, tmp_path, cols, n_chain=2, n_draw=200)
+    with pytest.raises(errors.ValidationError):
+        diagnostics.run_geometry(rid, max_dims=5)
+
+
+def test_geometry_params_filter(tmp_path, monkeypatch):
+    rng = np.random.default_rng(7)
+    cols = {"a": rng.normal(size=800), "b[0]": rng.normal(size=800), "b[1]": rng.normal(size=800)}
+    rid = _geom_run(monkeypatch, tmp_path, cols, n_chain=2, n_draw=400)
+    assert diagnostics.run_geometry(rid, params=["b"])["n_dims"] == 2  # block name matches
+    with pytest.raises(errors.ValidationError):
+        diagnostics.run_geometry(rid, params=["nope"])
+
+
+def test_geometry_rejects_non_sample_methods(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    runstore.write_meta("variational-0001", {"method": "variational", "status": "done"})
+    with pytest.raises(errors.RunError):
+        diagnostics.run_geometry("variational-0001")
+
+
+def test_geometry_reports_preparing_not_an_error(tmp_path, monkeypatch):
+    """The first call on a freshly sampled model has no .so; the build happens off
+    the caller's thread and the call must say so rather than fail."""
+    import arviz as az
+
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    runstore.write_meta("sample-0001", {"method": "sample", "status": "done"})
+    az.from_dict({"posterior": {"x": np.zeros((2, 10))}}).to_netcdf(
+        str(runstore.idata_path("sample-0001"))
+    )
+
+    def _pending(rid, idata):
+        raise diagnostics._GeometryPending("building")
+
+    monkeypatch.setattr(diagnostics, "_unconstrained_draws", _pending)
+    assert diagnostics.run_geometry("sample-0001")["status"] == "preparing"

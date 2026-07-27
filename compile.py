@@ -7,6 +7,7 @@ import re
 import subprocess
 import threading
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import config
 import errors
@@ -26,6 +27,56 @@ def _compile_lock(key: str) -> threading.Lock:
             lock = threading.Lock()
             _COMPILE_LOCKS[key] = lock
         return lock
+
+
+# Background BridgeStan builds. A run compiles only the CmdStan executable, so a
+# sampled model has no .so until something asks for one — and building it inline
+# would stall that caller for a whole compile. Requests kick a build off here and
+# return immediately; the caller retries. Single worker, deliberately NOT the
+# RunManager pool, so a build can never occupy a slot an inference run needs.
+_SO_BUILDER: "ThreadPoolExecutor | None" = None
+_SO_BUILDS: dict[str, "Future"] = {}
+_SO_GUARD = threading.Lock()
+
+if TYPE_CHECKING:
+    from concurrent.futures import Future, ThreadPoolExecutor
+
+
+def _so_builder():
+    global _SO_BUILDER
+    if _SO_BUILDER is None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _SO_BUILDER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="so-build")
+    return _SO_BUILDER
+
+
+def so_path_if_built(source: str, stanc_args: list[str] | None = None) -> Path | None:
+    p = config.compiled_dir() / f"{model_id(source, stanc_args)}_model.so"
+    return p if p.exists() else None
+
+
+def request_so(source: str, stanc_args: list[str] | None = None) -> dict:
+    """Ensure the BridgeStan .so exists, building it in the background if not.
+
+    Returns {"status": "ready"|"building"|"failed", ...}. The build goes through
+    compiled_so, so it takes the same per-model compile lock as a foreground
+    compile_model and the two serialize rather than racing on one artifact."""
+    if so_path_if_built(source, stanc_args) is not None:
+        return {"status": "ready"}
+    mid = model_id(source, stanc_args)
+    with _SO_GUARD:
+        fut = _SO_BUILDS.get(mid)
+        if fut is not None and fut.done():
+            _SO_BUILDS.pop(mid, None)
+            if (exc := fut.exception()) is not None:
+                return {"status": "failed", "error": str(exc)}
+            if so_path_if_built(source, stanc_args) is not None:
+                return {"status": "ready"}
+            return {"status": "failed", "error": "build finished but no .so was produced"}
+        if fut is None:
+            _SO_BUILDS[mid] = _so_builder().submit(compiled_so, source, stanc_args)
+    return {"status": "building"}
 
 
 def _pedantic_check(stan_path: Path) -> list[str]:

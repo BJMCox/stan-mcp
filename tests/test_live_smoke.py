@@ -2,6 +2,7 @@
 
 import os
 
+import numpy as np
 import pytest
 
 pytestmark = pytest.mark.skipif(
@@ -207,6 +208,71 @@ def test_live_pathologies_localize_funnel_neck(tmp_path, monkeypatch):
     assert out["ranking"][0]["param"] == "v"
     assert out["ranking"][0]["direction"] == "below"
     assert out["separation"]["margin"] > 3
+
+
+COLLINEAR = """
+data { int<lower=0> N; vector[N] x1; vector[N] x2; vector[N] y; }
+parameters { real a; real b1; real b2; real<lower=0> sigma; }
+model { y ~ normal(a + b1 * x1 + b2 * x2, sigma); }
+"""
+
+
+def test_live_geometry_finds_collinearity(tmp_path, monkeypatch):
+    """Full unconstrained path: BridgeStan rebuild, the background .so build and
+    its `preparing` status, the BridgeStan-name to arviz-dim index mapping, and
+    the statistics. The offline tests stub all of that out.
+
+    x2 = x1 + tiny noise, so b1 and b2 are near-degenerate and trade off — a
+    NEGATIVE correlation, which is what the signed-Fisher-z bug silently dropped.
+    """
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    import asyncio
+    import time
+
+    import diagnostics
+    import sample
+
+    rng = np.random.default_rng(7)
+    n = 100
+    x1 = rng.normal(size=n)
+    x2 = x1 + 0.01 * rng.normal(size=n)
+    data = {
+        "N": n,
+        "x1": list(x1),
+        "x2": list(x2),
+        "y": list(x1 + x2 + 0.3 * rng.normal(size=n)),
+    }
+    mgr = sample.RunManager()
+    started = mgr.start_run(
+        COLLINEAR,
+        data,
+        method="sample",
+        seed=1,
+        method_args={"chains": 4, "iter_warmup": 500, "iter_sampling": 500},
+    )
+    result = asyncio.run(mgr.await_run(started["run_id"], timeout=300))
+    assert result["status"] == "done", result["meta"].get("stderr", "")[:500]
+
+    saw_preparing = False
+    for _ in range(60):
+        geom = diagnostics.run_geometry(started["run_id"])
+        if geom.get("status") != "preparing":
+            break
+        saw_preparing = True
+        time.sleep(3)
+    else:
+        pytest.fail("BridgeStan artifact never finished building")
+
+    # A run builds only the CmdStan exe, so the first call must have deferred.
+    assert saw_preparing
+    assert geom["scale"] == "unconstrained"
+    assert geom["verdict"] == "warn"
+    pair = geom["pairs"][0]
+    assert {pair["a"], pair["b"]} == {"b1", "b2"}
+    assert pair["r"] < -0.9  # trading off: negative, and it must survive the filter
+    assert pair["z"] > 4
+    assert geom["eigen"]["condition_number"] > 100
+    assert {d["param"] for d in geom["eigen"]["direction"][:2]} == {"b1", "b2"}
 
 
 def test_live_validate_data(tmp_path, monkeypatch):

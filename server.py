@@ -276,6 +276,35 @@ async def get_run_pathologies(
 
 
 @mcp.tool()
+async def get_run_geometry(
+    run_id: str,
+    params: list[str] | None = None,
+    max_dims: int = diagnostics.DEFAULT_MAX_DIMS,
+    min_abs_r: float = 0.5,
+    min_z: float = 4.0,
+    top_k: int = 10,
+) -> dict:
+    """Posterior conditioning for a sample run: correlated cross-block parameter
+    pairs and the worst-conditioned direction, computed on the unconstrained
+    scale the sampler actually explores, with each chain centred first.
+
+    Catches linear degeneracy — collinear predictors wasting gradient
+    evaluations along a ridge — which can leave R-hat, ESS, divergences and
+    E-BFMI all looking healthy. It does NOT catch funnels: that dependence is
+    non-linear, so use `get_run_pathologies` and `get_run_diagnostics` for those.
+
+    Pairs are calibrated by Fisher z against each pair's effective sample size,
+    since raw |r| has no fixed meaning across runs (its noise floor scales as
+    1/sqrt(ESS)). Only pairs clearing both `min_abs_r` and `min_z` are itemized;
+    thresholds and `max_dims` accept 0 for unlimited. The first call on a freshly
+    sampled model returns `status: "preparing"` while the BridgeStan artifact
+    builds in the background — retry shortly."""
+    return await asyncio.to_thread(
+        _safe, diagnostics.run_geometry, run_id, params, max_dims, min_abs_r, min_z, top_k
+    )
+
+
+@mcp.tool()
 async def run_loo(run_id: str, var_name: str = "log_lik") -> dict:
     """PSIS-LOO cross-validation for a run (model must emit a `log_lik` GQ)."""
     return await asyncio.to_thread(_safe, diagnostics.run_loo, run_id, var_name)
