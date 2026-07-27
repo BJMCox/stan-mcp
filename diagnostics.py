@@ -791,19 +791,6 @@ _MIN_DIVERGENCES = 5
 _PERMUTATION_BUDGET = 50_000_000
 
 
-def _draw_matrix(idata) -> tuple[np.ndarray, list[str]]:
-    """(draws, elements) matrix over every posterior parameter element, and the
-    matching element names."""
-    cols, names = [], []
-    for name in idata.posterior.data_vars:
-        arr = np.asarray(idata.posterior[name].values)
-        flat = arr.reshape(arr.shape[0] * arr.shape[1], -1)
-        for j in range(flat.shape[1]):
-            cols.append(flat[:, j])
-            names.append(str(name) if flat.shape[1] == 1 else f"{name}[{j}]")
-    return np.column_stack(cols), names
-
-
 def _shift_vector(Xz: np.ndarray, idx: np.ndarray, n_div: int, n: int) -> np.ndarray:
     """mean(divergent) - mean(rest), per column, in sd units.
 
@@ -938,26 +925,29 @@ def _bridgestan_names(source, data) -> list[str]:
     return density.get_model(source, data).param_names()
 
 
-def _constrained_matrix(idata, bs_names: list[str]) -> np.ndarray:
+def _constrained_matrix(d: draws.Draws, bs_names: list[str]) -> np.ndarray:
     """(draws, n_params) in BridgeStan's constrained parameter order.
 
-    BridgeStan spells elements `z.3` / `m.2.1` with 1-based indices; arviz keeps
-    them as array dims. Indices are resolved explicitly per name, so the two
-    orderings never have to agree."""
-    post = idata.posterior
+    BridgeStan spells elements `z.3` / `m.2.1` with 1-based indices; the sidecar
+    records each variable's dims, so an index tuple resolves directly against the
+    typed array. This replaces resolving them against arviz's dim ordering with
+    ravel_multi_index."""
     cols = []
     for nm in bs_names:
         base, *idx = nm.split(".")
-        arr = np.asarray(post[base].values)  # (chain, draw, ...)
+        arr = d.params.get(base)
+        if arr is None:
+            raise RunError(f"BridgeStan names parameter {base!r}, absent from the run's draws")
         flat = arr.reshape(arr.shape[0] * arr.shape[1], -1)
-        pos = 0
         if idx:
             pos = int(np.ravel_multi_index(tuple(int(i) - 1 for i in idx), arr.shape[2:]))
+        else:
+            pos = 0
         cols.append(flat[:, pos])
     return np.column_stack(cols)
 
 
-def _unconstrained_draws(run_id: str, idata) -> tuple[np.ndarray, list[str], dict]:
+def _unconstrained_draws(run_id: str, d: draws.Draws) -> tuple[np.ndarray, list[str], dict]:
     """(chain, draw, dim) unconstrained draws and their names.
 
     The sampler explores the UNCONSTRAINED space, so that is the geometry whose
@@ -970,7 +960,7 @@ def _unconstrained_draws(run_id: str, idata) -> tuple[np.ndarray, list[str], dic
 
     inputs = runstore.load_inputs(run_id)
     source = inputs["source"]
-    n_chain, n_draw = idata.posterior.sizes["chain"], idata.posterior.sizes["draw"]
+    n_chain, n_draw = d.n_chain, d.n_draw
     if source is None:
         raise RunError(f"run {run_id!r} has no persisted model.stan to unconstrain with")
 
@@ -981,12 +971,12 @@ def _unconstrained_draws(run_id: str, idata) -> tuple[np.ndarray, list[str], dic
             "the CmdStan executable); retry shortly"
         )
     if state["status"] == "failed":
-        X, names = _draw_matrix(idata)
+        X, names = draws.matrix(d)
         u = X.reshape(n_chain, n_draw, -1)
         return u, names, {"scale": "constrained", "scale_reason": state["error"]}
 
     m = density.get_model(source, inputs["data"])
-    X = _constrained_matrix(idata, m.param_names())
+    X = _constrained_matrix(d, m.param_names())
     unc = np.empty((X.shape[0], m.param_unc_num()))
     try:
         for i in range(X.shape[0]):
@@ -1001,7 +991,7 @@ def _unconstrained_draws(run_id: str, idata) -> tuple[np.ndarray, list[str], dic
         # unconstrained at all, so report constrained draws and say why instead of
         # failing the call. Same for any other constraint whose inverse validates
         # (unit_vector, corr_matrix, cholesky_factor_corr).
-        Xc, cnames = _draw_matrix(idata)
+        Xc, cnames = draws.matrix(d)
         return (
             Xc.reshape(n_chain, n_draw, -1),
             cnames,
@@ -1064,9 +1054,9 @@ def run_geometry(
             f"geometry needs MCMC draws with chain structure; run {run_id!r} "
             f"used {meta.get('method')!r}"
         )
-    idata = _load_idata(run_id)
+    d = draws.load(run_id)
     try:
-        u3, names, scale = _unconstrained_draws(run_id, idata)
+        u3, names, scale = _unconstrained_draws(run_id, d)
     except _GeometryPending as pending:
         # Not an error: the artifact is being built off the caller's thread.
         return {"run_id": run_id, "status": "preparing", "note": str(pending)}

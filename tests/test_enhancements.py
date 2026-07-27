@@ -1315,25 +1315,69 @@ def test_sampler_stats_reports_ebfmi_warning_when_bfmi_raises(monkeypatch):
     assert got["ebfmi_warning"] == "E-BFMI unavailable: boom"
 
 
+def test_constrained_matrix_maps_bridgestan_names_via_recorded_dims(tmp_path, monkeypatch):
+    """BridgeStan spells elements m.2.1 (1-based, column-major). Resolving that
+    against the sidecar's dims replaces ravel_multi_index over arviz's dim order."""
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    rid = "sample-0001"
+    runstore.write_meta(rid, {"method": "sample", "status": "done"})
+    csvdir = runstore.run_dir(rid, create=True) / "csv"
+    csvdir.mkdir(parents=True, exist_ok=True)
+    (csvdir / "a.csv").write_text("# c\nlp__,s,m.1.1,m.2.1,m.1.2,m.2.2\n-1,9.0,11,21,12,22\n")
+    diagnostics.draws.schema_path(rid).write_text(
+        json.dumps(
+            {
+                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "files": ["a.csv"],
+                "params": {
+                    "s": {"dims": [], "cols": [1]},
+                    "m": {"dims": [2, 2], "cols": [2, 4, 3, 5]},
+                },
+                "sampler_stats": {"lp__": {"dims": [], "cols": [0]}},
+            }
+        )
+    )
+    d = diagnostics.draws.load(rid)
+    # BridgeStan's own order for this model, column-major
+    X = diagnostics._constrained_matrix(d, ["m.1.1", "m.2.1", "m.1.2", "m.2.2", "s"])
+    assert X.shape == (1, 5)
+    assert X[0].tolist() == [11.0, 21.0, 12.0, 22.0, 9.0]
+
+
 # --- posterior geometry ---
 def _geom_run(monkeypatch, tmp_path, cols: dict, n_chain=4, n_draw=500):
     """A run whose unconstrained draws are planted. `cols` maps name -> (draws,)
     array of length n_chain*n_draw. The BridgeStan round-trip is stubbed: what
-    needs testing is the statistics, and the unconstraining needs a toolchain."""
-    import arviz as az
+    needs testing is the statistics, and the unconstraining needs a toolchain.
 
+    `run_geometry` only uses the loaded `Draws` to pass into `_unconstrained_draws`,
+    which is stubbed below regardless of what it's given -- so the on-disk typed
+    run just needs to exist and load, not carry the planted values itself.
+    """
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     names = list(cols)
     u3 = np.stack([cols[n] for n in names], axis=-1).reshape(n_chain, n_draw, len(names))
-    idata = az.from_dict({"posterior": {"dummy": np.zeros((n_chain, n_draw))}})
-    runstore.write_meta("sample-0001", {"method": "sample", "status": "done"})
-    idata.to_netcdf(str(runstore.idata_path("sample-0001")))
+    rid = "sample-0001"
+    runstore.write_meta(rid, {"method": "sample", "status": "done"})
+    csvdir = runstore.run_dir(rid, create=True) / "csv"
+    csvdir.mkdir(parents=True, exist_ok=True)
+    (csvdir / "chain0.csv").write_text("# c\nlp__,dummy\n-1,0\n")
+    diagnostics.draws.schema_path(rid).write_text(
+        json.dumps(
+            {
+                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "files": ["chain0.csv"],
+                "params": {"dummy": {"dims": [], "cols": [1]}},
+                "sampler_stats": {"lp__": {"dims": [], "cols": [0]}},
+            }
+        )
+    )
     monkeypatch.setattr(
         diagnostics,
         "_unconstrained_draws",
-        lambda rid, idata: (u3, names, {"scale": "unconstrained"}),
+        lambda rid, d: (u3, names, {"scale": "unconstrained"}),
     )
-    return "sample-0001"
+    return rid
 
 
 def _correlated(rho, n, seed=0):
@@ -1453,28 +1497,40 @@ def test_geometry_params_filter(tmp_path, monkeypatch):
 
 
 def test_geometry_rejects_non_sample_methods(tmp_path, monkeypatch):
+    """The method gate must fire before `draws.load` ever runs: a run with no
+    draws_schema.json also raises RunError, on a different message, so this has
+    to pin the gate's own text or it would pass even with the gate deleted."""
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     runstore.write_meta("variational-0001", {"method": "variational", "status": "done"})
-    with pytest.raises(errors.RunError):
+    with pytest.raises(errors.RunError, match="geometry needs MCMC draws with chain structure"):
         diagnostics.run_geometry("variational-0001")
 
 
 def test_geometry_reports_preparing_not_an_error(tmp_path, monkeypatch):
     """The first call on a freshly sampled model has no .so; the build happens off
     the caller's thread and the call must say so rather than fail."""
-    import arviz as az
-
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    runstore.write_meta("sample-0001", {"method": "sample", "status": "done"})
-    az.from_dict({"posterior": {"x": np.zeros((2, 10))}}).to_netcdf(
-        str(runstore.idata_path("sample-0001"))
+    rid = "sample-0001"
+    runstore.write_meta(rid, {"method": "sample", "status": "done"})
+    csvdir = runstore.run_dir(rid, create=True) / "csv"
+    csvdir.mkdir(parents=True, exist_ok=True)
+    (csvdir / "chain0.csv").write_text("# c\nlp__,x\n-1,0\n")
+    diagnostics.draws.schema_path(rid).write_text(
+        json.dumps(
+            {
+                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "files": ["chain0.csv"],
+                "params": {"x": {"dims": [], "cols": [1]}},
+                "sampler_stats": {"lp__": {"dims": [], "cols": [0]}},
+            }
+        )
     )
 
-    def _pending(rid, idata):
+    def _pending(rid, d):
         raise diagnostics._GeometryPending("building")
 
     monkeypatch.setattr(diagnostics, "_unconstrained_draws", _pending)
-    assert diagnostics.run_geometry("sample-0001")["status"] == "preparing"
+    assert diagnostics.run_geometry(rid)["status"] == "preparing"
 
 
 def test_geometry_falls_back_when_draws_cannot_be_unconstrained(tmp_path, monkeypatch):
@@ -1486,24 +1542,41 @@ def test_geometry_falls_back_when_draws_cannot_be_unconstrained(tmp_path, monkey
     on every mixture or LKJ model. It must degrade to the constrained scale and say
     so instead -- reported, not swallowed, and not fatal.
     """
-    import arviz as az
-
     import density
 
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    rid = "sample-0001"
     n_chain, n_draw = 2, 50
     rng = np.random.default_rng(4)
-    idata = az.from_dict(
-        {
-            "posterior": {
-                "theta": rng.random((n_chain, n_draw, 3)),
-                "s": rng.random((n_chain, n_draw)),
+    theta = rng.random((n_chain, n_draw, 3))
+    s = rng.random((n_chain, n_draw))
+
+    runstore.write_meta(rid, {"method": "sample", "status": "done"})
+    runstore.persist_inputs(rid, "parameters { simplex[3] theta; real s; } model { }", {})
+    csvdir = runstore.run_dir(rid, create=True) / "csv"
+    csvdir.mkdir(parents=True, exist_ok=True)
+    files = []
+    for chain in range(n_chain):
+        rows = "\n".join(
+            f"-1,{theta[chain, i, 0]},{theta[chain, i, 1]},{theta[chain, i, 2]},{s[chain, i]}"
+            for i in range(n_draw)
+        )
+        name = f"chain{chain}.csv"
+        (csvdir / name).write_text(f"# c\nlp__,theta.1,theta.2,theta.3,s\n{rows}\n")
+        files.append(name)
+    diagnostics.draws.schema_path(rid).write_text(
+        json.dumps(
+            {
+                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "files": files,
+                "params": {
+                    "theta": {"dims": [3], "cols": [1, 2, 3]},
+                    "s": {"dims": [], "cols": [4]},
+                },
+                "sampler_stats": {"lp__": {"dims": [], "cols": [0]}},
             }
-        }
+        )
     )
-    runstore.write_meta("sample-0001", {"method": "sample", "status": "done"})
-    runstore.persist_inputs("sample-0001", "parameters { simplex[3] theta; real s; } model { }", {})
-    idata.to_netcdf(str(runstore.idata_path("sample-0001")))
 
     class _Rejecting:
         def param_names(self):
@@ -1527,7 +1600,7 @@ def test_geometry_falls_back_when_draws_cannot_be_unconstrained(tmp_path, monkey
     monkeypatch.setattr(_compile, "request_so", lambda *a, **k: {"status": "ready"})
     monkeypatch.setattr(density, "get_model", lambda *a, **k: _Rejecting())
 
-    g = diagnostics.run_geometry("sample-0001")
+    g = diagnostics.run_geometry(rid)
     assert "error" not in g, g
     assert g["scale"] == "constrained"
     # the actual Stan message must survive into the reason, not be flattened away

@@ -221,8 +221,8 @@ model { y ~ normal(a + b1 * x1 + b2 * x2, sigma); }
 
 def test_live_geometry_finds_collinearity(tmp_path, monkeypatch):
     """Full unconstrained path: BridgeStan rebuild, the background .so build and
-    its `preparing` status, the BridgeStan-name to arviz-dim index mapping, and
-    the statistics. The offline tests stub all of that out.
+    its `preparing` status, the BridgeStan-name to sidecar-recorded-dim index
+    mapping, and the statistics. The offline tests stub all of that out.
 
     x2 = x1 + tiny noise, so b1 and b2 are near-degenerate and trade off — a
     NEGATIVE correlation, which is what the signed-Fisher-z bug silently dropped.
@@ -414,8 +414,8 @@ model {
 
 
 def test_live_bridgestan_name_mapping_on_shaped_params(tmp_path, monkeypatch):
-    """The BridgeStan `m.2.1` name to arviz array-dim mapping, on a model that
-    actually has multi-dimensional and dimension-changing parameters.
+    """The BridgeStan `m.2.1` name to sidecar-recorded-dim mapping, on a model
+    that actually has multi-dimensional and dimension-changing parameters.
 
     This is the one line in run_geometry whose failure is silent: get it wrong
     and every reported pair is labelled with the wrong parameter name. Nothing
@@ -430,6 +430,7 @@ def test_live_bridgestan_name_mapping_on_shaped_params(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     import asyncio
     import time
+    from pathlib import Path
 
     import density
     import diagnostics
@@ -454,8 +455,8 @@ def test_live_bridgestan_name_mapping_on_shaped_params(tmp_path, monkeypatch):
     # 6 matrix elements + 3 simplex components + 1 scalar
     assert len(bs_names) == 10, bs_names
 
-    idata = diagnostics._load_idata(rid)
-    X = diagnostics._constrained_matrix(idata, bs_names)
+    d = diagnostics.draws.load(rid)
+    X = diagnostics._constrained_matrix(d, bs_names)
     assert X.shape == (1000, 10)
 
     # (1) each matrix element must land on its own prior mean, 10*i + j
@@ -466,16 +467,24 @@ def test_live_bridgestan_name_mapping_on_shaped_params(tmp_path, monkeypatch):
         got = float(X[:, k].mean())
         assert abs(got - (10 * i + j)) < 0.5, f"{nm} resolved to {got}, wants {10 * i + j}"
 
-    # (2) independent oracle: CmdStan writes its CSV header with the same
-    # `m.i.j` spelling, so column nm from the CSV and column k here are the same
-    # quantity. Compared as multisets, since the two paths need not agree on the
-    # order in which chains are concatenated.
-    df = diagnostics._draws_df(rid)
-    for k, nm in enumerate(bs_names):
-        assert nm in df.columns, f"{nm} missing from CmdStan CSV: {list(df.columns)[:12]}"
-        mine = np.sort(X[:, k])
-        theirs = np.sort(df[nm].to_numpy(dtype=float))
-        assert np.allclose(mine, theirs), f"{nm} mismatch vs CmdStan CSV"
+    # (2) Independent oracle: the sidecar's recorded columns must place L[i,j]
+    # where the CSV header says L.i.j is. A mapping error here mislabels
+    # parameters rather than raising, so it is checked against CmdStan's own
+    # header, produced by code that shares nothing with the mapping under test.
+    lines = [
+        ln
+        for ln in Path(diagnostics.draws.csv_files(rid)[0]).read_text().splitlines()
+        if ln and not ln.startswith("#")
+    ]
+    header = lines[0].split(",")
+    raw = np.asarray([[float(v) for v in ln.split(",")] for ln in lines[1:]])
+    for i in range(2):
+        for j in range(3):
+            col = header.index(f"m.{i + 1}.{j + 1}")
+            assert np.allclose(d.params["m"][0, :, i, j], raw[:, col]), f"m[{i + 1},{j + 1}]"
+            # and the value must be the prior mean for THAT element, so a
+            # transpose is caught by magnitude and not only by equality
+            assert abs(float(d.params["m"][0, :, i, j].mean()) - (10 * (i + 1) + (j + 1))) < 0.5
 
     # (3) the unconstrained space is genuinely a different size: the simplex
     # contributes 2 dims, not 3, so param_unc_names() cannot be assumed to line
