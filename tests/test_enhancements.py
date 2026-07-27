@@ -532,9 +532,9 @@ def test_csv_summary_for_non_idata_run(tmp_path, monkeypatch):
 
 def _write_typed_csv_run(run_id):
     """`_write_csv_run`'s single-file layout, plus the sidecar `extract_draws`
-    now requires. Kept separate from `_write_csv_run` itself -- run_summary,
-    posterior_mean_inits and get_run_progress still read that fixture straight
-    off the untyped CSV and must keep working unmigrated."""
+    now requires. Kept separate from `_write_csv_run` itself -- get_run_progress
+    still reads that fixture straight off the untyped CSV and must keep working
+    unmigrated."""
     _write_csv_run(run_id)
     diagnostics.draws.schema_path(run_id).write_text(
         json.dumps(
@@ -578,7 +578,7 @@ def test_extract_draws_requires_a_param(tmp_path, monkeypatch):
 
 def test_posterior_mean_inits_from_csv(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    _write_csv_run("variational-0001")
+    _write_typed_csv_run("variational-0001")
     inits = diagnostics.posterior_mean_inits("variational-0001")
     assert abs(inits["theta"] - 0.6) < 1e-9
     assert inits["beta"] == [1.25, 2.25]  # means of (1.0,1.5) and (2.0,2.5)
@@ -590,6 +590,39 @@ def test_posterior_mean_inits_from_optimize(tmp_path, monkeypatch):
     runstore.persist_estimate("optimize-0001", {"theta": 0.7, "lp__": -2.0})
     inits = diagnostics.posterior_mean_inits("optimize-0001")
     assert inits == {"theta": 0.7}  # lp__ dropped
+
+
+def test_posterior_mean_inits_handles_matrices(tmp_path, monkeypatch):
+    """Previously anything with two or more dots in its CSV name was silently
+    skipped and left to Stan's default init, because reassembling it needed the
+    dims. With dims recorded it is arr.mean(axis=(0,1)).tolist()."""
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    rid = "sample-0001"
+    runstore.write_meta(rid, {"method": "sample", "status": "done"})
+    csvdir = runstore.run_dir(rid, create=True) / "csv"
+    csvdir.mkdir(parents=True, exist_ok=True)
+    # columns: lp__, s, m.1.1, m.2.1, m.1.2, m.2.2  (CmdStan column-major)
+    (csvdir / "a.csv").write_text(
+        "# c\nlp__,s,m.1.1,m.2.1,m.1.2,m.2.2\n-1,2.0,11,21,12,22\n-1,4.0,13,23,14,24\n"
+    )
+    diagnostics.draws.schema_path(rid).write_text(
+        json.dumps(
+            {
+                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "files": ["a.csv"],
+                "params": {
+                    "s": {"dims": [], "cols": [1]},
+                    # row-major fill order: m[1,1], m[1,2], m[2,1], m[2,2]
+                    "m": {"dims": [2, 2], "cols": [2, 4, 3, 5]},
+                },
+                "sampler_stats": {"lp__": {"dims": [], "cols": [0]}},
+            }
+        )
+    )
+    inits = diagnostics.posterior_mean_inits(rid)
+    assert inits["s"] == pytest.approx(3.0)
+    assert inits["m"] == [[12.0, 13.0], [22.0, 23.0]]
+    assert "lp__" not in inits
 
 
 def test_list_runs_status_and_method_filters(tmp_path, monkeypatch):

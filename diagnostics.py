@@ -1240,25 +1240,25 @@ def run_geometry(
 
 def posterior_mean_inits(run_id: str) -> dict:
     """Posterior (or estimate) mean per parameter, shaped as CmdStan inits, for
-    warm-starting another run. Scalars and 1-D vectors are reconstructed;
-    higher-dimensional params are omitted (Stan default-inits those)."""
+    warm-starting another run.
+
+    Every rank is supported: with dims recorded in the sidecar this is just the
+    mean over the chain and draw axes. The previous version parsed flat CSV names
+    and silently skipped anything with two or more dots -- so warm-starting a model
+    with a matrix parameter looked like it worked while Stan default-inited it.
+
+    No check that the source run's model matches the target's, deliberately:
+    warm-starting a RELATED model is the point (same source with more data, a
+    centered->non-centered rewrite), and CmdStan ignores an init name the model
+    does not have while default-initing one the init omits. An init cannot bias a
+    posterior, so a mismatch costs warmup, not correctness.
+    """
     meta = runstore.read_meta(run_id)
     if meta.get("method") == "optimize":
         return {k: v for k, v in runstore.load_estimate(run_id).items() if k != "lp__"}
-    df = _draws_df(run_id)
-    scalars: dict = {}
-    vectors: dict[str, dict[int, float]] = {}
-    for c in df.columns:
-        if c.endswith("__"):
-            continue
-        parts = c.split(".")
-        mean = float(df[c].to_numpy(dtype=float).mean())
-        if len(parts) == 1:
-            scalars[parts[0]] = mean
-        elif len(parts) == 2:  # 1-D vector element base.i
-            vectors.setdefault(parts[0], {})[int(parts[1])] = mean
-        # higher-dimensional params (base.i.j...) are left to Stan's default init
-    inits = dict(scalars)
-    for base, idx_to_mean in vectors.items():
-        inits[base] = [idx_to_mean[i] for i in sorted(idx_to_mean)]
+    d = draws.load(run_id)
+    inits: dict = {}
+    for name, arr in d.params.items():
+        mean = np.asarray(arr).mean(axis=(0, 1))
+        inits[name] = float(mean) if mean.ndim == 0 else mean.tolist()
     return inits
