@@ -203,7 +203,7 @@ def test_extract_draws_unknown_param_raises(tmp_path, monkeypatch):
 
 
 def test_extract_draws_works_for_a_variational_run(tmp_path, monkeypatch):
-    """One path for all six methods: no branch on whether inference.nc exists."""
+    """One path for all six methods: no branch on the method at all."""
     rid = _typed_run(tmp_path, monkeypatch, method="variational")
     assert diagnostics.extract_draws(rid, param="theta")["draws"] == [0.1, 0.2, 0.3, 0.4]
 
@@ -554,9 +554,9 @@ def _write_csv_run(run_id):
     )
 
 
-def test_csv_summary_for_non_idata_run(tmp_path, monkeypatch):
-    """Approximate methods get numpy moments over the typed draws layer -- Stan
-    labels, not arviz's dot notation."""
+def test_summary_for_an_approximate_method_uses_numpy_moments(tmp_path, monkeypatch):
+    """Approximate methods get numpy moments over the typed draws layer -- 1-based
+    Stan labels, not CmdStan's dot notation."""
     rid = _typed_run(tmp_path, monkeypatch, method="variational")
     s = diagnostics.run_summary(rid)
     assert {r["param"] for r in s["summary"]} == {"theta", "z[1]", "z[2]"}  # lp__ excluded
@@ -586,7 +586,7 @@ def _write_typed_csv_run(run_id):
     )
 
 
-def test_csv_extract_draws_for_non_idata_run(tmp_path, monkeypatch):
+def test_extract_draws_for_an_approximate_method(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     _write_typed_csv_run("variational-0001")
     scalar = diagnostics.extract_draws("variational-0001", "theta")
@@ -595,7 +595,7 @@ def test_csv_extract_draws_for_non_idata_run(tmp_path, monkeypatch):
     assert vector["draws"] == [[1.0, 2.0], [1.5, 2.5]]
 
 
-def test_csv_extract_multi_param(tmp_path, monkeypatch):
+def test_extract_draws_multi_param_for_an_approximate_method(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     _write_typed_csv_run("variational-0001")
     out = diagnostics.extract_draws("variational-0001", params=["theta", "beta"])
@@ -611,7 +611,7 @@ def test_extract_draws_requires_a_param(tmp_path, monkeypatch):
         diagnostics.extract_draws("variational-0001")
 
 
-def test_posterior_mean_inits_from_csv(tmp_path, monkeypatch):
+def test_posterior_mean_inits_from_typed_draws(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     _write_typed_csv_run("variational-0001")
     inits = diagnostics.posterior_mean_inits("variational-0001")
@@ -837,8 +837,8 @@ def test_progress_counts_persisted_csvs_after_live_cleanup(tmp_path, monkeypatch
     assert out["draws_written"] == 2
 
 
-# --- extract_draws: by_chain over CSVs, single load, size cap ---
-def test_csv_extract_by_chain(tmp_path, monkeypatch):
+# --- extract_draws: by_chain, single load, size cap ---
+def test_extract_draws_by_chain_for_an_approximate_method(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     runstore.write_meta("variational-0001", {"method": "variational", "status": "done"})
     csvdir = runstore.run_dir("variational-0001", create=True) / "csv"
@@ -878,7 +878,7 @@ def test_extract_draws_caps_result_size(tmp_path, monkeypatch):
 
 
 # run_summary is the tool you actually reach for (raw draws tell you little), so
-# it is the one that most needs to stay small — and arviz emits one row per
+# it is the one that most needs to stay small — and it emits one row per
 # parameter ELEMENT, so one big vector is hundreds of rows.
 def test_run_summary_caps_rows(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
@@ -914,7 +914,7 @@ def test_run_summary_truncation_keeps_worst_converged(tmp_path, monkeypatch):
     rows worth keeping are the ones you would act on."""
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     rows = [{"param": f"z[{i}]", "r_hat": 1.0, "ess_bulk": 900.0} for i in range(10)]
-    rows[7]["r_hat"] = 1.4  # the broken one, last in arviz order among the tail
+    rows[7]["r_hat"] = 1.4  # the broken one, sitting in the tail a first-N cap drops
     rows[9]["ess_bulk"] = 12.0  # worst ESS, but r_hat is fine
     out = diagnostics._cap_rows(rows, 2)
     assert [r["param"] for r in out["summary"]] == ["z[7]", "z[9]"]
@@ -922,7 +922,8 @@ def test_run_summary_truncation_keeps_worst_converged(tmp_path, monkeypatch):
 
 
 def test_run_summary_truncation_without_convergence_columns(tmp_path, monkeypatch):
-    """The CSV fallback has no r_hat/ess_bulk, so order is all there is."""
+    """The approximate methods' numpy summary reports no r_hat/ess_bulk, so
+    order is all there is."""
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     rows = [{"param": f"z[{i}]", "mean": 0.0} for i in range(5)]
     out = diagnostics._cap_rows(rows, 2)
@@ -930,7 +931,7 @@ def test_run_summary_truncation_without_convergence_columns(tmp_path, monkeypatc
     assert out["truncated"]["selected_by"] == "order"
 
 
-def test_run_summary_csv_fallback_caps_rows(tmp_path, monkeypatch):
+def test_run_summary_caps_rows_for_an_approximate_method(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     rid = "variational-0001"
     runstore.write_meta(rid, {"method": "variational", "status": "done"})
@@ -1464,8 +1465,9 @@ def test_sampler_stats_reports_ebfmi_warning_when_bfmi_raises(monkeypatch):
 
 
 def test_constrained_matrix_maps_bridgestan_names_via_recorded_dims(tmp_path, monkeypatch):
-    """BridgeStan spells elements m.2.1 (1-based, column-major). Resolving that
-    against the sidecar's dims replaces ravel_multi_index over arviz's dim order.
+    """BridgeStan spells elements m.2.1 (1-based, column-major). ravel_multi_index
+    still flattens it, but against the sidecar's recorded dims rather than arviz's
+    dim ordering.
 
     `m` is non-square (2x3, matching the live SHAPED model): a square fixture
     catches a transposed reshape (every value differs) but not a stride error
@@ -2219,5 +2221,30 @@ def test_idata_with_loglik_is_built_from_typed_arrays(tmp_path, monkeypatch):
 
 def test_missing_loglik_still_raises_a_clear_error(tmp_path, monkeypatch):
     rid = _typed_run(tmp_path, monkeypatch)
-    with pytest.raises(errors.RunError, match="log_lik"):
+    with pytest.raises(errors.RunError, match="log_lik") as exc:
+        diagnostics._idata_with_loglik(rid, "log_lik")
+    # the names that ARE there are listed, so the caller can see the near-miss
+    assert "theta" in str(exc.value)
+
+
+def test_missing_loglik_on_a_run_with_no_parameters_reads_as_prose(tmp_path, monkeypatch):
+    """`", ".join(sorted({}))` is the empty string, so the message used to end at
+    "(have: )" — a trailing space and nothing after it."""
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
+    rid = "sample-0001"
+    runstore.write_meta(rid, {"method": "sample", "status": "done"})
+    csvdir = runstore.run_dir(rid, create=True) / "csv"
+    csvdir.mkdir(parents=True, exist_ok=True)
+    (csvdir / "a.csv").write_text("# c\nlp__\n-1\n")
+    diagnostics.draws.schema_path(rid).write_text(
+        json.dumps(
+            {
+                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "files": ["a.csv"],
+                "params": {},
+                "sampler_stats": {"lp__": {"dims": [], "cols": [0]}},
+            }
+        )
+    )
+    with pytest.raises(errors.RunError, match=r"have: no parameters at all"):
         diagnostics._idata_with_loglik(rid, "log_lik")

@@ -3,6 +3,16 @@
 from errors import ValidationError
 
 METHODS: dict[str, dict] = {
+    # `save_warmup` and `thin` are deliberately absent from "sample"'s args, and
+    # must stay absent. The draws sidecar records only each variable's dims and
+    # CSV column indices -- it has no notion of which ROWS are warmup. Exposing
+    # `save_warmup` would put warmup rows in the CSVs, where every reader would
+    # silently count them as draws: they would land in each statistic, in the
+    # divergence count, in the pathology ranking and in the geometry result, all
+    # without any indication. (`thin` is CmdStan's own draw thinning, distinct
+    # from `extract_draws`' read-side `thin`, and would likewise make a run's
+    # nominal and actual draw counts disagree.) Adding either needs a schema
+    # version bump recording the warmup row count first.
     "sample": {
         "cmd": "sample",
         "draws": True,

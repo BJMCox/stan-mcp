@@ -75,7 +75,11 @@ def test_sidecar_write_failure_fails_the_run(tmp_path, monkeypatch):
         (live / "model_1.csv").write_text("# c\nlp__,theta\n-1,0.5\n")
         return object()
 
-    def boom(fit):
+    # The real signature is `_sidecar_from_fit(fit, method, run_id)`. A one-arg
+    # stub raises TypeError on arity before its body ever runs, so the test would
+    # pass on the wrong exception -- the trap its sibling in test_enhancements.py
+    # carries a comment about, fixed there and not here.
+    def boom(fit, method, run_id):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(mgr, "_runner", runner)
@@ -86,6 +90,10 @@ def test_sidecar_write_failure_fails_the_run(tmp_path, monkeypatch):
     assert result["status"] == "failed"
     meta = runstore.read_meta(started["run_id"])
     assert "draws schema" in meta["stderr"]
+    # exact suffix, not `in`: a TypeError from a signature mismatch carries the
+    # function's own name too ("boom() takes ... arguments") and would satisfy
+    # the loose check above just as well.
+    assert meta["persist_warning"] == "draws schema not written: boom"
     # the CSVs must survive the failure -- they're still worth keeping
     assert runstore.csv_paths(started["run_id"])
 

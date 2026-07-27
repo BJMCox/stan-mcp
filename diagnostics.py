@@ -1,4 +1,4 @@
-"""Method-aware summary and diagnostics over stored runs (arviz-backed).
+"""Method-aware summary and diagnostics over stored runs.
 
 persist_run: after a run finishes, convert its fit to persistent storage —
 optimize writes an estimate.json (optimized_params_dict); draws-producing
@@ -42,10 +42,15 @@ from errors import RunError, ValidationError
 
 
 def _method_diagnostics(method: str, fit) -> dict:
-    """Method-specific health scalars pulled from the fit. arviz cannot convert
-    VI/pathfinder/laplace fits, so for those three methods these are the ONLY
-    diagnostics there are — which is why a failure here is recorded rather than
-    swallowed."""
+    """Method-specific health scalars pulled from the fit.
+
+    For variational/pathfinder/laplace these are the ONLY diagnostics there are.
+    Not because arviz cannot convert those fits — nothing here goes through arviz
+    any more — but because R-hat, ESS, divergences and E-BFMI all describe HMC
+    chains, and these three methods produce neither chains nor the sampler stats
+    those statistics are computed from. That is why a failure here is recorded
+    rather than swallowed: there is no other diagnostic to fall back on.
+    """
     getters = {
         "variational": lambda: {"eta": float(fit.eta)},
         "pathfinder": lambda: {"is_resampled": bool(fit.is_resampled)},
@@ -283,16 +288,17 @@ def persist_run(run_id: str, method: str, fit) -> None:
         runstore.clear_live(run_id)
 
 
-# Default ceiling on summary rows. arviz emits one row per parameter ELEMENT, so
-# a single vector[500] is 500 rows x 9 fields. The summary is the tool you
+# Default ceiling on summary rows. The summary emits one row per parameter
+# ELEMENT, so a single vector[500] is 500 rows x 9 fields. It is the tool you
 # actually reach for — raw draws are near-useless to read — so it is the one that
 # most needs to stay small. Name `params` for specifics, or pass max_rows=0.
 DEFAULT_MAX_ROWS = 100
 
 
 def _worst_first(records: list[dict]):
-    """Sort key putting the least-converged rows first, or None if the run has
-    no convergence columns (the CSV fallback for VI/pathfinder/laplace)."""
+    """Sort key putting the least-converged rows first, or None if the run has no
+    convergence columns — the approximate methods' numpy summary, which reports
+    no R-hat or ESS because their draws are not MCMC chains."""
     if not records or not ({"r_hat", "ess_bulk"} & set(records[0])):
         return None
 
@@ -678,14 +684,19 @@ def _idata_with_loglik(run_id: str, var_name: str):
 
     d = draws.load(run_id)
     if var_name not in d.params:
+        # A run with zero parameters would otherwise end the message at
+        # "(have: )", with a trailing space and nothing after it.
+        have = ", ".join(sorted(d.params)) or "no parameters at all"
         raise RunError(
             f"run {run_id!r} has no log-likelihood: model must emit a generated "
-            f"quantity named {var_name!r} (have: {', '.join(sorted(d.params))})"
+            f"quantity named {var_name!r} (have: {have})"
         )
     posterior = {k: v for k, v in d.params.items() if k != var_name}
-    # arviz 1.2's from_dict takes one nested {group: {var: array}} dict, not
-    # per-group keyword arguments (the signature the brief was written
-    # against, and still in use by az.compare/az.loo elsewhere in this file).
+    # arviz 1.2's from_dict takes ONE nested {group: {var: array}} dict, not the
+    # per-group keyword arguments (posterior=..., log_likelihood=...) the brief
+    # was written against. This says nothing about az.loo/az.compare below: those
+    # take an idata or dataset plus ordinary keyword arguments (`var_name=`,
+    # `pointwise=`), and never took per-group ones.
     return az.from_dict(
         {
             "posterior": posterior or {var_name: d.params[var_name]},
@@ -996,8 +1007,9 @@ def _constrained_matrix(d: draws.Draws, bs_names: list[str]) -> np.ndarray:
 
     BridgeStan spells elements `z.3` / `m.2.1` with 1-based indices; the sidecar
     records each variable's dims, so an index tuple resolves directly against the
-    typed array. This replaces resolving them against arviz's dim ordering with
-    ravel_multi_index."""
+    typed array's own shape. `ravel_multi_index` still does the flattening below —
+    what changed is that it is given the sidecar's recorded dims rather than
+    arviz's dim ordering."""
     cols = []
     for nm in bs_names:
         base, *idx = nm.split(".")

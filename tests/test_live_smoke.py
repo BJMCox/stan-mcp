@@ -354,7 +354,6 @@ def test_live_generate_quantities(tmp_path, monkeypatch):
     import asyncio
 
     import diagnostics
-    import errors
     import runstore
     import sample
 
@@ -383,16 +382,16 @@ def test_live_generate_quantities(tmp_path, monkeypatch):
     # persist_run no longer does any arviz conversion for any method -- the
     # draws_schema.json sidecar plus the persisted raw CmdStan CSVs
     # (runstore.csv_paths) are the only record now, for every draws-producing
-    # method including generate_quantities. extract_draws can still fail here
-    # if the sidecar itself couldn't be written for this GQ run; if so, the raw
-    # CSVs must still be there to fall back on.
-    try:
-        diagnostics.extract_draws(run_id_gq, "y_sim")
-    except errors.RunError:
-        assert runstore.csv_paths(run_id_gq)
-    else:
-        summ = diagnostics.run_summary(run_id_gq)
-        assert "summary" in summ
+    # method including generate_quantities. Unconditional: persist_run RAISES on
+    # a sidecar-write failure, so a run that reached status="done" (asserted
+    # above) necessarily has one. The `except RunError: assert csv_paths(...)`
+    # tolerance this replaces dated from the arviz era, when a failed conversion
+    # still left status="done"; it is now unreachable and would mask a real
+    # regression.
+    assert runstore.csv_paths(run_id_gq)
+    drawn = diagnostics.extract_draws(run_id_gq, "y_sim")
+    assert len(drawn["draws"]) > 0
+    assert "summary" in diagnostics.run_summary(run_id_gq)
 
 
 # matrix elements get distinct, well-separated means (11,12,13 / 21,22,23) so a
