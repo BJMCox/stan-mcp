@@ -29,7 +29,7 @@ from datetime import UTC
 from pathlib import Path
 
 import config
-from errors import RunError
+from errors import RunError, ValidationError
 
 
 def new_run_id(method: str, seq: int) -> str:
@@ -150,6 +150,27 @@ def persist_csvs(run_id: str, csv_files) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     for f in csv_files:
         shutil.copy(f, dest / Path(f).name)
+
+
+def persist_input_csvs(run_id: str, csv_files: str | list[str]) -> list[str]:
+    """Snapshot external fitted-parameter CSVs in caller-supplied chain order."""
+    paths = [csv_files] if isinstance(csv_files, str) else csv_files
+    if not isinstance(paths, list) or not paths or not all(isinstance(p, str) for p in paths):
+        raise ValidationError("csv_files must be a CSV path or a nonempty list of CSV paths")
+    sources = [Path(p).expanduser().resolve() for p in paths]
+    for source in sources:
+        if source.suffix != ".csv" or not source.is_file():
+            raise ValidationError(f"fitted-parameter CSV file not found: {source}")
+    dest = run_dir(run_id, create=True) / "input_csv"
+    dest.mkdir(parents=True, exist_ok=True)
+    saved = []
+    for i, source in enumerate(sources):
+        # CmdStanPy sorts CSV paths. Numbered names preserve the supplied order
+        # and avoid collisions when chains share a basename in different dirs.
+        target = dest / f"{i:08d}.csv"
+        shutil.copyfile(source, target)
+        saved.append(str(target.resolve()))
+    return saved
 
 
 def clear_live(run_id: str) -> None:

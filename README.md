@@ -20,7 +20,7 @@ pixi run serve        # start the MCP server
 The C++ toolchain is provided by pixi. The BridgeStan and CmdStan source trees
 are downloaded automatically to `STAN_MCP_HOME` on first compile (large — the
 first compile takes a while). Pixi-managed, single platform (`osx-arm64`),
-Python 3.11/3.12.
+Python 3.15.
 
 ## Tasks
 
@@ -44,21 +44,30 @@ toolchain.
 
 ## Quickstart
 
-Compile a model, then evaluate its log density and gradient at a point in
-unconstrained space:
+Prefer file inputs. Pass an absolute `.stan` path as `stan` and an absolute
+`.json` path as `data`. Both files must exist on the MCP server's filesystem.
+Relative paths resolve from the server's working directory. Inline Stan and
+JSON strings remain available as fallbacks when files are unavailable.
+
+Compile an existing model file, then evaluate its log density and gradient at
+a point in unconstrained space:
 
 ```python
-compile_model(stan="parameters { real x; } model { x ~ normal(0, 1); }")
+compile_model(stan="/absolute/path/model.stan")
 # -> {"model_id": "…", "so_path": "…", "exe_path": "…"}
 
-log_density_gradient(stan="<model_id from above>", data=None, theta_unc=[0.5])
-# -> {"lp": -0.375, "gradient": [-0.5]}
+log_density_gradient(
+    stan="<model_id from above>",
+    data="/absolute/path/data.json",
+    theta_unc="/absolute/path/theta.json",
+)
+# theta.json contains a numeric array, e.g. [0.5]. Its length must match the model.
 ```
 
 Or run full inference and pull a summary once it finishes:
 
 ```python
-start_run(stan="<model_id>", data={"N": 10, ...}, method="sample")
+start_run(stan="/absolute/path/model.stan", data="/absolute/path/data.json", method="sample")
 # -> {"run_id": "sample-0001", "method": "sample", "status": "running"}
 
 await_run(run_id="sample-0001")
@@ -66,9 +75,34 @@ get_run_diagnostics(run_id="sample-0001")
 get_run_summary(run_id="sample-0001")
 ```
 
-A `model_id` (from `compile_model`) or `data_id` (from `register_data`) can be
-passed anywhere a tool expects `stan`/`data`, so a full model source or data
-payload only needs to be sent once.
+A `model_id` (from `compile_model`) or `data_id` (from
+`register_data(data="/absolute/path/data.json")`) can be passed anywhere a tool
+expects `stan`/`data`. Reuse these IDs for repeated calls. Registered data is a
+snapshot of the file contents. Runs save their model source and data contents,
+so later file changes do not alter their stored inputs.
+
+The density, gradient, Hessian, constrain, and gradient-check tools accept a
+JSON array file as `theta_unc`. `param_unconstrain` accepts a JSON object file
+as `constrained`, for example `{"theta": 0.5}`. Prefer these files over inline
+lists and dictionaries, which remain supported.
+
+For generated quantities from an external fit, pass CmdStan CSV paths:
+
+```python
+start_run(
+    stan="/absolute/path/model_with_gq.stan",
+    data="/absolute/path/data.json",
+    method="generate_quantities",
+    method_args={"csv_files": ["/absolute/path/chain-1.csv", "/absolute/path/chain-2.csv"]},
+)
+```
+
+`csv_files` accepts one path or a list in chain order. Files must retain the
+CmdStan headers from a sample, optimize, or variational fit. Optimize and
+variational accept one CSV each. Each run saves copies, so `rerun` works after
+the original files change or disappear. Draw
+summaries exclude saved warmup, intermediate optimization iterations, and the
+variational mean row. Use either `csv_files` or `from_run_id`, never both.
 
 ## Documentation
 

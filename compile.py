@@ -229,6 +229,17 @@ def model_id(source: str, stanc_args: list[str] | None = None) -> str:
     return h.hexdigest()[:16]
 
 
+def read_json_file(path: str, label: str):
+    """Read a server-local JSON input with a useful validation error."""
+    p = Path(path).expanduser()
+    if p.suffix != ".json" or not p.is_file():
+        raise errors.ValidationError(f"{label} JSON file not found: {path}")
+    try:
+        return json.loads(p.read_text())
+    except (OSError, ValueError) as exc:
+        raise errors.ValidationError(f"cannot read {label} JSON file {path!r}: {exc}") from exc
+
+
 def canonical_data(data) -> object:
     """Resolve data (dict, registered data_id, .json path, or JSON string)."""
     if data is None:
@@ -242,10 +253,7 @@ def canonical_data(data) -> object:
             return json.loads(cached.read_text())
         raise errors.ValidationError(f"unknown data_id {s!r} (register the data first)")
     if s.endswith(".json"):
-        p = Path(s)
-        if not p.is_file():
-            raise errors.ValidationError(f"data file not found: {s}")
-        return json.loads(p.read_text())
+        return read_json_file(s, "data")
     return json.loads(s)  # assume JSON string literal
 
 

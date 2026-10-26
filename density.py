@@ -80,6 +80,10 @@ def validate_data(stan, data) -> dict:
 
 
 def _validate_theta(model, theta_unc) -> np.ndarray:
+    if isinstance(theta_unc, str):
+        theta_unc = _compile.read_json_file(theta_unc, "theta_unc")
+        if not isinstance(theta_unc, list):
+            raise errors.ValidationError("theta_unc JSON file must contain a numeric array")
     arr = np.asarray(theta_unc, dtype=float)
     n = model.param_unc_num()
     if arr.shape != (n,):
@@ -129,7 +133,11 @@ def param_constrain(stan, data, theta_unc, include_tp=False, include_gq=False) -
     return {"constrained": dict(zip(names, vals, strict=True))}
 
 
-def param_unconstrain(stan, data, constrained: dict) -> dict:
+def param_unconstrain(stan, data, constrained: dict | str) -> dict:
+    if isinstance(constrained, str):
+        constrained = _compile.read_json_file(constrained, "constrained")
+    if not isinstance(constrained, dict):
+        raise errors.ValidationError("constrained must contain a named parameter object")
     source = _compile.resolve_source(stan)
     m = get_model(source, data)
     theta = m.param_unconstrain_json(json.dumps(constrained))

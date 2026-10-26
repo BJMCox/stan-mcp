@@ -52,7 +52,7 @@ METHODS: dict[str, dict] = {
         "cmd": "generate_quantities",
         "draws": True,
         "inits": False,
-        "args": {"from_run_id"},
+        "args": {"from_run_id", "csv_files"},
     },
 }
 
@@ -73,6 +73,8 @@ def build_kwargs(method: str, seed, inits, method_args: dict) -> dict:
         raise ValidationError(
             f"method {method!r} does not accept {sorted(bad)}; allowed: {sorted(allowed)}"
         )
+    if method == "generate_quantities" and ma.get("from_run_id") and "csv_files" in ma:
+        raise ValidationError("choose either method_args.from_run_id or method_args.csv_files")
     kw = dict(ma)
     if seed is not None:
         kw["seed"] = seed

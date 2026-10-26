@@ -91,7 +91,7 @@ def _csv_columns(fit) -> tuple[list[str], str]:
         return list(fit.column_names), "column_names"
 
 
-def _draw_row_offset(method: str, run_id: str) -> int:
+def _draw_row_offset(method: str, run_id: str, fit: Any = None) -> int:
     """How many leading data rows in each of this run's draws CSVs are NOT
     draws. Checked directly against cmdstanpy's own row assembly for every
     method that reaches here (cmdstanpy 1.3.0):
@@ -113,11 +113,27 @@ def _draw_row_offset(method: str, run_id: str) -> int:
     source run's persisted `method` (`runstore.read_meta`), not
     `isinstance(fit.previous_fit, CmdStanVB)`, so this does not depend on a
     cmdstanpy internal that could be renamed.
+
+    External CSV inputs have no source run. Use the parsed previous fit's
+    metadata and public draw counts instead. Its saved warmup or intermediate
+    optimization rows also appear in the generated CSV and must be skipped.
     """
     if method == "variational":
         return 1
     if method == "generate_quantities":
-        from_run_id = runstore.read_meta(run_id).get("method_args", {}).get("from_run_id")
+        args = runstore.read_meta(run_id).get("method_args", {})
+        if "csv_files" in args:
+            previous = fit.previous_fit
+            config = previous.metadata.cmdstan_config
+            source_method = config["method"]
+            if source_method == "variational":
+                return 1
+            if source_method == "sample" and config.get("save_warmup"):
+                return previous.num_draws_warmup
+            if source_method == "optimize" and config.get("save_iterations"):
+                return len(previous.optimized_iterations_np) - 1
+            return 0
+        from_run_id = args.get("from_run_id")
         if from_run_id and runstore.read_meta(from_run_id).get("method") == "variational":
             return 1
     return 0
@@ -177,7 +193,7 @@ def _sidecar_from_fit(fit, method: str, run_id: str) -> dict:
         "schema": draws.SCHEMA_VERSION,
         "params": params,
         "sampler_stats": stats,
-        "draw_row_offset": _draw_row_offset(method, run_id),
+        "draw_row_offset": _draw_row_offset(method, run_id, fit),
     }
 
 

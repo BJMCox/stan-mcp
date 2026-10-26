@@ -134,12 +134,27 @@ class RunManager:
         if method == "generate_quantities":
             kwargs = dict(kwargs)
             from_run_id = kwargs.pop("from_run_id", None)
-            if not from_run_id:
-                raise RunError("generate_quantities requires method_args.from_run_id")
-            csvs = runstore.csv_paths(from_run_id)
-            if not csvs:
-                raise RunError(f"run {from_run_id!r} has no persisted draws CSVs to reuse")
-            return model.generate_quantities(data=data, previous_fit=csvs, **kwargs)
+            csvs = kwargs.pop("csv_files", None)
+            if csvs is not None:
+                import cmdstanpy
+
+                previous_fit = cmdstanpy.from_csv(csvs)
+                if not isinstance(
+                    previous_fit, (cmdstanpy.CmdStanMCMC, cmdstanpy.CmdStanMLE, cmdstanpy.CmdStanVB)
+                ):
+                    raise RunError("csv_files must come from sample, optimize, or variational")
+                if not isinstance(previous_fit, cmdstanpy.CmdStanMCMC) and len(csvs) != 1:
+                    raise RunError("optimize and variational inputs require exactly one CSV file")
+            else:
+                if not from_run_id:
+                    raise RunError(
+                        "generate_quantities requires method_args.from_run_id "
+                        "or method_args.csv_files"
+                    )
+                previous_fit = runstore.csv_paths(from_run_id)
+                if not previous_fit:
+                    raise RunError(f"run {from_run_id!r} has no persisted draws CSVs to reuse")
+            return model.generate_quantities(data=data, previous_fit=previous_fit, **kwargs)
         if method == "variational":
             kwargs = dict(kwargs)
             # ADVI is approximate; don't hard-fail the run on the convergence
@@ -186,12 +201,16 @@ class RunManager:
         if inits_from is not None and inits is None:
             # Warm-start at another run's posterior/estimate mean.
             inits = diagnostics.posterior_mean_inits(inits_from)
-        kwargs = methods.build_kwargs(method, seed, inits, method_args or {})
+        method_args = dict(method_args or {})
+        kwargs = methods.build_kwargs(method, seed, inits, method_args)
         source = _compile.resolve_source(stan)
         data = _compile.canonical_data(data)  # resolve dict / data_id / path / json
         with self._lock:
             self._seq += 1
             run_id = runstore.new_run_id(method, self._seq)
+        if method == "generate_quantities" and "csv_files" in kwargs:
+            csvs = runstore.persist_input_csvs(run_id, kwargs["csv_files"])
+            method_args["csv_files"] = kwargs["csv_files"] = csvs
         runstore.persist_inputs(run_id, source, data)
         runstore.write_meta(
             run_id,

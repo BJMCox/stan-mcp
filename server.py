@@ -39,7 +39,12 @@ def _safe(fn, *args, **kwargs):
 async def compile_model(
     stan: str, stanc_args: list[str] | None = None, warn_pedantic: bool = False
 ) -> dict:
-    """Compile a Stan model (BridgeStan .so + CmdStan exe). Returns artifact paths.
+    """Prefer a file input: set `stan="/absolute/path/model.stan"`.
+
+    Use an absolute path to a file on the MCP server. Inline Stan source is
+    a fallback when no file is available.
+
+    Compile a Stan model (BridgeStan .so + CmdStan exe). Return artifact paths.
 
     The returned `model_id` can be passed as `stan` to any other tool instead of
     re-sending the full source (saves tokens on repeated calls). Set
@@ -50,14 +55,24 @@ async def compile_model(
 
 @mcp.tool()
 async def register_data(data) -> dict:
-    """Cache a data payload and return a `data_id` usable as `data` on any tool
-    instead of re-sending the full data (saves tokens on repeated calls)."""
+    """Prefer a file input: set `data="/absolute/path/data.json"`.
+
+    Use an absolute path to a file on the MCP server. Inline JSON is a fallback
+    when no file is available. Cache the file contents and return a `data_id`.
+    Reuse that ID as `data` on later calls to avoid resending the payload.
+    The cached snapshot does not change when the original file changes."""
     return await asyncio.to_thread(_safe, lambda: {"data_id": _compile.register_data(data)})
 
 
 @mcp.tool()
 async def validate_data(stan: str, data=None) -> dict:
-    """Check that `data` satisfies the model's data block (returns param counts,
+    """Prefer file inputs: `stan="/absolute/path/model.stan"`, `data="/absolute/path/data.json"`.
+
+    Use absolute paths to files on the MCP server. Reuse `model_id` and `data_id`
+    handles for repeated calls. Inline Stan and JSON strings are fallbacks
+    when files are unavailable.
+
+    Check that `data` satisfies the model's data block (returns param counts,
     or an error naming the missing/invalid variable)."""
     return await asyncio.to_thread(_safe, density.validate_data, stan, data)
 
@@ -86,15 +101,28 @@ async def prune_compiled(keep: int | None = None, older_than_days: float | None 
 
 @mcp.tool()
 async def param_info(stan: str, data=None) -> dict:
-    """Return parameter names and constrained/unconstrained counts for the model."""
+    """Prefer file inputs: `stan="/absolute/path/model.stan"`, `data="/absolute/path/data.json"`.
+
+    Use absolute paths to files on the MCP server. Reuse `model_id` and `data_id`
+    handles for repeated calls. Inline Stan and JSON strings are fallbacks
+    when files are unavailable.
+
+    Return parameter names and constrained/unconstrained counts for the model."""
     return await asyncio.to_thread(_safe, density.param_info, stan, data)
 
 
 @mcp.tool()
 async def log_density(
-    stan: str, data, theta_unc: list[float], propto: bool = True, jacobian: bool = True
+    stan: str, data, theta_unc: list[float] | str, propto: bool = True, jacobian: bool = True
 ) -> dict:
-    """Log density at an unconstrained parameter vector."""
+    """Prefer file inputs: `stan="/absolute/path/model.stan"`, `data="/absolute/path/data.json"`.
+
+    Use absolute paths to files on the MCP server. Reuse `model_id` and `data_id`
+    handles for repeated calls. Inline Stan and JSON strings are fallbacks
+    when files are unavailable. Prefer `theta_unc="/absolute/path/theta.json"`,
+    containing a numeric array such as `[0.5]`. An inline numeric list is a fallback.
+
+    Return the log density at an unconstrained parameter vector."""
     return await asyncio.to_thread(
         _safe, density.log_density, stan, data, theta_unc, propto, jacobian
     )
@@ -102,9 +130,16 @@ async def log_density(
 
 @mcp.tool()
 async def log_density_gradient(
-    stan: str, data, theta_unc: list[float], propto: bool = True, jacobian: bool = True
+    stan: str, data, theta_unc: list[float] | str, propto: bool = True, jacobian: bool = True
 ) -> dict:
-    """Log density and gradient at an unconstrained parameter vector."""
+    """Prefer file inputs: `stan="/absolute/path/model.stan"`, `data="/absolute/path/data.json"`.
+
+    Use absolute paths to files on the MCP server. Reuse `model_id` and `data_id`
+    handles for repeated calls. Inline Stan and JSON strings are fallbacks
+    when files are unavailable. Prefer `theta_unc="/absolute/path/theta.json"`,
+    containing a numeric array such as `[0.5]`. An inline numeric list is a fallback.
+
+    Return the log density and gradient at an unconstrained parameter vector."""
     return await asyncio.to_thread(
         _safe, density.log_density_gradient, stan, data, theta_unc, propto, jacobian
     )
@@ -112,9 +147,16 @@ async def log_density_gradient(
 
 @mcp.tool()
 async def log_density_hessian(
-    stan: str, data, theta_unc: list[float], propto: bool = True, jacobian: bool = True
+    stan: str, data, theta_unc: list[float] | str, propto: bool = True, jacobian: bool = True
 ) -> dict:
-    """Log density, gradient, and Hessian at an unconstrained parameter vector."""
+    """Prefer file inputs: `stan="/absolute/path/model.stan"`, `data="/absolute/path/data.json"`.
+
+    Use absolute paths to files on the MCP server. Reuse `model_id` and `data_id`
+    handles for repeated calls. Inline Stan and JSON strings are fallbacks
+    when files are unavailable. Prefer `theta_unc="/absolute/path/theta.json"`,
+    containing a numeric array such as `[0.5]`. An inline numeric list is a fallback.
+
+    Return the log density, gradient, and Hessian at an unconstrained parameter vector."""
     return await asyncio.to_thread(
         _safe, density.log_density_hessian, stan, data, theta_unc, propto, jacobian
     )
@@ -122,25 +164,50 @@ async def log_density_hessian(
 
 @mcp.tool()
 async def param_constrain(
-    stan: str, data, theta_unc: list[float], include_tp: bool = False, include_gq: bool = False
+    stan: str,
+    data,
+    theta_unc: list[float] | str,
+    include_tp: bool = False,
+    include_gq: bool = False,
 ) -> dict:
-    """Map unconstrained params to the constrained space (named)."""
+    """Prefer file inputs: `stan="/absolute/path/model.stan"`, `data="/absolute/path/data.json"`.
+
+    Use absolute paths to files on the MCP server. Reuse `model_id` and `data_id`
+    handles for repeated calls. Inline Stan and JSON strings are fallbacks
+    when files are unavailable. Prefer `theta_unc="/absolute/path/theta.json"`,
+    containing a numeric array such as `[0.5]`. An inline numeric list is a fallback.
+
+    Map unconstrained params to the constrained space (named)."""
     return await asyncio.to_thread(
         _safe, density.param_constrain, stan, data, theta_unc, include_tp, include_gq
     )
 
 
 @mcp.tool()
-async def param_unconstrain(stan: str, data, constrained: dict) -> dict:
-    """Map named constrained params to the unconstrained vector."""
+async def param_unconstrain(stan: str, data, constrained: dict | str) -> dict:
+    """Prefer file inputs: `stan="/absolute/path/model.stan"`, `data="/absolute/path/data.json"`.
+
+    Use absolute paths to files on the MCP server. Reuse `model_id` and `data_id`
+    handles for repeated calls. Inline Stan and JSON strings are fallbacks
+    when files are unavailable. Prefer `constrained="/absolute/path/params.json"`,
+    containing a named parameter object such as `{"x": 0.5}`. An inline dict is a fallback.
+
+    Map named constrained params to the unconstrained vector."""
     return await asyncio.to_thread(_safe, density.param_unconstrain, stan, data, constrained)
 
 
 @mcp.tool()
 async def check_gradient(
-    stan: str, data, theta_unc: list[float], eps: float = 1e-6, tol: float = 1e-4
+    stan: str, data, theta_unc: list[float] | str, eps: float = 1e-6, tol: float = 1e-4
 ) -> dict:
-    """Compare autodiff gradient against central finite differences (mismatch
+    """Prefer file inputs: `stan="/absolute/path/model.stan"`, `data="/absolute/path/data.json"`.
+
+    Use absolute paths to files on the MCP server. Reuse `model_id` and `data_id`
+    handles for repeated calls. Inline Stan and JSON strings are fallbacks
+    when files are unavailable. Prefer `theta_unc="/absolute/path/theta.json"`,
+    containing a numeric array such as `[0.5]`. An inline numeric list is a fallback.
+
+    Compare autodiff gradient against central finite differences (mismatch
     threshold `tol`)."""
     return await asyncio.to_thread(_safe, density.check_gradient, stan, data, theta_unc, eps, tol)
 
@@ -155,7 +222,23 @@ async def start_run(
     method_args: dict | None = None,
     inits_from: str | None = None,
 ) -> dict:
-    """Start a background inference run (sample/optimize/variational/pathfinder/
+    """Prefer file inputs: `stan="/absolute/path/model.stan"`, `data="/absolute/path/data.json"`.
+
+    Use absolute paths to files on the MCP server. Reuse `model_id` and `data_id`
+    handles for repeated calls. Inline Stan and JSON strings are fallbacks
+    when files are unavailable. Model source and data contents are saved with
+    the run, so later file changes do not alter its stored inputs.
+
+    For `generate_quantities`, prefer `method_args={"csv_files": ["/absolute/path/chain.csv"]}`
+    for external CmdStan fitted parameters. A single CSV path also works.
+    Supply sample, optimize, or variational CSVs in chain order, with their
+    original CmdStan comment headers. Optimize and variational accept one CSV
+    each. Input CSVs are copied into the run for reproduction.
+    Warmup rows, saved optimization iterations, and a variational
+    mean row are excluded from stored draw summaries. Alternatively, use
+    `method_args={"from_run_id": "sample-0001"}` for a managed run. Choose one source.
+
+    Start a background inference run (sample/optimize/variational/pathfinder/
     laplace/generate_quantities). Returns a run_id immediately. `inits_from` warm-
     starts at another run's posterior/estimate mean (ignored if `inits` is set)."""
     return await asyncio.to_thread(
