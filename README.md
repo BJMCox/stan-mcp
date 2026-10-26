@@ -18,9 +18,9 @@ pixi run serve        # start the MCP server
 ```
 
 The C++ toolchain is provided by pixi. The BridgeStan and CmdStan source trees
-are downloaded automatically to `STAN_MCP_HOME` on first compile (large — the
-first compile takes a while). Pixi-managed, single platform (`osx-arm64`),
-Python 3.15.
+are downloaded automatically to `~/.bridgestan` and `~/.cmdstan` on first
+compile. Set `BRIDGESTAN` and `CMDSTAN` to use existing source trees.
+`STAN_MCP_HOME` holds compiled models, registered data, and runs. Python 3.15.
 
 ## Tasks
 
@@ -112,6 +112,7 @@ variational mean row. Use either `csv_files` or `from_run_id`, never both.
 | [docs/configuration.md](docs/configuration.md) | Env vars, defaults, on-disk layout |
 | [docs/architecture.md](docs/architecture.md) | Module map, data flow, design decisions |
 | [docs/internals.md](docs/internals.md) | Developer reference: internal functions and types |
+| [docs/remote.md](docs/remote.md) | SSH stdio transport and remote file paths |
 
 Full design rationale: `docs/2026-07-14-stan-mcp-design.md` (local-only, not
 pushed to remotes).

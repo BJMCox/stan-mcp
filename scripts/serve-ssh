@@ -1,0 +1,15 @@
+#!/bin/sh
+# Keep stdin/stdout exclusively for the MCP protocol.
+set -eu
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+    echo 'usage: serve-ssh HOST ABSOLUTE_REMOTE_CHECKOUT [ABSOLUTE_REMOTE_PIXI]' >&2
+    exit 2
+fi
+host=$1
+checkout=$2
+pixi=${3:-pixi}
+case "$host" in -*|'') echo 'invalid SSH host' >&2; exit 2 ;; esac
+case "$checkout" in /*) ;; *) echo 'remote checkout must be absolute' >&2; exit 2 ;; esac
+quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+remote="cd $(quote "$checkout") && exec $(quote "$pixi") run --locked serve"
+exec ssh -T -o BatchMode=yes -- "$host" "$remote"

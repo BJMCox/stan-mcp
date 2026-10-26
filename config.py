@@ -3,10 +3,11 @@
 A single home root holds everything (override with STAN_MCP_HOME):
 
     ~/stan-mcp/
-      bridgestan/     auto-downloaded BridgeStan source tree
-      cmdstan/        auto-downloaded CmdStan (CmdStanPy-managed)
       compiled/       .so + executables, cached by source hash
       runs/<run-id>/  persisted inference runs
+
+BridgeStan and CmdStan source trees use their libraries' cache roots,
+~/.bridgestan and ~/.cmdstan, overridden by BRIDGESTAN and CMDSTAN.
 
 Path/cap logic is implemented during the build (see design "Home root" and
 "Model lifecycle").

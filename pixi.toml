@@ -3,7 +3,7 @@ name = "stan-mcp"
 version = "0.1.0"
 description = "MCP server for compiling, inspecting, and running Stan models (BridgeStan + CmdStanPy)"
 channels = ["conda-forge"]
-platforms = ["osx-arm64"]
+platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 
 [tasks]
 serve = "python server.py"
