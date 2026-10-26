@@ -1,17 +1,241 @@
 """Source resolution, hashing, and disk-cached compilation."""
 
+import fcntl
 import hashlib
+import importlib.metadata
 import json
 import os
+import platform
 import re
+import shutil
 import subprocess
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Self
 
 import config
 import errors
 import toolchain
+
+
+class SourceSnapshot(str):
+    """Self-contained Stan source with its immutable compilation identity."""
+
+    manifest: dict[str, Any]
+
+    def __new__(cls, source: str, manifest: dict[str, Any]) -> Self:
+        obj = super().__new__(cls, source)
+        obj.manifest = manifest
+        return obj
+
+
+_SOURCES: dict[tuple[str, str], SourceSnapshot] = {}
+_SOURCES_LOCK = threading.Lock()
+_BUILD_CACHE: tuple[tuple, dict[str, Any]] | None = None
+_BUILD_LOCK = threading.Lock()
+_VERSIONS = {p: importlib.metadata.version(p) for p in ("bridgestan", "cmdstanpy")}
+
+
+def _build_identity() -> dict[str, Any]:
+    """Describe inputs to native builds without invoking a provisioning helper."""
+    global _BUILD_CACHE
+    versions = _VERSIONS
+    roots = {
+        "bridgestan": Path(
+            os.environ.get("BRIDGESTAN")
+            or Path.home() / ".bridgestan" / f"bridgestan-{versions['bridgestan']}"
+        ),
+    }
+    import cmdstanpy
+
+    try:
+        roots["cmdstan"] = Path(cmdstanpy.cmdstan_path())
+    except ValueError:
+        roots["cmdstan"] = Path(os.environ.get("CMDSTAN", Path.home() / ".cmdstan"))
+    paths: dict[str, Path] = {}
+    for name, root in roots.items():
+        for relative in (
+            "make/local",
+            "makefile",
+            "Makefile",
+            "stan/src/stan/version.hpp",
+            "bin/stanc",
+        ):
+            p = root / relative
+            if p.is_file():
+                paths[f"{name}/{relative}"] = p
+    env = {
+        k: os.environ.get(k)
+        for k in (
+            "CC",
+            "CXX",
+            "CXXFLAGS",
+            "CPPFLAGS",
+            "LDFLAGS",
+            "STANCFLAGS",
+            "STAN_THREADS",
+            "STAN_OPENCL",
+            "CXXFLAGS_O3",
+            "MAKE",
+            "STANC",
+            "STAN_CPP_OPTIMS",
+            "STAN_NO_RANGE_CHECKS",
+            "STAN_MPI",
+            "BRIDGESTAN_AD_HESSIAN",
+            "BRIDGESTAN_AD_HESSIAN_VECTOR_PRODUCT",
+            "PRECOMPILED_HEADERS",
+            "O",
+        )
+    }
+    compiler = shutil.which(os.environ.get("CXX", "c++"))
+    if compiler:
+        paths["compiler"] = Path(compiler)
+    if os.environ.get("STANC"):
+        stanc = shutil.which(os.environ["STANC"])
+        if stanc:
+            paths["stanc_override"] = Path(stanc)
+    stamps = {
+        k: (str(p.resolve()), p.stat().st_size, p.stat().st_mtime_ns) for k, p in paths.items()
+    }
+    root_names = {k: str(v.resolve()) for k, v in roots.items()}
+    key = (tuple(env.items()), tuple(root_names.items()), tuple(stamps.items()))
+    with _BUILD_LOCK:
+        if _BUILD_CACHE is not None and _BUILD_CACHE[0] == key:
+            return _BUILD_CACHE[1]
+        files: dict[str, Any] = {
+            k: list(stamp)
+            if k == "compiler" or k.endswith("/stanc") or k == "stanc_override"
+            else hashlib.sha256(paths[k].read_bytes()).hexdigest()
+            for k, stamp in stamps.items()
+        }
+        identity = {
+            "schema": 2,
+            "versions": versions,
+            "platform": platform.platform(),
+            "roots": root_names,
+            "files": files,
+            "environment": env,
+            "native_calls": "process-serialized",
+        }
+        _BUILD_CACHE = (key, identity)
+        return identity
+
+
+def _identity(manifest: dict[str, Any]) -> str:
+    payload = {k: v for k, v in manifest.items() if k != "model_id"}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _expand_includes(
+    source: str, origin: str | None, args: list[str]
+) -> tuple[str, list[dict[str, str]]]:
+    roots: list[Path] = []
+    for index, arg in enumerate(args):
+        if arg.startswith("--include-paths="):
+            roots = [Path(p).expanduser().resolve() for p in arg.split("=", 1)[1].split(",")]
+        elif arg in ("--include-paths", "-I") and index + 1 < len(args):
+            roots = [Path(p).expanduser().resolve() for p in args[index + 1].split(",")]
+    roots.append(Path(origin).parent if origin else Path.cwd())
+    dependencies: list[dict[str, str]] = []
+
+    def expand(text: str, stack: tuple[Path, ...]) -> str:
+        lines: list[str] = []
+        cursor = start = 0
+        # Preserve all surrounding source. Stan recognizes include directives
+        # anywhere between tokens, including after code or a closing comment.
+        while cursor < len(text):
+            if text.startswith("//", cursor):
+                end = text.find("\n", cursor)
+                cursor = len(text) if end == -1 else end + 1
+                continue
+            if text.startswith("/*", cursor):
+                end = text.find("*/", cursor + 2)
+                cursor = len(text) if end == -1 else end + 2
+                continue
+            if text[cursor] == '"':
+                cursor += 1
+                while cursor < len(text):
+                    char = text[cursor]
+                    cursor += 2 if char == "\\" else 1
+                    if char == '"':
+                        break
+                continue
+            match = (
+                re.match(r'#include\s+(?:"([^"\n]+)"|<([^>\n]+)>|([^\s]+))', text[cursor:])
+                if text.startswith("#include", cursor)
+                else None
+            )
+            if match is None:
+                cursor += 1
+                continue
+            name = next(group for group in match.groups() if group is not None)
+            candidates = [root / name for root in roots]
+            path = next((p.resolve() for p in candidates if p.is_file()), None)
+            if path is None:
+                raise errors.ValidationError(f"Stan include file not found: {name}")
+            if path in stack:
+                raise errors.ValidationError(f"recursive Stan include: {path}")
+            included = path.read_text()
+            dependencies.append({"path": str(path), "source": included})
+            lines.extend((text[start:cursor], expand(included, (*stack, path)), "\n"))
+            cursor += match.end()
+            start = cursor
+        lines.append(text[start:])
+        return "".join(lines)
+
+    return expand(source, ()), dependencies
+
+
+def _snapshot(
+    source: str,
+    stanc_args: list[str] | None = None,
+    origin: str | None = None,
+    *,
+    refresh_build: bool = False,
+) -> SourceSnapshot:
+    if isinstance(source, SourceSnapshot):
+        build = _build_identity() if refresh_build else source.manifest["build"]
+        args = source.manifest["stanc_args"] if stanc_args is None else stanc_args
+        if args == source.manifest["stanc_args"] and build == source.manifest["build"]:
+            return source
+        manifest = {**source.manifest, "stanc_args": list(args), "build": build}
+    else:
+        args = _norm_args(stanc_args)
+        expanded, dependencies = _expand_includes(source, origin, args)
+        manifest = {
+            "source": expanded,
+            "original_source": source,
+            "origin": origin,
+            "dependencies": dependencies,
+            "stanc_args": args,
+            "build": _build_identity(),
+        }
+    manifest["model_id"] = _identity(manifest)
+    return SourceSnapshot(manifest["source"], manifest)
+
+
+def model_manifest(source: str, stanc_args: list[str] | None = None) -> dict[str, Any]:
+    """Return a JSON-owned manifest suitable for durable run input snapshots."""
+    return json.loads(json.dumps(refresh_source(source, stanc_args).manifest))
+
+
+def refresh_source(source: str, stanc_args: list[str] | None = None) -> SourceSnapshot:
+    """Validate the build context before compiling an immutable source snapshot."""
+    refreshed = _snapshot(source, stanc_args, refresh_build=True)
+    if isinstance(source, SourceSnapshot):
+        with _SOURCES_LOCK:
+            _SOURCES[(str(config.home() / "compiled"), source.manifest["model_id"])] = refreshed
+    return refreshed
+
+
+def restore_source(source: str, manifest: dict[str, Any]) -> SourceSnapshot:
+    """Restore a persisted snapshot independently of the compiled cache."""
+    if source != manifest.get("source") or _identity(manifest) != manifest.get("model_id"):
+        raise errors.ValidationError("persisted Stan source does not match its manifest")
+    return SourceSnapshot(source, manifest)
+
 
 # Per-model-id compile locks: two concurrent runs / density calls that miss the
 # cache for the same model must not drive bridgestan/cmdstan builds on the same
@@ -20,13 +244,21 @@ _COMPILE_LOCKS: dict[str, threading.Lock] = {}
 _COMPILE_LOCKS_GUARD = threading.Lock()
 
 
-def _compile_lock(key: str) -> threading.Lock:
+@contextmanager
+def _compile_lock(key: str) -> Iterator[None]:
     with _COMPILE_LOCKS_GUARD:
         lock = _COMPILE_LOCKS.get(key)
         if lock is None:
             lock = threading.Lock()
             _COMPILE_LOCKS[key] = lock
-        return lock
+    with lock:
+        # A separate directory keeps lock inodes alive while model artifacts
+        # are pruned. All server processes lock the same inode for this ID.
+        directory = config.compiled_dir() / ".locks"
+        directory.mkdir(exist_ok=True)
+        with (directory / key).open("a") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            yield
 
 
 # Background BridgeStan builds. A run compiles only the CmdStan executable, so a
@@ -41,8 +273,10 @@ _SO_GUARD = threading.Lock()
 if TYPE_CHECKING:
     from concurrent.futures import Future, ThreadPoolExecutor
 
+    from cmdstanpy import CmdStanModel
 
-def _so_builder():
+
+def _so_builder() -> "ThreadPoolExecutor":
     global _SO_BUILDER
     if _SO_BUILDER is None:
         from concurrent.futures import ThreadPoolExecutor
@@ -52,6 +286,7 @@ def _so_builder():
 
 
 def so_path_if_built(source: str, stanc_args: list[str] | None = None) -> Path | None:
+    source = resolve_source(source, stanc_args)
     p = config.compiled_dir() / f"{model_id(source, stanc_args)}_model.so"
     return p if p.exists() else None
 
@@ -62,6 +297,7 @@ def request_so(source: str, stanc_args: list[str] | None = None) -> dict:
     Returns {"status": "ready"|"building"|"failed", ...}. The build goes through
     compiled_so, so it takes the same per-model compile lock as a foreground
     compile_model and the two serialize rather than racing on one artifact."""
+    source = resolve_source(source, stanc_args)
     if so_path_if_built(source, stanc_args) is not None:
         return {"status": "ready"}
     mid = model_id(source, stanc_args)
@@ -119,30 +355,50 @@ def _data_cache_dir() -> Path:
     return d
 
 
-def resolve_source(stan: str) -> str:
+def resolve_source(stan: str, stanc_args: list[str] | None = None) -> SourceSnapshot:
+    if isinstance(stan, SourceSnapshot):
+        with _SOURCES_LOCK:
+            stan = _SOURCES.get((str(config.home() / "compiled"), stan.manifest["model_id"]), stan)
+        return _snapshot(stan, stanc_args)
     if stan.endswith(".stan"):
-        p = Path(stan)
+        p = Path(stan).expanduser().resolve()
         if not p.is_file():
             raise errors.ValidationError(f"Stan file not found: {stan}")
-        return p.read_text()
+        return _snapshot(p.read_text(), stanc_args, str(p))
     # A bare model_id references source already persisted under compiled/ by a
     # prior compile — lets callers pass the short id instead of re-sending source.
     if _is_hash_id(stan):
+        key = (str(config.home() / "compiled"), stan)
+        with _SOURCES_LOCK:
+            cached_source = _SOURCES.get(key)
+        if cached_source is not None:
+            return _snapshot(cached_source, stanc_args)
         cached = config.compiled_dir() / f"{stan}.stan"
+        manifest = cached.with_suffix(".manifest.json")
+        if cached.is_file() and manifest.is_file():
+            snapshot = restore_source(cached.read_text(), json.loads(manifest.read_text()))
+            if snapshot.manifest["model_id"] != stan:
+                raise errors.ValidationError("cached model_id does not match its manifest")
+            with _SOURCES_LOCK:
+                _SOURCES[key] = snapshot
+            return _snapshot(snapshot, stanc_args)
         if cached.is_file():
-            return cached.read_text()
+            raise errors.ValidationError(
+                f"model_id {stan!r} predates verified manifests; compile its source again"
+            )
         raise errors.ValidationError(f"unknown model_id {stan!r} (compile the model first)")
-    return stan
+    return _snapshot(stan, stanc_args)
 
 
-def register_data(data) -> str:
+def register_data(data: object) -> str:
     """Cache data under compiled/data/<data_id>.json; return the data_id.
 
     The returned id can then be passed as `data` to any tool instead of
     re-sending the full data payload."""
     canon = canonical_data(data)
-    did = data_hash(data)
-    (_data_cache_dir() / f"{did}.json").write_text(json.dumps(canon, sort_keys=True))
+    payload = json.dumps(canon, sort_keys=True)
+    did = hashlib.sha256(payload.encode()).hexdigest()[:16]
+    _atomic_write(_data_cache_dir() / f"{did}.json", payload)
     return did
 
 
@@ -162,6 +418,7 @@ def list_compiled(limit: int = 50) -> dict:
                 "last_used": _last_used(p),
                 "so_built": (d / f"{mid}_model.so").exists(),
                 "source_bytes": p.stat().st_size,
+                "recompile_required": not p.with_suffix(".manifest.json").is_file(),
             }
         )
     data_dir = d / "data"
@@ -222,14 +479,10 @@ def _norm_args(stanc_args: list[str] | None) -> list[str]:
 
 
 def model_id(source: str, stanc_args: list[str] | None = None) -> str:
-    h = hashlib.sha256()
-    h.update(source.encode())
-    h.update(b"\x00")
-    h.update("\x00".join(_norm_args(stanc_args)).encode())
-    return h.hexdigest()[:16]
+    return _snapshot(source, stanc_args).manifest["model_id"]
 
 
-def read_json_file(path: str, label: str):
+def read_json_file(path: str, label: str) -> Any:
     """Read a server-local JSON input with a useful validation error."""
     p = Path(path).expanduser()
     if p.suffix != ".json" or not p.is_file():
@@ -240,7 +493,7 @@ def read_json_file(path: str, label: str):
         raise errors.ValidationError(f"cannot read {label} JSON file {path!r}: {exc}") from exc
 
 
-def canonical_data(data) -> object:
+def canonical_data(data: object) -> object:
     """Resolve data (dict, registered data_id, .json path, or JSON string)."""
     if data is None:
         return None
@@ -257,7 +510,7 @@ def canonical_data(data) -> object:
     return json.loads(s)  # assume JSON string literal
 
 
-def data_hash(data) -> str:
+def data_hash(data: object) -> str:
     canon = json.dumps(canonical_data(data), sort_keys=True)
     return hashlib.sha256(canon.encode()).hexdigest()[:16]
 
@@ -287,10 +540,16 @@ def _last_used(stan_path: Path) -> float:
 
 
 def stan_file_for(source: str, stanc_args: list[str] | None = None) -> Path:
-    mid = model_id(source, stanc_args)
+    source = _snapshot(source, stanc_args)
+    mid = model_id(source)
     path = config.compiled_dir() / f"{mid}.stan"
-    if not path.exists() or path.read_text() != source:
-        path.write_text(source)
+    if not path.exists():
+        _atomic_write(path, source)
+    manifest_path = path.with_suffix(".manifest.json")
+    if not manifest_path.exists():
+        _atomic_write(manifest_path, json.dumps(source.manifest, sort_keys=True))
+    with _SOURCES_LOCK:
+        _SOURCES[(str(path.parent), mid)] = source
     # Track last use so prune_compiled(keep=N) evicts by last use rather than by
     # first compile — otherwise the model you run every day loses to a one-off
     # compiled an hour ago.
@@ -298,26 +557,41 @@ def stan_file_for(source: str, stanc_args: list[str] | None = None) -> Path:
     return path
 
 
+def _atomic_write(path: Path, text: str) -> None:
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            stream.write(text)
+            stream.flush()
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
 def compiled_so(source: str, stanc_args: list[str] | None = None) -> Path:
     toolchain.ensure_bridgestan()
     # bridgestan.compile_model returns the actual .so path; cache by existence.
     import bridgestan
 
+    source = refresh_source(source, stanc_args)
     with _compile_lock(model_id(source, stanc_args)):
         stan_path = stan_file_for(source, stanc_args)
         expected = stan_path.parent / f"{stan_path.stem}_model.so"
         if expected.exists():  # re-check under lock: another thread may have built it
             return expected
-        built = bridgestan.compile_model(stan_path, stanc_args=_norm_args(stanc_args))
+        built = bridgestan.compile_model(stan_path, stanc_args=source.manifest["stanc_args"])
         return Path(built)
 
 
-def cmdstan_model(source: str, stanc_args: list[str] | None = None):
+def cmdstan_model(source: str, stanc_args: list[str] | None = None) -> "CmdStanModel":
     toolchain.ensure_cmdstan()
     import cmdstanpy
 
+    source = refresh_source(source, stanc_args)
     opts = {}
-    for a in _norm_args(stanc_args):
+    for a in source.manifest["stanc_args"]:
         if a.startswith("--"):
             k, _, v = a[2:].partition("=")
             opts[k] = v or True
@@ -330,9 +604,15 @@ def compile_model(
     stan: str, stanc_args: list[str] | None = None, warn_pedantic: bool = False
 ) -> dict:
     try:
-        source = resolve_source(stan)
+        source = refresh_source(resolve_source(stan, stanc_args))
         so = compiled_so(source, stanc_args)
         cm = cmdstan_model(source, stanc_args)
+        prepared = _snapshot(source, stanc_args, refresh_build=True)
+        if prepared.manifest["model_id"] != source.manifest["model_id"]:
+            # First-use provisioning may have changed the effective toolchain.
+            source = prepared
+            so = compiled_so(source)
+            cm = cmdstan_model(source)
         out: dict = {
             "model_id": model_id(source, stanc_args),
             "so_path": str(so),
