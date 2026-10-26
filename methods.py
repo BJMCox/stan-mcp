@@ -33,7 +33,12 @@ METHODS: dict[str, dict] = {
             "sig_figs",
         },
     },
-    "optimize": {"cmd": "optimize", "draws": False, "inits": True, "args": {"algorithm", "iter"}},
+    "optimize": {
+        "cmd": "optimize",
+        "draws": False,
+        "inits": True,
+        "args": {"algorithm", "iter", "jacobian"},
+    },
     "variational": {
         "cmd": "variational",
         "draws": True,
@@ -47,7 +52,12 @@ METHODS: dict[str, dict] = {
         "args": {"num_paths", "draws"},
     },
     # cmdstanpy's laplace_sample and generate_quantities take no `inits` argument.
-    "laplace": {"cmd": "laplace_sample", "draws": True, "inits": False, "args": {"mode", "draws"}},
+    "laplace": {
+        "cmd": "laplace_sample",
+        "draws": True,
+        "inits": False,
+        "args": {"mode", "draws", "jacobian"},
+    },
     "generate_quantities": {
         "cmd": "generate_quantities",
         "draws": True,
@@ -63,7 +73,12 @@ def is_draws_method(method: str) -> bool:
     return METHODS[method]["draws"]
 
 
-def build_kwargs(method: str, seed, inits, method_args: dict) -> dict:
+def build_kwargs(
+    method: str,
+    seed: int | None,
+    inits: dict | list | float | int | str | None,
+    method_args: dict,
+) -> dict:
     if method not in METHODS:
         raise ValidationError(f"unknown method {method!r}; choose from {sorted(METHODS)}")
     allowed = METHODS[method]["args"]
@@ -76,6 +91,11 @@ def build_kwargs(method: str, seed, inits, method_args: dict) -> dict:
     if method == "generate_quantities" and ma.get("from_run_id") and "csv_files" in ma:
         raise ValidationError("choose either method_args.from_run_id or method_args.csv_files")
     kw = dict(ma)
+    # Preserve CmdStanPy's measures: optimize defaults to a constrained-space
+    # mode; Laplace defaults to a density including the transform Jacobian.
+    # Reusing an optimize CSV as a Laplace mode requires matching both settings.
+    if method in {"optimize", "laplace"}:
+        kw.setdefault("jacobian", method == "laplace")
     if seed is not None:
         kw["seed"] = seed
     if inits is not None:

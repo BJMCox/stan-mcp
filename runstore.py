@@ -2,15 +2,17 @@
 
 Persists, per run:
 
-- `model.stan` / `data.json` — the exact inputs, for reproduction.
+- `model.stan` / `data.json` / `inits.json` / `source_manifest.json` — resolved
+  inputs and compiler settings, for reproduction.
 - `csv/` — the raw CmdStan draws CSVs. The ONLY durable record of a run's
   draws, and what `generate_quantities` reuses as `previous_fit`.
 - `draws_schema.json` — the draws sidecar (each Stan variable's dims and its
   row-major CSV column indices, plus chain order); draws-producing methods
   only, written by `diagnostics.persist_run` and read by `draws.py`. A few
   hundred bytes to a few KB, holding no draws itself.
-- `estimate.json` — the stored point estimate, `optimize` only (instead of the
-  two above).
+- `estimate.json` / `initialization.json` — the flattened point estimate and
+  shaped parameter initialization, `optimize` only (alongside its raw CSV).
+- `input_csv/` — owned fitted-parameter snapshots for GQ and Laplace mode reuse.
 - `live/` — where CmdStan streams output during the run; deleted once `csv/`
   holds the durable copy.
 - `meta.json` — model_id, method, method_args, status, created_at/finished_at/
@@ -23,9 +25,12 @@ the sidecar above replaces it. See `idata_path`.
 Implemented during the build (see design "Run store").
 """
 
+import fcntl
 import json
+import os
 import shutil
-from datetime import UTC
+import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 import config
@@ -34,6 +39,74 @@ from errors import RunError, ValidationError
 
 def new_run_id(method: str, seq: int) -> str:
     return f"{method}-{seq:04d}"
+
+
+def reserve_run(method: str) -> tuple[str, int]:
+    """Reserve an exclusive run directory and globally ordered sequence."""
+    runs = config.runs_dir()
+    with (runs / ".allocation.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        counter = runs / ".sequence"
+        try:
+            high_water = int(counter.read_text())
+            if high_water < 0:
+                raise ValueError("negative sequence")
+        except FileNotFoundError:
+            high_water = max_seq()
+        except ValueError as exc:
+            raise RunError("run allocation counter is unreadable") from exc
+        seq = high_water + 1
+        while True:
+            # Publish before mkdir: even a crashed or failed submission consumes
+            # its ID, and pruning can never make an old ID available again.
+            with tempfile.NamedTemporaryFile(mode="w", dir=runs, delete=False) as stream:
+                temporary = Path(stream.name)
+                try:
+                    stream.write(f"{seq}\n")
+                    stream.flush()
+                    temporary.replace(counter)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            run_id = new_run_id(method, seq)
+            try:
+                run_dir(run_id).mkdir(exist_ok=False)
+                return run_id, seq
+            except FileExistsError:
+                seq += 1
+
+
+def process_owner() -> dict[str, int | float]:
+    import psutil
+
+    process = psutil.Process(os.getpid())
+    return {"pid": process.pid, "create_time": process.create_time()}
+
+
+def reconcile_abandoned() -> None:
+    """Finalize crashed owners; another live server retains its own runs."""
+    import psutil
+
+    for meta in list_runs(limit=10**9):
+        if meta.get("status") not in {"running", "cancelling"}:
+            continue
+        owner = meta.get("owner")
+        if owner:
+            try:
+                process = psutil.Process(owner["pid"])
+                if process.create_time() == owner["create_time"] and process.is_running():
+                    continue
+            except (psutil.NoSuchProcess, KeyError):
+                pass
+            except psutil.AccessDenied:
+                continue  # Unable to prove that this owner died.
+        meta["status"] = "failed"
+        meta["finished_at"] = datetime.now(UTC).isoformat()
+        meta["stderr"] = (
+            "Run abandoned: owning server exited; surviving subprocesses are not adopted."
+            if owner
+            else "Run abandoned: no verifiable owning server was recorded."
+        )
+        write_meta(meta["run_id"], meta)
 
 
 def run_dir(run_id: str, create: bool = False) -> Path:
@@ -52,9 +125,14 @@ def write_meta(run_id: str, meta: dict) -> None:
     m["run_id"] = run_id
     path = _meta_path(run_id, create=True)
     # Write atomically: a concurrent reader must never observe a truncated file.
-    tmp = path.parent / (path.name + ".tmp")
-    tmp.write_text(json.dumps(m, indent=2))
-    tmp.replace(path)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as stream:
+        tmp = Path(stream.name)
+        try:
+            json.dump(m, stream, indent=2)
+            stream.flush()
+            tmp.replace(path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 def read_meta(run_id: str) -> dict:
@@ -83,8 +161,8 @@ def list_runs(
             continue
         try:
             meta = json.loads(mp.read_text())
-        except json.JSONDecodeError:
-            continue  # skip a run whose meta.json is mid-write / corrupt
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue  # Concurrent pruning or corrupt metadata.
         if model_id is not None and meta.get("model_id") != model_id:
             continue
         if status is not None and meta.get("status") != status:
@@ -102,20 +180,19 @@ def list_runs(
 
 
 def max_seq() -> int:
-    """Highest run sequence number persisted on disk (0 if none).
-
-    Lets a fresh RunManager continue the counter instead of restarting at 1
-    and overwriting runs from a prior process.
-    """
+    """Highest reserved or persisted sequence on disk (0 if none)."""
     best = 0
     runs = config.runs_dir()
     for d in runs.iterdir():
+        suffix = d.name.rsplit("-", 1)[-1]
+        if d.is_dir() and suffix.isdigit():
+            best = max(best, int(suffix))
         mp = d / "meta.json"
         if not mp.is_file():
             continue
         try:
             seq = json.loads(mp.read_text()).get("seq", 0)
-        except json.JSONDecodeError:
+        except (FileNotFoundError, json.JSONDecodeError):
             continue
         if isinstance(seq, int) and seq > best:
             best = seq
@@ -145,7 +222,7 @@ def live_dir(run_id: str, create: bool = False) -> Path:
     return d
 
 
-def persist_csvs(run_id: str, csv_files) -> None:
+def persist_csvs(run_id: str, csv_files: list[str]) -> None:
     dest = run_dir(run_id, create=True) / "csv"
     dest.mkdir(parents=True, exist_ok=True)
     for f in csv_files:
@@ -162,15 +239,27 @@ def persist_input_csvs(run_id: str, csv_files: str | list[str]) -> list[str]:
         if source.suffix != ".csv" or not source.is_file():
             raise ValidationError(f"fitted-parameter CSV file not found: {source}")
     dest = run_dir(run_id, create=True) / "input_csv"
-    dest.mkdir(parents=True, exist_ok=True)
-    saved = []
-    for i, source in enumerate(sources):
-        # CmdStanPy sorts CSV paths. Numbered names preserve the supplied order
-        # and avoid collisions when chains share a basename in different dirs.
-        target = dest / f"{i:08d}.csv"
-        shutil.copyfile(source, target)
-        saved.append(str(target.resolve()))
-    return saved
+    staging = Path(tempfile.mkdtemp(prefix=".input_csv-", dir=dest.parent))
+    try:
+        for i, source in enumerate(sources):
+            # CmdStanPy sorts CSV paths. Numbered names retain chain order.
+            shutil.copyfile(source, staging / f"{i:08d}.csv")
+        staging.replace(dest)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+    return [str((dest / f"{i:08d}.csv").resolve()) for i in range(len(sources))]
+
+
+def persist_initialization(run_id: str, initialization: dict) -> None:
+    (run_dir(run_id, create=True) / "initialization.json").write_text(
+        json.dumps(initialization, indent=2)
+    )
+
+
+def load_initialization(run_id: str) -> dict | None:
+    path = run_dir(run_id) / "initialization.json"
+    return json.loads(path.read_text()) if path.is_file() else None
 
 
 def clear_live(run_id: str) -> None:
@@ -198,12 +287,22 @@ def load_estimate(run_id: str) -> dict:
     return json.loads((run_dir(run_id) / "estimate.json").read_text())
 
 
-def persist_inputs(run_id: str, source: str, data) -> None:
+def persist_inputs(
+    run_id: str,
+    source: str,
+    data: object,
+    inits: dict | list | float | int | str | None = None,
+    source_manifest: dict | None = None,
+) -> None:
     """Persist the exact model source and data so a run can be reproduced."""
     d = run_dir(run_id, create=True)
     (d / "model.stan").write_text(source)
     if data is not None:
         (d / "data.json").write_text(json.dumps(data, sort_keys=True, indent=2))
+    if inits is not None:
+        (d / "inits.json").write_text(json.dumps(inits, sort_keys=True, indent=2))
+    if source_manifest is not None:
+        (d / "source_manifest.json").write_text(json.dumps(source_manifest, indent=2))
 
 
 def load_inputs(run_id: str) -> dict:
@@ -214,9 +313,13 @@ def load_inputs(run_id: str) -> dict:
         raise RunError(f"unknown run_id {run_id!r}")
     src = d / "model.stan"
     dat = d / "data.json"
+    init = d / "inits.json"
+    manifest = d / "source_manifest.json"
     return {
         "source": src.read_text() if src.is_file() else None,
         "data": json.loads(dat.read_text()) if dat.is_file() else None,
+        "inits": json.loads(init.read_text()) if init.is_file() else None,
+        "source_manifest": json.loads(manifest.read_text()) if manifest.is_file() else None,
     }
 
 
@@ -255,7 +358,7 @@ def prune_runs(keep: int | None = None, older_than_days: float | None = None) ->
         rid = m.get("run_id")
         if not rid or rid in seen:
             continue
-        if m.get("status") == "running":
+        if m.get("status") in {"running", "cancelling"}:
             continue  # never delete a run still in flight (rmtree would race its writes)
         seen.add(rid)
         d = run_dir(rid)

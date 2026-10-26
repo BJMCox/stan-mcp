@@ -1,10 +1,15 @@
 """Background run manager for all CmdStanPy inference methods."""
 
 import asyncio
+import json
+import shutil
 import threading
 import traceback
+from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
 import compile as _compile
 import config
@@ -45,7 +50,7 @@ def _error_excerpt(stderr: str) -> str:
     return text[:_ERROR_EXCERPT_CHARS].rstrip() + " […truncated; full text in meta.json]"
 
 
-def _count_csv_draws(paths) -> int | None:
+def _count_csv_draws(paths: Sequence[str | Path]) -> int | None:
     """Total draws across CmdStan CSVs (None if there are none). CmdStan CSV:
     `#` comment lines, one header row, then one line per draw.
 
@@ -108,29 +113,33 @@ def _kill_run_processes(run_id: str) -> list[int]:
 
 
 class _Handle:
-    def __init__(self):
+    def __init__(self) -> None:
         self.event = threading.Event()
-        self.aio_events: list[tuple] = []  # (loop, asyncio.Event)
-        self.future: Future | None = None  # set after submit
+        self.aio_events: list[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
+        self.future: Future[None] | None = None  # set after submit
         self.cancelled = False  # set by cancel_run so _execute relabels the run
+        self.lock = threading.RLock()
+        self.finished = False
 
 
 class RunManager:
-    def __init__(self, max_workers: int | None = None):
+    def __init__(self, max_workers: int | None = None) -> None:
         self._pool = ThreadPoolExecutor(
             max_workers=max_workers if max_workers is not None else config.max_workers()
         )
         self._handles: dict[str, _Handle] = {}
-        # Continue the sequence past any runs persisted by a prior process so
-        # run_ids never collide with (and overwrite) earlier persisted runs.
-        self._seq = runstore.max_seq()
         self._lock = threading.Lock()
+        runstore.reconcile_abandoned()
 
     # --- injectable seams (replaced in tests) ---
-    def _compile(self, source, stanc_args):
+    def _compile(self, source: str, stanc_args: list[str] | None) -> Any:
         return _compile.cmdstan_model(source, stanc_args)
 
-    def _runner(self, method, model, data, kwargs):
+    def _runner(self, method: str, model: Any, data: object, kwargs: dict) -> Any:
+        kwargs = dict(kwargs)
+        # Every method can feed a later warm start or generated-quantities run.
+        # Preserve enough precision for constrained values to roundtrip.
+        kwargs.setdefault("sig_figs", _OUTPUT_SIG_FIGS)
         if method == "generate_quantities":
             kwargs = dict(kwargs)
             from_run_id = kwargs.pop("from_run_id", None)
@@ -166,11 +175,10 @@ class RunManager:
             # min(cpu_count(), chains) per run, so `max_workers` concurrent
             # runs would oversubscribe the machine several times over.
             kwargs.setdefault("parallel_chains", config.max_parallel_chains())
-            kwargs.setdefault("sig_figs", _OUTPUT_SIG_FIGS)
         cmd = methods.METHODS[method]["cmd"]
         return getattr(model, cmd)(data=data, **kwargs)
 
-    def _persist(self, run_id, method, fit):
+    def _persist(self, run_id: str, method: str, fit: Any) -> None:
         # diagnostics.persist_run lands in Task 12; tests monkeypatch this seam.
         diagnostics.persist_run(run_id, method, fit)  # pyright: ignore[reportAttributeAccessIssue]
 
@@ -190,111 +198,176 @@ class RunManager:
     # --- public API ---
     def start_run(
         self,
-        stan,
-        data,
-        method="sample",
-        seed=None,
-        inits=None,
-        method_args=None,
-        inits_from=None,
+        stan: str,
+        data: object,
+        method: str = "sample",
+        seed: int | None = None,
+        inits: dict | list | float | int | str | None = None,
+        method_args: dict | None = None,
+        inits_from: str | None = None,
     ) -> dict:
+        """Submit owned inputs; warm starts use a valid mean or stored draw."""
         if inits_from is not None and inits is None:
-            # Warm-start at another run's posterior/estimate mean.
             inits = diagnostics.posterior_mean_inits(inits_from)
+        if isinstance(inits, str):
+            inits = json.loads(Path(inits).expanduser().read_text())
+        elif isinstance(inits, list):
+            inits = [
+                json.loads(Path(value).expanduser().read_text())
+                if isinstance(value, str)
+                else value
+                for value in inits
+            ]
+        # Detach the caller's mutable inputs before worker submission.
+        if inits is not None:
+            inits = json.loads(json.dumps(inits))
         method_args = dict(method_args or {})
         kwargs = methods.build_kwargs(method, seed, inits, method_args)
         source = _compile.resolve_source(stan)
-        data = _compile.canonical_data(data)  # resolve dict / data_id / path / json
-        with self._lock:
-            self._seq += 1
-            run_id = runstore.new_run_id(method, self._seq)
-        if method == "generate_quantities" and "csv_files" in kwargs:
-            csvs = runstore.persist_input_csvs(run_id, kwargs["csv_files"])
-            method_args["csv_files"] = kwargs["csv_files"] = csvs
-        runstore.persist_inputs(run_id, source, data)
-        runstore.write_meta(
-            run_id,
-            {
-                "run_id": run_id,
-                "method": method,
-                "status": "running",
-                "model_id": _compile.model_id(source, None),
-                "seq": self._seq,
-                "method_args": method_args or {},
-                "seed": seed,
-                "created_at": _now(),
-            },
-        )
+        data = json.loads(json.dumps(_compile.canonical_data(data)))
+        run_id, seq = runstore.reserve_run(method)
+        try:
+            input_method = None
+            if method == "generate_quantities":
+                if kwargs.get("from_run_id"):
+                    prior = kwargs.pop("from_run_id")
+                    input_method = runstore.read_meta(prior).get("method")
+                    csvs = runstore.csv_paths(prior)
+                    if not csvs:
+                        raise RunError(f"run {prior!r} has no persisted draws CSVs to reuse")
+                    kwargs["csv_files"] = csvs
+                    method_args.pop("from_run_id", None)
+                if "csv_files" in kwargs:
+                    csvs = runstore.persist_input_csvs(run_id, kwargs["csv_files"])
+                    method_args["csv_files"] = kwargs["csv_files"] = csvs
+            if method == "laplace" and kwargs.get("mode") is not None:
+                mode = kwargs["mode"]
+                if not isinstance(mode, (str, Path)):
+                    mode = mode.runset.csv_files[0]
+                kwargs["mode"] = method_args["mode"] = runstore.persist_input_csvs(
+                    run_id, [str(mode)]
+                )[0]
+            if method in {"optimize", "laplace"}:
+                method_args["jacobian"] = kwargs["jacobian"]
+            runstore.persist_inputs(
+                run_id, source, data, inits=inits, source_manifest=_compile.model_manifest(source)
+            )
+            runstore.write_meta(
+                run_id,
+                {
+                    "run_id": run_id,
+                    "method": method,
+                    "status": "running",
+                    "model_id": _compile.model_id(source, None),
+                    "seq": seq,
+                    "method_args": method_args or {},
+                    "seed": seed,
+                    "created_at": _now(),
+                    "owner": runstore.process_owner(),
+                    "input_method": input_method,
+                },
+            )
+        except Exception:
+            shutil.rmtree(runstore.run_dir(run_id))
+            raise
         handle = _Handle()
-        self._handles[run_id] = handle
-        handle.future = self._pool.submit(
-            self._execute, run_id, source, data, method, kwargs, handle
-        )
+        with self._lock:
+            self._handles[run_id] = handle
+        try:
+            handle.future = self._pool.submit(
+                self._execute, run_id, source, data, method, kwargs, handle
+            )
+        except Exception:
+            with self._lock:
+                self._handles.pop(run_id, None)
+            meta = runstore.read_meta(run_id)
+            meta["status"] = "failed"
+            meta["stderr"] = traceback.format_exc()
+            self._stamp_finish(meta)
+            runstore.write_meta(run_id, meta)
+            raise
         return {"run_id": run_id, "method": method, "status": "running"}
 
-    def rerun(self, run_id) -> dict:
+    def rerun(self, run_id: str) -> dict:
         """Start a fresh run from a prior run's persisted source, data, method,
-        seed, and method_args. (inits are not persisted and are not carried over.)"""
+        seed, resolved initialization, and method_args."""
         meta = runstore.read_meta(run_id)
         inputs = runstore.load_inputs(run_id)
         if inputs["source"] is None:
             raise RunError(f"run {run_id!r} has no persisted inputs to rerun")
+        source = inputs["source"]
+        if inputs.get("source_manifest"):
+            source = _compile.restore_source(source, inputs["source_manifest"])
         return self.start_run(
-            inputs["source"],
+            source,
             inputs["data"],
             method=meta.get("method", "sample"),
             seed=meta.get("seed"),
             method_args=meta.get("method_args"),
+            inits=inputs.get("inits"),
         )
 
-    def _wake_waiters(self, handle) -> None:
-        handle.event.set()
-        for loop, aio_event in handle.aio_events:
+    def _wake_waiters(self, handle: _Handle) -> None:
+        with handle.lock:
+            handle.event.set()
+            waiters = list(handle.aio_events)
+        for loop, aio_event in waiters:
             try:
                 loop.call_soon_threadsafe(aio_event.set)
             except RuntimeError:
                 pass
 
-    def cancel_run(self, run_id) -> dict:
-        """Cancel a run. Only queued (not-yet-started) runs can be stopped: once
-        CmdStan is executing, its subprocess cannot be interrupted from here."""
-        handle = self._handles.get(run_id)
+    def cancel_run(self, run_id: str) -> dict:
+        """Cancel queued work or kill this server's live CmdStan subprocesses."""
+        with self._lock:
+            handle = self._handles.get(run_id)
         if handle is None:
             meta = runstore.read_meta(run_id)
             return {
                 "run_id": run_id,
                 "cancelled": False,
                 "status": meta.get("status"),
-                "reason": "run already finished",
+                "reason": "owned by another server"
+                if meta.get("status") in {"running", "cancelling"}
+                else "run already finished",
             }
-        if handle.future is not None and handle.future.cancel():
-            # Still queued: it will never run, so finalize the meta ourselves.
-            handle.cancelled = True
-            meta = runstore.read_meta(run_id)
-            meta["status"] = "cancelled"
-            self._stamp_finish(meta)
-            runstore.write_meta(run_id, meta)
-            self._wake_waiters(handle)
-            self._handles.pop(run_id, None)
-            return {"run_id": run_id, "cancelled": True, "status": "cancelled"}
-        # Already executing: SIGKILL this run's CmdStan subprocess(es). The worker
-        # then sees a nonzero exit, and _execute relabels the run "cancelled".
-        # Only claim the run as cancelled if something was actually killed —
-        # otherwise a run that goes on to fail on its own merits (or succeed)
-        # would be mislabelled.
-        killed = _kill_run_processes(run_id)
-        handle.cancelled = bool(killed)
-        return {
-            "run_id": run_id,
-            "cancelled": bool(killed),
-            "status": "cancelling" if killed else "running",
-            "killed_pids": killed,
-            "reason": None
-            if killed
-            else "no live CmdStan process found (still compiling or between chains); retry",
-        }
+        # Killing and committing cancellation share the finalization lock. A
+        # worker awakened by the kill cannot publish a conflicting final state.
+        with handle.lock:
+            if handle.finished:
+                return {
+                    "run_id": run_id,
+                    "cancelled": False,
+                    "status": runstore.read_meta(run_id)["status"],
+                }
+            if handle.future is not None and handle.future.cancel():
+                handle.cancelled = True
+                handle.finished = True
+                meta = runstore.read_meta(run_id)
+                meta["status"] = "cancelled"
+                self._stamp_finish(meta)
+                runstore.write_meta(run_id, meta)
+                self._wake_waiters(handle)
+                with self._lock:
+                    self._handles.pop(run_id, None)
+                return {"run_id": run_id, "cancelled": True, "status": "cancelled"}
+            killed = _kill_run_processes(run_id)
+            handle.cancelled = handle.cancelled or bool(killed)
+            if handle.cancelled:
+                meta = runstore.read_meta(run_id)
+                meta["status"] = "cancelling"
+                runstore.write_meta(run_id, meta)
+            return {
+                "run_id": run_id,
+                "cancelled": handle.cancelled,
+                "status": "cancelling" if handle.cancelled else "running",
+                "killed_pids": killed,
+                "reason": None
+                if handle.cancelled
+                else "no live CmdStan process found (still compiling or between chains); retry",
+            }
 
-    def get_run_progress(self, run_id) -> dict:
+    def get_run_progress(self, run_id: str) -> dict:
         """Status, elapsed wall time, and (for a running sample) draws written so
         far vs expected, parsed from CmdStan's live CSV output."""
         meta = runstore.read_meta(run_id)
@@ -318,12 +391,24 @@ class RunManager:
                     out["progress"] = round(min(written / expected, 1.0), 3)
         return out
 
-    def _execute(self, run_id, source, data, method, kwargs, handle):
+    def _execute(
+        self, run_id: str, source: str, data: object, method: str, kwargs: dict, handle: _Handle
+    ) -> None:
         try:
             meta: dict = {"run_id": run_id, "method": method}
             try:
                 meta = runstore.read_meta(run_id)
                 model = self._compile(source, None)
+                # Cold provisioning can reveal a different toolchain identity.
+                # Store the identity actually used after the build completes.
+                manifest = _compile.model_manifest(source)
+                (runstore.run_dir(run_id) / "source_manifest.json").write_text(
+                    json.dumps(manifest, indent=2)
+                )
+                with handle.lock:
+                    meta = runstore.read_meta(run_id)
+                    meta["model_id"] = manifest["model_id"]
+                    runstore.write_meta(run_id, meta)
                 # Route CmdStan's live CSV output to a per-run dir so cancel can
                 # target this run's subprocesses and progress can be measured.
                 # generate_quantities spells the argument gq_output_dir.
@@ -331,6 +416,12 @@ class RunManager:
                 out_key = "gq_output_dir" if method == "generate_quantities" else "output_dir"
                 kwargs.setdefault(out_key, str(runstore.live_dir(run_id, create=True)))
                 fit = self._runner(method, model, data, kwargs)
+                if method == "generate_quantities":
+                    # Record the verified law for external inputs and reruns,
+                    # whose CSV snapshots no longer reference a source run.
+                    meta = runstore.read_meta(run_id)
+                    meta["input_method"] = fit.previous_fit.metadata.cmdstan_config["method"]
+                    runstore.write_meta(run_id, meta)
                 self._persist(run_id, method, fit)
                 # re-read: _persist may have written its own warning fields
                 # (persist_warning / csv_warning) directly to meta.json, and
@@ -347,20 +438,24 @@ class RunManager:
                     meta = runstore.read_meta(run_id)
                 except Exception:  # noqa: BLE001
                     pass
-                meta["status"] = "cancelled" if handle.cancelled else "failed"
+                meta["status"] = "failed"
                 meta["stderr"] = f"{exc}\n{traceback.format_exc()}"
-            self._stamp_finish(meta)
-            try:
-                runstore.write_meta(run_id, meta)
-            except Exception:  # noqa: BLE001 - nothing left to report it to
-                pass
+            with handle.lock:
+                if handle.cancelled:
+                    meta["status"] = "cancelled"
+                self._stamp_finish(meta)
+                try:
+                    runstore.write_meta(run_id, meta)
+                finally:
+                    handle.finished = True
         finally:
             self._wake_waiters(handle)
             # Drop the handle now the run is finished; later await_run calls fall
             # back to reading status from disk. Prevents unbounded growth.
-            self._handles.pop(run_id, None)
+            with self._lock:
+                self._handles.pop(run_id, None)
 
-    def get_run_status(self, run_id) -> dict:
+    def get_run_status(self, run_id: str) -> dict:
         meta = runstore.read_meta(run_id)
         out = {k: meta[k] for k in ("run_id", "method", "status") if k in meta}
         if meta.get("stderr"):
@@ -372,8 +467,9 @@ class RunManager:
                 out[w] = meta[w]
         return out
 
-    async def await_run(self, run_id, timeout=None) -> dict:
-        handle = self._handles.get(run_id)
+    async def await_run(self, run_id: str, timeout: float | None = None) -> dict:
+        with self._lock:
+            handle = self._handles.get(run_id)
         if handle is None:
             # already finished in a prior process/session: read from disk
             meta = runstore.read_meta(run_id)
@@ -389,13 +485,18 @@ class RunManager:
         # in the gap before we append, losing the wakeup forever. Appending
         # first guarantees that whichever of the worker's event.set() or our
         # is_set() check "wins" the race, at least one side observes it.
-        handle.aio_events.append((loop, aio_event))
-        if handle.event.is_set():
-            aio_event.set()
+        waiter = (loop, aio_event)
+        with handle.lock:
+            handle.aio_events.append(waiter)
+            if handle.event.is_set():
+                aio_event.set()
         try:
             await asyncio.wait_for(aio_event.wait(), timeout=timeout)
         except TimeoutError:
             return {"status": "running", "run_id": run_id}
+        finally:
+            with handle.lock:
+                handle.aio_events.remove(waiter)
         meta = runstore.read_meta(run_id)
         return {"status": meta["status"], "run_dir": str(runstore.run_dir(run_id)), "meta": meta}
 
