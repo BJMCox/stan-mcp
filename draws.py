@@ -17,16 +17,17 @@ Deliberately depends on numpy, stdlib and `runstore` only:
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
 import runstore
 from errors import RunError
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -47,13 +48,14 @@ class Draws:
     n_chain: int
     n_draw: int
     truncated_to: int | None = None
+    header_warning: str | None = None
 
 
 def schema_path(run_id: str) -> Path:
     return runstore.run_dir(run_id) / "draws_schema.json"
 
 
-def schema(run_id: str) -> dict:
+def schema(run_id: str) -> dict[str, Any]:
     """The validated sidecar, without reading any draws.
 
     Separate from `load` so a summary sourced from stansummary can get names and
@@ -81,7 +83,7 @@ def schema(run_id: str) -> dict:
             "not an object — re-run the model"
         )
     got = sc.get("schema")
-    if got != SCHEMA_VERSION:
+    if got not in (2, SCHEMA_VERSION):
         raise RunError(
             f"run {run_id!r} has draws_schema version {got!r}, but this build reads "
             f"version {SCHEMA_VERSION} — re-run the model"
@@ -96,6 +98,16 @@ def schema(run_id: str) -> dict:
                 f"run {run_id!r} has a malformed draws_schema.json: {key!r} is a "
                 f"{type(sc[key]).__name__}, expected a {kind.__name__} — re-run the model"
             )
+    if got == SCHEMA_VERSION and not (
+        isinstance(sc.get("header"), list)
+        and sc["header"]
+        and all(isinstance(name, str) for name in sc["header"])
+    ):
+        raise RunError(f"run {run_id!r} has a malformed draws_schema.json: no valid header")
+    if got == 2:
+        sc["header_warning"] = (
+            "legacy draws schema has no recorded CSV header identity; column labels are unverified"
+        )
     for group in ("params", "sampler_stats"):
         for name, spec in sc[group].items():
             missing = [k for k in ("dims", "cols") if not isinstance(spec, dict) or k not in spec]
@@ -115,17 +127,46 @@ def csv_files(run_id: str) -> list[str]:
     filename and thereby permutes chains relative to the original run).
     """
     d = runstore.run_dir(run_id) / "csv"
-    return [str(d / name) for name in schema(run_id)["files"]]
+    sc = schema(run_id)
+    paths = [d / name for name in sc["files"]]
+    if "header" in sc:
+        for path in paths:
+            if not path.exists():
+                raise RunError(f"run {run_id!r} is missing its draws CSV {path.name!r}")
+            with path.open() as stream:
+                _validate_header(path, _csv_header(path, stream), sc["header"])
+    return [str(path) for path in paths]
 
 
-def _read_csv(path: Path) -> np.ndarray:
+def _csv_header(path: Path, stream: Iterable[str]) -> list[str]:
+    for line in stream:
+        if line.strip() and not line.lstrip().startswith("#"):
+            return line.strip().split(",")
+    raise RunError(f"draws CSV {path.name!r} has no header or draws")
+
+
+def _validate_header(path: Path, header: list[str], expected: list[str] | None) -> None:
+    if expected is not None and header != expected:
+        raise RunError(
+            f"draws CSV {path.name!r} header differs from draws_schema; "
+            "the sidecar is stale or its CSV was replaced"
+        )
+
+
+def _read_csv(path: Path, expected_header: list[str] | None = None) -> np.ndarray:
     """`(draw, column)` floats from one CmdStan CSV."""
-    body = [ln for ln in path.read_text().splitlines() if ln and not ln.startswith("#")]
-    if len(body) < 2:
+    with path.open() as stream:
+        header = _csv_header(path, stream)
+        _validate_header(path, header, expected_header)
+        try:
+            rows = np.loadtxt(stream, delimiter=",", comments="#", ndmin=2)
+        except ValueError as exc:
+            raise RunError(f"draws CSV {path.name!r} has invalid numeric rows: {exc}") from exc
+    if rows.size == 0:
         raise RunError(f"draws CSV {path.name!r} has no draws")
-    # body[0] is the column header: CmdStan always writes it as the first
-    # non-comment line.
-    return np.asarray([[float(v) for v in ln.split(",")] for ln in body[1:]], dtype=float)
+    if rows.shape[1] != len(header):
+        raise RunError(f"draws CSV {path.name!r} has numeric rows inconsistent with its header")
+    return rows
 
 
 def load(run_id: str) -> Draws:
@@ -142,7 +183,7 @@ def load(run_id: str) -> Draws:
         p = csvdir / name
         if not p.exists():
             raise RunError(f"run {run_id!r} is missing its draws CSV {name!r}")
-        rows = _read_csv(p)
+        rows = _read_csv(p, sc.get("header"))
         if offset:
             rows = rows[offset:]
             if rows.shape[0] == 0:
@@ -204,6 +245,7 @@ def load(run_id: str) -> Draws:
         n_chain=arr.shape[0],
         n_draw=n_draw,
         truncated_to=truncated_to,
+        header_warning=sc.get("header_warning"),
     )
 
 
@@ -234,16 +276,48 @@ def elements(name: str, arr: np.ndarray) -> Iterator[tuple[str, np.ndarray]]:
         yield label, flat[:, :, pos]
 
 
+def spec_element_labels(name: str, spec: dict[str, Any]) -> Iterator[tuple[str, str]]:
+    """Scalar labels and exact header identities, including tuple/complex leaves."""
+    if "labels" in spec:
+        yield from zip(spec["labels"], spec["column_names"], strict=True)
+    else:
+        yield from element_labels(name, tuple(spec["dims"]))
+
+
 def matrix(d: Draws) -> tuple[np.ndarray, list[str]]:
     """`(draws, elements)` design matrix over every parameter element, plus labels.
 
     Parameters only — never sampler stats.
     """
+    sc = schema(d.run_id)
     cols, names = [], []
     for name, arr in d.params.items():
-        for label, values in elements(name, arr):
-            cols.append(values.reshape(-1))
+        flat = arr.reshape(d.n_chain * d.n_draw, -1)
+        for pos, (label, _) in enumerate(spec_element_labels(name, sc["params"][name])):
+            cols.append(flat[:, pos])
             names.append(label)
     if not cols:
         raise RunError(f"run {d.run_id!r} has no parameters to build a draw matrix from")
     return np.column_stack(cols), names
+
+
+def parameter_matrix(d: Draws, names: list[str]) -> np.ndarray:
+    """Constrained parameter columns in an external model's exact CSV order.
+
+    Resolving against recorded leaf identities also covers complex components
+    and nested tuple fields without inferring structure from dotted names.
+    """
+    sc = schema(d.run_id)
+    columns: dict[str, np.ndarray] = {}
+    for name, arr in d.params.items():
+        flat = arr.reshape(d.n_chain * d.n_draw, -1)
+        for pos, (_, csv_name) in enumerate(spec_element_labels(name, sc["params"][name])):
+            columns[csv_name] = flat[:, pos]
+    missing = [name for name in names if name not in columns]
+    if missing:
+        raise RunError(
+            f"run {d.run_id!r} does not contain constrained model parameters: {', '.join(missing)}"
+        )
+    if not names:
+        return np.empty((d.n_chain * d.n_draw, 0))
+    return np.column_stack([columns[name] for name in names])

@@ -515,3 +515,85 @@ def test_live_bridgestan_name_mapping_on_shaped_params(tmp_path, monkeypatch):
         pytest.fail("BridgeStan artifact never finished building")
     assert geom["scale"] == "unconstrained"
     assert geom["n_dims"] == 9, geom
+
+
+def test_live_optimize_mode_and_gq_survive_owned_input_snapshots(tmp_path, monkeypatch):
+    import asyncio
+
+    import diagnostics
+    import runstore
+    import sample
+
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "home"))
+    source = """
+    parameters { real<lower=0> sigma; vector[2] v; }
+    model { sigma ~ lognormal(0,1); v ~ std_normal(); }
+    """
+    mgr = sample.RunManager()
+    optimized = mgr.start_run(
+        source, {}, method="optimize", seed=42, method_args={"jacobian": True}
+    )["run_id"]
+    assert asyncio.run(mgr.await_run(optimized, timeout=120))["status"] == "done"
+    initial = diagnostics.posterior_mean_inits(optimized)
+    np.testing.assert_allclose(initial["sigma"], 1, rtol=1e-4)
+    np.testing.assert_allclose(initial["v"], [0, 0], atol=1e-4)
+    laplace = mgr.start_run(
+        source,
+        {},
+        method="laplace",
+        seed=43,
+        method_args={"mode": runstore.csv_paths(optimized)[0], "draws": 8, "jacobian": True},
+    )["run_id"]
+    assert asyncio.run(mgr.await_run(laplace, timeout=120))["status"] == "done"
+    gq = mgr.start_run(
+        source + "\ngenerated quantities {real norm_v=dot_self(v);}",
+        {},
+        method="generate_quantities",
+        method_args={"from_run_id": optimized},
+        seed=44,
+    )["run_id"]
+    assert asyncio.run(mgr.await_run(gq, timeout=120))["status"] == "done"
+    assert optimized in runstore.prune_runs(keep=1)
+    rerun = mgr.rerun(gq)["run_id"]
+    assert asyncio.run(mgr.await_run(rerun, timeout=120))["status"] == "done"
+    assert (
+        diagnostics.extract_draws(rerun, "norm_v")["draws"]
+        == diagnostics.extract_draws(gq, "norm_v")["draws"]
+    )
+
+
+def test_live_unit_vector_warm_start_avoids_invalid_mean(tmp_path, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    import diagnostics
+    import runstore
+    import sample
+
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "home"))
+    source = "parameters {unit_vector[2] u;} model {u[1] ~ normal(0,1);}"
+    rid = "sample-0001"
+    runstore.write_meta(rid, {"method": "sample", "status": "done"})
+    runstore.persist_inputs(rid, source, {})
+    live = runstore.live_dir(rid, create=True)
+    csv = live / "antipodal.csv"
+    csv.write_text("lp__,u.1,u.2\n-1,1,0\n-1,-1,0\n")
+    fit = SimpleNamespace(
+        runset=SimpleNamespace(csv_files=[str(csv)]),
+        metadata=SimpleNamespace(
+            cmdstan_config={"raw_header": "lp__,u.1,u.2"},
+            stan_vars={"u": SimpleNamespace(dimensions=(2,))},
+        ),
+    )
+    diagnostics.persist_run(rid, "sample", fit)
+    initial = diagnostics.posterior_mean_inits(rid)
+    assert initial == {"u": [1.0, 0.0]}
+    mgr = sample.RunManager()
+    result = mgr.start_run(
+        source,
+        {},
+        inits_from=rid,
+        seed=45,
+        method_args={"chains": 1, "iter_warmup": 20, "iter_sampling": 10},
+    )
+    assert asyncio.run(mgr.await_run(result["run_id"], timeout=120))["status"] == "done"

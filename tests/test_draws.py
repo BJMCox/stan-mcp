@@ -35,6 +35,7 @@ def _run(tmp_path, monkeypatch, *, files, params, stats, rows_per_chain, draw_ro
         (csvdir / name).write_text(f"# comment\n{header}\n{body}\n")
     sidecar = {
         "schema": draws.SCHEMA_VERSION,
+        "header": header.split(","),
         "files": files,
         "params": params,
         "sampler_stats": stats,

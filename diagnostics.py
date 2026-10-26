@@ -41,7 +41,7 @@ import stansummary
 from errors import RunError, ValidationError
 
 
-def _method_diagnostics(method: str, fit) -> dict:
+def _method_diagnostics(method: str, fit: Any) -> dict:
     """Method-specific health scalars pulled from the fit.
 
     For variational/pathfinder/laplace these are the ONLY diagnostics there are.
@@ -68,7 +68,7 @@ def _method_diagnostics(method: str, fit) -> dict:
         return {"method_diagnostics_warning": f"{method} diagnostics unavailable: {exc}"}
 
 
-def _csv_columns(fit) -> tuple[list[str], str]:
+def _csv_columns(fit: Any) -> tuple[list[str], str]:
     """The fit's CSV column names in CmdStan's own dot notation (`m.1.1`), plus
     which header source they came from.
 
@@ -121,7 +121,10 @@ def _draw_row_offset(method: str, run_id: str, fit: Any = None) -> int:
     if method == "variational":
         return 1
     if method == "generate_quantities":
-        args = runstore.read_meta(run_id).get("method_args", {})
+        meta = runstore.read_meta(run_id)
+        args = meta.get("method_args", {})
+        if meta.get("input_method") == "variational":
+            return 1
         if "csv_files" in args:
             previous = fit.previous_fit
             config = previous.metadata.cmdstan_config
@@ -139,7 +142,7 @@ def _draw_row_offset(method: str, run_id: str, fit: Any = None) -> int:
     return 0
 
 
-def _sidecar_from_fit(fit, method: str, run_id: str) -> dict:
+def _sidecar_from_fit(fit: Any, method: str, run_id: str) -> dict[str, Any]:
     """The draws sidecar body for a fit: dims and CSV column indices per variable.
 
     `cols` is written in the order that fills the array ROW-MAJOR, because
@@ -180,17 +183,60 @@ def _sidecar_from_fit(fit, method: str, run_id: str) -> dict:
                 "run's CSVs are persisted, but its draws cannot be typed."
             ) from exc
 
-    params: dict[str, dict] = {}
-    for name, shape in dims.items():
-        if not shape:
-            params[name] = {"dims": [], "cols": [column_of(name, name)]}
-            continue
-        ordered = [column_of(name, cn) for _, cn in draws.element_labels(name, shape)]
-        params[name] = {"dims": list(shape), "cols": ordered}
+    params: dict[str, dict[str, Any]] = {}
+    variables: dict[str, dict[str, Any]] = {}
+
+    def describe(variable: Any) -> dict[str, Any]:
+        return {
+            "type": getattr(getattr(variable, "type", None), "name", "SCALAR").lower(),
+            "dims": list(variable.dimensions),
+            "contents": [describe(child) for child in getattr(variable, "contents", [])],
+        }
+
+    def leaves(
+        variable: Any,
+        key: str,
+        prefixes: list[tuple[str, str]],
+        outer_dims: tuple[int, ...] = (),
+    ) -> None:
+        shape = tuple(variable.dimensions)
+        # Array indices belong before a tuple field or complex component.
+        expanded = [
+            (stan_label, column + cmdstan_name[len(label) :])
+            for label, column in prefixes
+            for stan_label, cmdstan_name in draws.element_labels(label, shape)
+        ]
+        kind = getattr(getattr(variable, "type", None), "name", "SCALAR")
+        if kind == "TUPLE":
+            for i, child in enumerate(variable.contents, 1):
+                leaves(
+                    child,
+                    f"{key}:{i}",
+                    [(f"{label}:{i}", f"{column}:{i}") for label, column in expanded],
+                    outer_dims + shape,
+                )
+            return
+        for component in ("real", "imag") if kind == "COMPLEX" else (None,):
+            suffix = f".{component}" if component else ""
+            labels = [label + suffix for label, _ in expanded]
+            columns = [column + suffix for _, column in expanded]
+            spec: dict[str, Any] = {
+                "dims": list(outer_dims + shape),
+                "cols": [column_of(key.split(":")[0], column) for column in columns],
+            }
+            if suffix or ":" in key:
+                spec.update(labels=labels, column_names=columns)
+            params[key + suffix] = spec
+
+    for name, variable in fit.metadata.stan_vars.items():
+        variables[name] = describe(variable)
+        leaves(variable, name, [(name, name)])
 
     stats = {name: {"dims": [], "cols": [i]} for i, name in enumerate(cols) if name.endswith("__")}
     return {
         "schema": draws.SCHEMA_VERSION,
+        "header": cols,
+        "variables": variables,
         "params": params,
         "sampler_stats": stats,
         "draw_row_offset": _draw_row_offset(method, run_id, fit),
@@ -210,7 +256,7 @@ def _is_draws_csv(name: str) -> bool:
     return "-opt-" not in name
 
 
-def _ordered_draws_files(fit, run_id: str) -> list[str]:
+def _ordered_draws_files(fit: Any, run_id: str) -> list[str]:
     """Persisted draws CSV filenames, in true per-chain run order.
 
     NOT a filename sort of `csv/`: past 9 chains that puts "_10" before "_2",
@@ -235,7 +281,7 @@ def _ordered_draws_files(fit, run_id: str) -> list[str]:
         if ordered:
             return ordered
 
-    def chain_key(name: str):
+    def chain_key(name: str) -> tuple[int, int | str]:
         stem = name.rsplit(".", 1)[0]
         tail = stem.rsplit("_", 1)[-1]
         return (0, int(tail)) if tail.isdigit() else (1, stem)
@@ -243,11 +289,7 @@ def _ordered_draws_files(fit, run_id: str) -> list[str]:
     return sorted((n for n in persisted if _is_draws_csv(n)), key=chain_key)
 
 
-def persist_run(run_id: str, method: str, fit) -> None:
-    if method == "optimize":
-        runstore.persist_estimate(run_id, dict(fit.optimized_params_dict))
-        return
-
+def persist_run(run_id: str, method: str, fit: Any) -> None:
     # persist raw cmdstan CSVs (source of truth; enables generate_quantities reuse).
     # Prefer the live output dir we route every method into — robust across fit
     # types (CmdStanPathfinder / CmdStanLaplace expose no .runset).
@@ -257,10 +299,26 @@ def persist_run(run_id: str, method: str, fit) -> None:
         if not csvs and hasattr(fit, "runset"):
             csvs = list(fit.runset.csv_files)
         runstore.persist_csvs(run_id, csvs)
-    except Exception as exc:  # best-effort
+    except Exception as exc:
         meta = runstore.read_meta(run_id)
         meta["csv_warning"] = f"csv persist failed: {exc}"
         runstore.write_meta(run_id, meta)
+        # Keep every original, including chains not yet copied. A partial
+        # durable copy cannot support a successful run or justify cleanup.
+        raise RunError(f"CSV persistence failed for run {run_id!r}: {exc}") from exc
+
+    if method == "optimize":
+        import density
+
+        estimate = dict(fit.optimized_params_dict)
+        runstore.persist_estimate(run_id, estimate)
+        values = {k: v for k, v in estimate.items() if not k.endswith("__")}
+        runstore.persist_initialization(
+            run_id, density.constrained_values(list(values), values.values())
+        )
+        if runstore.csv_paths(run_id):
+            runstore.clear_live(run_id)
+        return
 
     md = _method_diagnostics(method, fit)
     if md:
@@ -311,14 +369,14 @@ def persist_run(run_id: str, method: str, fit) -> None:
 DEFAULT_MAX_ROWS = 100
 
 
-def _worst_first(records: list[dict]):
+def _worst_first(records: list[dict]) -> Callable[[dict], tuple[float, float]] | None:
     """Sort key putting the least-converged rows first, or None if the run has no
     convergence columns — the approximate methods' numpy summary, which reports
     no R-hat or ESS because their draws are not MCMC chains."""
     if not records or not ({"r_hat", "ess_bulk"} & set(records[0])):
         return None
 
-    def key(r):
+    def key(r: dict) -> tuple[float, float]:
         rhat = _finite(r.get("r_hat"))
         ess = _finite(r.get("ess_bulk"))
         return (-(rhat if rhat is not None else 0.0), ess if ess is not None else float("inf"))
@@ -363,11 +421,13 @@ _SUMMARY_COLUMNS = {
 }
 
 
-def _wanted(name: str, params) -> bool:
-    return not params or name in set(params)
+def _wanted(name: str, params: list[str] | None) -> bool:
+    return not params or any(
+        name == root or name.startswith((root + ".", root + ":")) for root in params
+    )
 
 
-def _sig6(x) -> float:
+def _sig6(x: float) -> float:
     """Six SIGNIFICANT figures, for a statistic of unknown magnitude.
 
     NOT `round(x, 6)`, which rounds decimal PLACES and so partly undoes
@@ -379,7 +439,7 @@ def _sig6(x) -> float:
     return float(f"{float(x):.6g}")
 
 
-def _no_match(run_id: str, n_elements: int, looked_up: list[str], stats) -> RunError:
+def _no_match(run_id: str, n_elements: int, looked_up: list[str], stats: dict) -> RunError:
     """The error for a join that matched nothing at all.
 
     Both consumers of stansummary's rows `continue` past an element with no row,
@@ -397,7 +457,7 @@ def _no_match(run_id: str, n_elements: int, looked_up: list[str], stats) -> RunE
     )
 
 
-def _summary_from_stansummary(run_id: str, params, max_rows: int) -> dict:
+def _summary_from_stansummary(run_id: str, params: list[str] | None, max_rows: int) -> dict:
     """Statistics from CmdStan's own implementation, relabelled into Stan syntax.
 
     Only the sidecar is read here, not the draws: stansummary has already parsed
@@ -410,7 +470,7 @@ def _summary_from_stansummary(run_id: str, params, max_rows: int) -> dict:
     for name, spec in sc["params"].items():
         if not _wanted(name, params):
             continue
-        for stan_label, cmdstan_name in draws.element_labels(name, tuple(spec["dims"])):
+        for stan_label, cmdstan_name in draws.spec_element_labels(name, spec):
             looked_up.append(cmdstan_name)
             row = stats.get(cmdstan_name)
             if row is None:
@@ -426,42 +486,64 @@ def _summary_from_stansummary(run_id: str, params, max_rows: int) -> dict:
             records.append(_json_safe(rec))
     if looked_up and not records:
         raise _no_match(run_id, len(looked_up), looked_up, stats)
-    return _cap_rows(records, max_rows)
+    out = _cap_rows(records, max_rows)
+    if sc.get("header_warning"):
+        out["header_warning"] = sc["header_warning"]
+    return out
 
 
-def _summary_from_draws(run_id: str, params, max_rows: int) -> dict:
+def _summary_from_draws(run_id: str, params: list[str] | None, max_rows: int) -> dict[str, Any]:
     """Moments and quantiles for the approximate methods.
 
     No R-hat or ESS: variational/pathfinder/laplace draws are not MCMC chains, and
     stansummary would happily report both anyway.
     """
     d = draws.load(run_id)
+    sc = draws.schema(run_id)
+    selected = [(name, arr) for name, arr in d.params.items() if _wanted(name, params)]
+    total = sum(int(np.prod(arr.shape[2:])) for _, arr in selected)
     records = []
-    for name, arr in d.params.items():
-        if not _wanted(name, params):
-            continue
-        for label, values in draws.elements(name, arr):
-            v = values.reshape(-1)
+    for name, arr in selected:
+        flat = arr.reshape(arr.shape[0], arr.shape[1], -1)
+        for pos, (label, _) in enumerate(draws.spec_element_labels(name, sc["params"][name])):
+            if max_rows > 0 and len(records) >= max_rows:
+                break
+            v = flat[:, :, pos].reshape(-1)
+            q5, q50, q95 = np.quantile(v, [0.05, 0.5, 0.95])
             records.append(
                 _json_safe(
                     {
                         "param": label,
                         "mean": _sig6(v.mean()),
                         "sd": _sig6(v.std(ddof=1)) if v.size > 1 else 0.0,
-                        "q5": _sig6(np.quantile(v, 0.05)),
-                        "q50": _sig6(np.quantile(v, 0.5)),
-                        "q95": _sig6(np.quantile(v, 0.95)),
+                        "q5": _sig6(q5),
+                        "q50": _sig6(q50),
+                        "q95": _sig6(q95),
                         "n": int(v.size),
                     }
                 )
             )
-    out = _cap_rows(records, max_rows)
+        if max_rows > 0 and len(records) >= max_rows:
+            break
+    out: dict[str, Any] = {"summary": records}
+    if total > len(records):
+        out["truncated"] = {
+            "shown": len(records),
+            "total": total,
+            "selected_by": "order",
+            "hint": "name parameters via `params`, or pass max_rows=0; "
+            "get_run_diagnostics reports worst-case R-hat/ESS over all of them",
+        }
     if d.truncated_to is not None:
         out["chains_truncated_to"] = d.truncated_to
+    if d.header_warning:
+        out["header_warning"] = d.header_warning
     return out
 
 
-def run_summary(run_id: str, params=None, max_rows: int = DEFAULT_MAX_ROWS) -> dict:
+def run_summary(
+    run_id: str, params: list[str] | None = None, max_rows: int = DEFAULT_MAX_ROWS
+) -> dict:
     meta = runstore.read_meta(run_id)
     method = meta.get("method")
     if method == "optimize":
@@ -477,7 +559,7 @@ _ESS_MIN = 400
 _EBFMI_MIN = 0.3
 
 
-def _finite(x):
+def _finite(x: Any) -> float | None:
     import math
 
     try:
@@ -527,13 +609,18 @@ def _convergence_stats(run_id: str) -> dict:
     min_tail: float | None = None
     looked_up: list[str] = []
     matched = 0
+    undefined: dict[str, list[str]] = {}
     for name, spec in sc["params"].items():
-        for stan_label, cmdstan_name in draws.element_labels(name, tuple(spec["dims"])):
+        for stan_label, cmdstan_name in draws.spec_element_labels(name, spec):
             looked_up.append(cmdstan_name)
             row = stats.get(cmdstan_name)
             if row is None:
+                undefined.setdefault("missing", []).append(stan_label)
                 continue
             matched += 1
+            for metric in ("R_hat", "ESS_bulk", "ESS_tail"):
+                if _finite(row.get(metric)) is None:
+                    undefined.setdefault(metric, []).append(stan_label)
             if (r := _finite(row.get("R_hat"))) is not None:
                 if worst_rhat is None or r > worst_rhat[0]:
                     worst_rhat = (r, stan_label)
@@ -549,6 +636,13 @@ def _convergence_stats(run_id: str) -> dict:
         raise _no_match(run_id, len(looked_up), looked_up, stats)
 
     out: dict = {}
+    if undefined:
+        out["undefined_diagnostics"] = {
+            key: {"count": len(values), "parameters": values[:10]}
+            for key, values in undefined.items()
+        }
+    if sc.get("header_warning"):
+        out["header_warning"] = sc["header_warning"]
     if worst_rhat is not None:
         out["max_rhat"] = round(worst_rhat[0], 4)
         out["max_rhat_param"] = worst_rhat[1]
@@ -584,7 +678,10 @@ def _sampler_stats(d: draws.Draws, meta: dict) -> dict:
         # silently missing from every run (measured on Neal's funnel: min E-BFMI
         # 0.06 against 1.01 for its non-centered twin).
         try:
-            bfmi = [v for v in (_finite(b) for b in np.asarray(az.bfmi(energy))) if v is not None]
+            values = [_finite(b) for b in np.asarray(az.bfmi(energy))]
+            bfmi = [v for v in values if v is not None]
+            if missing := [i + 1 for i, value in enumerate(values) if value is None]:
+                out["ebfmi_warning"] = f"E-BFMI undefined for chain(s) {missing}"
             if bfmi:
                 out["min_ebfmi"] = round(min(bfmi), 4)
         except Exception as exc:  # noqa: BLE001
@@ -662,6 +759,13 @@ def _verdict(d: dict) -> dict:
     if not any(key in d for key, _ in _VERDICT_CHECKS):
         return {"verdict": "unknown", "issues": []}
     issues = [msg for key, check in _VERDICT_CHECKS if key in d and (msg := check(d))]
+    if not issues and (
+        d.get("undefined_diagnostics")
+        or d.get("convergence_warning")
+        or d.get("ebfmi_warning")
+        or d.get("sampler_stats_warning")
+    ):
+        return {"verdict": "unknown", "issues": []}
     return {"verdict": "pass" if not issues else "warn", "issues": issues}
 
 
@@ -688,7 +792,7 @@ def run_diagnostics(run_id: str) -> dict:
     return out
 
 
-def _idata_with_loglik(run_id: str, var_name: str):
+def _idata_with_loglik(run_id: str, var_name: str) -> Any:
     """An arviz DataTree with a `log_likelihood` group, built from typed draws.
 
     arviz is needed only for PSIS-LOO, which CmdStan has no equivalent for, so the
@@ -698,6 +802,7 @@ def _idata_with_loglik(run_id: str, var_name: str):
     """
     import arviz as az
 
+    _require_posterior_draws(run_id)
     d = draws.load(run_id)
     if var_name not in d.params:
         # A run with zero parameters would otherwise end the message at
@@ -721,6 +826,27 @@ def _idata_with_loglik(run_id: str, var_name: str):
     )
 
 
+def _require_posterior_draws(run_id: str) -> None:
+    meta = runstore.read_meta(run_id)
+    method = meta.get("method")
+    if method == "sample":
+        return
+    if method == "generate_quantities":
+        # A CSV snapshot retains the source sampling law after pruning.
+        source_method = meta.get("input_method")
+        source = meta.get("method_args", {}).get("from_run_id")
+        if source_method is None and source:
+            _require_posterior_draws(source)
+            return
+        if source_method == "sample":
+            return
+    raise RunError(
+        f"run {run_id!r} has no verified posterior sampling law ({method!r}); "
+        "ordinary PSIS-LOO requires MCMC posterior draws. Approximate fits need "
+        "target/proposal importance correction, which this tool does not implement."
+    )
+
+
 def run_loo(run_id: str, var_name: str = "log_lik") -> dict:
     """PSIS-LOO cross-validation for a run (needs a `log_lik` generated quantity)."""
     import arviz as az
@@ -737,13 +863,16 @@ def run_loo(run_id: str, var_name: str = "log_lik") -> dict:
     p = getattr(loo, "p_loo", None) if p is None else p
     khat = np.asarray(getattr(loo, "pareto_k", []), dtype=float)
     good_k = float(getattr(loo, "good_k", 0.7) or 0.7)
-    return {
+    out = {
         "elpd_loo": round(float(elpd), 3),
         "se": round(float(loo.se), 3),
         "p_loo": round(float(p), 3) if p is not None else None,
         "n_high_pareto_k": int((khat > good_k).sum()) if khat.size else 0,
         "warning": bool(getattr(loo, "warning", False)),
     }
+    if warning := draws.schema(run_id).get("header_warning"):
+        out["header_warning"] = warning
+    return out
 
 
 def compare_runs(run_ids: list[str], var_name: str = "log_lik") -> dict:
@@ -755,20 +884,30 @@ def compare_runs(run_ids: list[str], var_name: str = "log_lik") -> dict:
     dataset = {rid: _idata_with_loglik(rid, var_name) for rid in run_ids}
     df: Any = az.compare(dataset)  # PSIS-LOO by default
     records = df.reset_index().rename(columns={"index": "run_id"}).to_dict("records")
-    return {"comparison": [_json_safe(r) for r in records]}
+    out: dict[str, Any] = {"comparison": [_json_safe(r) for r in records]}
+    warnings = {
+        rid: warning for rid in run_ids if (warning := draws.schema(rid).get("header_warning"))
+    }
+    if warnings:
+        out["header_warnings"] = warnings
+    return out
 
 
-def _json_safe(record: dict) -> dict:
+def _json_safe(record: Any) -> Any:
     """Replace non-finite floats (NaN/inf) with None so the result is valid JSON."""
     import math
 
-    out = {}
-    for k, v in record.items():
-        if isinstance(v, float) and not math.isfinite(v):
-            out[k] = None
-        else:
-            out[k] = v
-    return out
+    if isinstance(record, dict):
+        return {k: _json_safe(v) for k, v in record.items()}
+    if isinstance(record, (list, tuple)):
+        return [_json_safe(v) for v in record]
+    if isinstance(record, np.ndarray):
+        return _json_safe(record.tolist())
+    if isinstance(record, np.generic):
+        return _json_safe(record.item())
+    if isinstance(record, float) and not math.isfinite(record):
+        return None
+    return record
 
 
 # Default ceiling on the draws one extract_draws call returns. Deliberately
@@ -792,38 +931,29 @@ def _thin_step(n: int, thin: int, budget: int) -> int:
 
 
 def _draw_budget(max_draws: int, width: int, n_chains: int = 1) -> int:
-    """Draws to return per chain, so the VALUES the call returns stay near the
-    ceiling. `width` is the number of scalar components in one draw of the
-    parameter (1 for a scalar, N for a length-N vector)."""
-    if max_draws <= 0:
-        return 0  # unlimited
-    return max(1, max_draws // max(1, width) // max(1, n_chains))
-
-
-def _shape_draws(arr: np.ndarray) -> list:
-    """Stable shape regardless of draw count: scalar param -> list of floats,
-    multidimensional param -> list of per-draw lists. Never collapse the draw
-    axis (squeeze() would turn a single remaining draw into a scalar)."""
-    return arr[:, 0].tolist() if arr.shape[1] == 1 else arr.tolist()
-
-
-def _from_typed_source(
-    d: draws.Draws, run_id: str, param: str, thin: int, by_chain: bool, max_draws: int
-) -> dict:
-    arr = d.params.get(param)
-    if arr is None:
-        raise RunError(
-            f"parameter {param!r} not found in run {run_id!r} (have: {', '.join(sorted(d.params))})"
+    """Common rows per chain within the whole-call scalar-value cap."""
+    if max_draws == 0:
+        return 0
+    row_width = width * n_chains
+    if row_width > max_draws:
+        raise ValidationError(
+            f"max_draws={max_draws} cannot hold one retained row of the selected "
+            f"parameters ({row_width} scalar values); select fewer parameters, "
+            "increase max_draws, or use max_draws=0 for unlimited output"
         )
-    width = int(np.prod(arr.shape[2:])) if arr.ndim > 2 else 1
+    return max_draws // row_width if row_width else 0
+
+
+def _from_typed_source(d: draws.Draws, param: str, step: int, by_chain: bool) -> dict[str, Any]:
+    arr = d.params[param]
+    # Preserve every declared variable axis, including a vector of length one.
+    values = arr[:, ::step] if by_chain else arr.reshape(-1, *arr.shape[2:])[::step]
+    out = {"param": param, "draws": values.tolist(), "thin": step}
     if by_chain:
-        budget = _draw_budget(max_draws, width, arr.shape[0])
-        step = _thin_step(arr.shape[1], thin, budget)
-        per_chain = [_shape_draws(c.reshape(c.shape[0], -1)[::step]) for c in arr]
-        return {"param": param, "by_chain": True, "draws": per_chain, "thin": step}
-    flat = arr.reshape(arr.shape[0] * arr.shape[1], -1)
-    step = _thin_step(flat.shape[0], thin, _draw_budget(max_draws, width))
-    return {"param": param, "draws": _shape_draws(flat[::step]), "thin": step}
+        out["by_chain"] = True
+    if d.header_warning:
+        out["header_warning"] = d.header_warning
+    return out
 
 
 def extract_draws(
@@ -833,7 +963,7 @@ def extract_draws(
     by_chain: bool = False,
     params: list[str] | None = None,
     max_draws: int = DEFAULT_MAX_DRAWS,
-) -> dict:
+) -> dict[str, Any]:
     if thin < 1:
         raise ValidationError(f"thin must be >= 1, got {thin}")
     if max_draws < 0:
@@ -841,28 +971,30 @@ def extract_draws(
     meta = runstore.read_meta(run_id)
     if meta.get("method") == "optimize":
         raise RunError("extract_draws is not available for optimize runs")
-    wanted = list(params) if params else ([param] if param else [])
+    wanted = list(dict.fromkeys(params)) if params else ([param] if param else [])
     if not wanted:
         raise ValidationError("extract_draws requires `param` or `params`")
-
-    from functools import partial
-
-    # Split the ceiling across the requested parameters: it bounds the whole
-    # call, so asking for N names must not return N times as much.
-    per_param = max(1, max_draws // len(wanted)) if max_draws > 0 else 0
-    shared = {"thin": thin, "by_chain": by_chain, "max_draws": per_param}
-    # Load the draws ONCE: doing it per parameter re-parsed every CSV for each
-    # name in `params`.
-    extract = partial(_from_typed_source, draws.load(run_id), run_id, **shared)
-
+    d = draws.load(run_id)
+    for name in wanted:
+        if name not in d.params:
+            raise RunError(
+                f"parameter {name!r} not found in run {run_id!r} "
+                f"(have: {', '.join(sorted(d.params))})"
+            )
+    width = sum(int(np.prod(d.params[name].shape[2:])) for name in wanted)
+    budget = _draw_budget(max_draws, width, d.n_chain if by_chain else 1)
+    n = d.n_draw if by_chain else d.n_chain * d.n_draw
+    step = _thin_step(n, thin, budget)
     if params:
-        results = {p: extract(p) for p in wanted}
-        return {
-            "draws": {p: r["draws"] for p, r in results.items()},
+        out = {
+            "draws": {p: _from_typed_source(d, p, step, by_chain)["draws"] for p in wanted},
             "by_chain": by_chain,
-            "thin": max(r["thin"] for r in results.values()),
+            "thin": step,
         }
-    return extract(wanted[0])
+        if d.header_warning:
+            out["header_warning"] = d.header_warning
+        return out
+    return _from_typed_source(d, wanted[0], step, by_chain)
 
 
 # --- divergence localization ---------------------------------------------
@@ -938,6 +1070,8 @@ def run_pathologies(run_id: str, top_k: int = 5, permutations: int = DEFAULT_PER
     div = np.asarray(d.sampler_stats["divergent__"]).reshape(-1).astype(bool)
     n, n_div = int(div.size), int(div.sum())
     out: dict = {"run_id": run_id, "n_draws": n, "n_divergent": n_div, "ranking": []}
+    if d.header_warning:
+        out["header_warning"] = d.header_warning
     if n_div == 0:
         return {**out, "note": "no divergent transitions to localize"}
     if n_div == n:
@@ -1019,35 +1153,17 @@ _EIGEN_GAP = 1.5  # min relative gap to the next eigenvalue before naming loadin
 
 
 def _constrained_matrix(d: draws.Draws, bs_names: list[str]) -> np.ndarray:
-    """(draws, n_params) in BridgeStan's constrained parameter order.
-
-    BridgeStan spells elements `z.3` / `m.2.1` with 1-based indices; the sidecar
-    records each variable's dims, so an index tuple resolves directly against the
-    typed array's own shape. `ravel_multi_index` still does the flattening below —
-    what changed is that it is given the sidecar's recorded dims rather than
-    arviz's dim ordering."""
-    cols = []
-    for nm in bs_names:
-        base, *idx = nm.split(".")
-        arr = d.params.get(base)
-        if arr is None:
-            raise RunError(f"BridgeStan names parameter {base!r}, absent from the run's draws")
-        flat = arr.reshape(arr.shape[0] * arr.shape[1], -1)
-        if idx:
-            try:
-                pos = int(np.ravel_multi_index(tuple(int(i) - 1 for i in idx), arr.shape[2:]))
-            except ValueError as exc:
-                raise RunError(
-                    f"BridgeStan name {nm!r} does not fit parameter {base!r}'s "
-                    f"recorded dims {arr.shape[2:]!r}: {exc}"
-                ) from exc
-        else:
-            pos = 0
-        cols.append(flat[:, pos])
-    return np.column_stack(cols)
+    """Return model parameters in BridgeStan CSV order, excluding other outputs."""
+    return draws.parameter_matrix(d, bs_names)
 
 
-def _unconstrained_draws(run_id: str, d: draws.Draws) -> tuple[np.ndarray, list[str], dict]:
+def _unconstrained_draws(
+    run_id: str,
+    d: draws.Draws,
+    *,
+    params: list[str] | None = None,
+    max_dims: int = 0,
+) -> tuple[np.ndarray, list[str], dict]:
     """(chain, draw, dim) unconstrained draws and their names.
 
     The sampler explores the UNCONSTRAINED space, so that is the geometry whose
@@ -1060,6 +1176,8 @@ def _unconstrained_draws(run_id: str, d: draws.Draws) -> tuple[np.ndarray, list[
 
     inputs = runstore.load_inputs(run_id)
     source = inputs["source"]
+    if source is not None and inputs.get("source_manifest"):
+        source = _compile.restore_source(source, inputs["source_manifest"])
     n_chain, n_draw = d.n_chain, d.n_draw
     if source is None:
         raise RunError(f"run {run_id!r} has no persisted model.stan to unconstrain with")
@@ -1071,11 +1189,25 @@ def _unconstrained_draws(run_id: str, d: draws.Draws) -> tuple[np.ndarray, list[
             "the CmdStan executable); retry shortly"
         )
     if state["status"] == "failed":
-        X, names = draws.matrix(d)
-        u = X.reshape(n_chain, n_draw, -1)
-        return u, names, {"scale": "constrained", "scale_reason": state["error"]}
+        raise RunError(
+            f"parameter geometry unavailable: {state['error']}. "
+            "The model parameter coordinates cannot be verified without BridgeStan."
+        )
 
     m = density.get_model(source, inputs["data"])
+    names = list(m.param_unc_names())
+    selected = [
+        i
+        for i, name in enumerate(names)
+        if not params or name in params or _block_of(name) in params
+    ]
+    if not selected:
+        raise ValidationError(f"no parameters matched {params!r} (have {len(names)} elements)")
+    if max_dims > 0 and len(selected) > max_dims:
+        raise ValidationError(
+            f"{len(selected)} unconstrained dimensions exceeds max_dims={max_dims}; "
+            "scope with params or raise max_dims."
+        )
     X = _constrained_matrix(d, m.param_names())
     unc = np.empty((X.shape[0], m.param_unc_num()))
     try:
@@ -1091,10 +1223,24 @@ def _unconstrained_draws(run_id: str, d: draws.Draws) -> tuple[np.ndarray, list[
         # unconstrained at all, so report constrained draws and say why instead of
         # failing the call. Same for any other constraint whose inverse validates
         # (unit_vector, corr_matrix, cholesky_factor_corr).
-        Xc, cnames = draws.matrix(d)
+        cnames = list(m.param_names())
+        keep = [
+            i
+            for i, name in enumerate(cnames)
+            if not params or name in params or _block_of(name) in params
+        ]
+        if max_dims > 0 and len(keep) > max_dims:
+            raise ValidationError(
+                f"{len(keep)} constrained dimensions exceeds max_dims={max_dims}"
+            ) from exc
+        labels = {
+            csv_name: label
+            for name, spec in draws.schema(run_id)["params"].items()
+            for label, csv_name in draws.spec_element_labels(name, spec)
+        }
         return (
-            Xc.reshape(n_chain, n_draw, -1),
-            cnames,
+            X[:, keep].reshape(n_chain, n_draw, -1),
+            [labels[cnames[i]] for i in keep],
             {
                 "scale": "constrained",
                 "scale_reason": (
@@ -1104,7 +1250,11 @@ def _unconstrained_draws(run_id: str, d: draws.Draws) -> tuple[np.ndarray, list[
                 ),
             },
         )
-    return unc.reshape(n_chain, n_draw, -1), list(m.param_unc_names()), {"scale": "unconstrained"}
+    return (
+        unc[:, selected].reshape(n_chain, n_draw, -1),
+        [names[i] for i in selected],
+        {"scale": "unconstrained"},
+    )
 
 
 class _GeometryPending(RunError):
@@ -1120,7 +1270,7 @@ def _fisher_z(r: float, n_eff: float) -> float:
 
 
 def _block_of(name: str) -> str:
-    return name.split(".")[0].split("[")[0]
+    return name.split(".")[0].split("[")[0].split(":")[0]
 
 
 def _mp_condition(p: int, n_eff: float) -> float:
@@ -1156,10 +1306,12 @@ def run_geometry(
         )
     d = draws.load(run_id)
     try:
-        u3, names, scale = _unconstrained_draws(run_id, d)
+        u3, names, scale = _unconstrained_draws(run_id, d, params=params, max_dims=max_dims)
     except _GeometryPending as pending:
         # Not an error: the artifact is being built off the caller's thread.
         return {"run_id": run_id, "status": "preparing", "note": str(pending)}
+    if d.header_warning:
+        scale["header_warning"] = d.header_warning
 
     if params:
         want = set(params)
@@ -1338,26 +1490,64 @@ def run_geometry(
 
 
 def posterior_mean_inits(run_id: str) -> dict:
-    """Posterior (or estimate) mean per parameter, shaped as CmdStan inits, for
-    warm-starting another run.
+    """Return a shaped estimate or a valid posterior warm start.
 
-    Every rank is supported: with dims recorded in the sidecar this is just the
-    mean over the chain and draw axes. The previous version parsed flat CSV names
-    and silently skipped anything with two or more dots -- so warm-starting a model
-    with a matrix parameter looked like it worked while Stan default-inited it.
-
-    No check that the source run's model matches the target's, deliberately:
-    warm-starting a RELATED model is the point (same source with more data, a
-    centered->non-centered rewrite), and CmdStan ignores an init name the model
-    does not have while default-initing one the init omits. An init cannot bias a
-    posterior, so a mismatch costs warmup, not correctness.
+    A constrained mean can leave a curved support. Verify the mean against the
+    model transform, then use a stored draw when the mean is invalid.
     """
+    import compile as _compile
+    import density
+
     meta = runstore.read_meta(run_id)
+    inputs = runstore.load_inputs(run_id)
+    source = inputs["source"]
+    if source is not None and inputs.get("source_manifest"):
+        source = _compile.restore_source(source, inputs["source_manifest"])
     if meta.get("method") == "optimize":
-        return {k: v for k, v in runstore.load_estimate(run_id).items() if k != "lp__"}
+        shaped = runstore.load_initialization(run_id)
+        if shaped is not None:
+            if source is not None:
+                model = density.get_model(source, inputs["data"])
+                unc = density.unconstrain_parameters(model, shaped)
+                return density.constrained_values(
+                    list(model.param_names()), model.param_constrain(unc)
+                )
+            return shaped
+        # Old estimates retain flattened CSV names. Reassemble containers rather
+        # than letting CmdStan silently ignore their element names.
+        estimate = {k: v for k, v in runstore.load_estimate(run_id).items() if k != "lp__"}
+        return density.constrained_values(list(estimate), list(estimate.values()))
     d = draws.load(run_id)
-    inits: dict = {}
-    for name, arr in d.params.items():
-        mean = np.asarray(arr).mean(axis=(0, 1))
-        inits[name] = float(mean) if mean.ndim == 0 else mean.tolist()
-    return inits
+    if source is None:
+        # Historical runs may predate input persistence. Keep their shaped
+        # means available, but record the missing support check explicitly.
+        meta["initialization_warning"] = (
+            "legacy run has no model source; warm-start support is unverified"
+        )
+        runstore.write_meta(run_id, meta)
+        return {name: np.asarray(arr).mean(axis=(0, 1)).tolist() for name, arr in d.params.items()}
+    model = density.get_model(source, inputs["data"])
+    names = list(model.param_names())
+    constrained = _constrained_matrix(d, names)
+
+    def valid(values: np.ndarray) -> dict | None:
+        if not np.isfinite(values).all():
+            return None
+        nested = density.constrained_values(names, values)
+        try:
+            unc = density.unconstrain_parameters(model, nested)
+            restored = model.param_constrain(unc)
+        except (RuntimeError, ValueError):
+            return None
+        # A transform roundtrip tests support even when *_free only tests a
+        # weaker condition, as for nonzero, nonunit unit_vector inputs.
+        if np.isfinite(unc).all() and np.allclose(values, restored, rtol=1e-8, atol=1e-10):
+            return nested
+        return None
+
+    if (mean := valid(constrained.mean(axis=0))) is not None:
+        return mean
+    for row in constrained:
+        if (state := valid(row)) is not None:
+            return state
+    raise RunError(f"run {run_id!r} has no valid constrained state for a warm start")

@@ -15,6 +15,8 @@ offload of blocking work via asyncio.to_thread).
 """
 
 import asyncio
+from collections.abc import Callable
+from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
@@ -28,9 +30,9 @@ from sample import MANAGER
 mcp = MCPServer("stan-mcp")
 
 
-def _safe(fn, *args, **kwargs):
+def _safe(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     try:
-        return fn(*args, **kwargs)
+        return diagnostics._json_safe(fn(*args, **kwargs))
     except Exception as exc:
         return as_error_dict(exc)
 
@@ -54,7 +56,7 @@ async def compile_model(
 
 
 @mcp.tool()
-async def register_data(data) -> dict:
+async def register_data(data: dict[str, Any] | str | None) -> dict:
     """Prefer a file input: set `data="/absolute/path/data.json"`.
 
     Use an absolute path to a file on the MCP server. Inline JSON is a fallback
@@ -65,7 +67,7 @@ async def register_data(data) -> dict:
 
 
 @mcp.tool()
-async def validate_data(stan: str, data=None) -> dict:
+async def validate_data(stan: str, data: dict[str, Any] | str | None = None) -> dict:
     """Prefer file inputs: `stan="/absolute/path/model.stan"`, `data="/absolute/path/data.json"`.
 
     Use absolute paths to files on the MCP server. Reuse `model_id` and `data_id`
@@ -84,7 +86,7 @@ async def list_compiled(limit: int = 50) -> dict:
     return await asyncio.to_thread(_safe, _compile.list_compiled, limit)
 
 
-def _prune_compiled(keep, older_than_days) -> dict:
+def _prune_compiled(keep: int | None, older_than_days: float | None) -> dict:
     result = _compile.prune_compiled(keep, older_than_days)
     # The in-process BridgeStan LRU would otherwise keep serving models whose
     # on-disk artifacts have just been deleted.
@@ -100,7 +102,7 @@ async def prune_compiled(keep: int | None = None, older_than_days: float | None 
 
 
 @mcp.tool()
-async def param_info(stan: str, data=None) -> dict:
+async def param_info(stan: str, data: dict[str, Any] | str | None = None) -> dict:
     """Prefer file inputs: `stan="/absolute/path/model.stan"`, `data="/absolute/path/data.json"`.
 
     Use absolute paths to files on the MCP server. Reuse `model_id` and `data_id`
@@ -113,7 +115,11 @@ async def param_info(stan: str, data=None) -> dict:
 
 @mcp.tool()
 async def log_density(
-    stan: str, data, theta_unc: list[float] | str, propto: bool = True, jacobian: bool = True
+    stan: str,
+    data: dict[str, Any] | str | None,
+    theta_unc: list[float] | str,
+    propto: bool = True,
+    jacobian: bool = True,
 ) -> dict:
     """Prefer file inputs: `stan="/absolute/path/model.stan"`, `data="/absolute/path/data.json"`.
 
@@ -130,7 +136,11 @@ async def log_density(
 
 @mcp.tool()
 async def log_density_gradient(
-    stan: str, data, theta_unc: list[float] | str, propto: bool = True, jacobian: bool = True
+    stan: str,
+    data: dict[str, Any] | str | None,
+    theta_unc: list[float] | str,
+    propto: bool = True,
+    jacobian: bool = True,
 ) -> dict:
     """Prefer file inputs: `stan="/absolute/path/model.stan"`, `data="/absolute/path/data.json"`.
 
@@ -147,7 +157,11 @@ async def log_density_gradient(
 
 @mcp.tool()
 async def log_density_hessian(
-    stan: str, data, theta_unc: list[float] | str, propto: bool = True, jacobian: bool = True
+    stan: str,
+    data: dict[str, Any] | str | None,
+    theta_unc: list[float] | str,
+    propto: bool = True,
+    jacobian: bool = True,
 ) -> dict:
     """Prefer file inputs: `stan="/absolute/path/model.stan"`, `data="/absolute/path/data.json"`.
 
@@ -165,7 +179,7 @@ async def log_density_hessian(
 @mcp.tool()
 async def param_constrain(
     stan: str,
-    data,
+    data: dict[str, Any] | str | None,
     theta_unc: list[float] | str,
     include_tp: bool = False,
     include_gq: bool = False,
@@ -184,7 +198,9 @@ async def param_constrain(
 
 
 @mcp.tool()
-async def param_unconstrain(stan: str, data, constrained: dict | str) -> dict:
+async def param_unconstrain(
+    stan: str, data: dict[str, Any] | str | None, constrained: dict | str
+) -> dict:
     """Prefer file inputs: `stan="/absolute/path/model.stan"`, `data="/absolute/path/data.json"`.
 
     Use absolute paths to files on the MCP server. Reuse `model_id` and `data_id`
@@ -198,7 +214,11 @@ async def param_unconstrain(stan: str, data, constrained: dict | str) -> dict:
 
 @mcp.tool()
 async def check_gradient(
-    stan: str, data, theta_unc: list[float] | str, eps: float = 1e-6, tol: float = 1e-4
+    stan: str,
+    data: dict[str, Any] | str | None,
+    theta_unc: list[float] | str,
+    eps: float = 1e-6,
+    tol: float = 1e-4,
 ) -> dict:
     """Prefer file inputs: `stan="/absolute/path/model.stan"`, `data="/absolute/path/data.json"`.
 
@@ -215,10 +235,10 @@ async def check_gradient(
 @mcp.tool()
 async def start_run(
     stan: str,
-    data=None,
+    data: dict[str, Any] | str | None = None,
     method: str = "sample",
     seed: int | None = None,
-    inits=None,
+    inits: dict[str, Any] | list[dict[str, Any] | str] | str | float | None = None,
     method_args: dict | None = None,
     inits_from: str | None = None,
 ) -> dict:
@@ -228,6 +248,10 @@ async def start_run(
     handles for repeated calls. Inline Stan and JSON strings are fallbacks
     when files are unavailable. Model source and data contents are saved with
     the run, so later file changes do not alter its stored inputs.
+
+    Prefer `inits="/absolute/path/inits.json"` when providing initial values.
+    Per-chain JSON paths are supported. Inline objects and numeric initialization
+    radii remain available. Initializer file contents are saved with the run.
 
     For `generate_quantities`, prefer `method_args={"csv_files": ["/absolute/path/chain.csv"]}`
     for external CmdStan fitted parameters. A single CSV path also works.
@@ -240,7 +264,10 @@ async def start_run(
 
     Start a background inference run (sample/optimize/variational/pathfinder/
     laplace/generate_quantities). Returns a run_id immediately. `inits_from` warm-
-    starts at another run's posterior/estimate mean (ignored if `inits` is set)."""
+    starts at a shaped estimate or verified posterior mean, using a stored draw
+    when the mean violates constraints (ignored if `inits` is set).
+    Optimize defaults to `jacobian=False` and Laplace to `jacobian=True`.
+    Set `method_args.jacobian` explicitly to align a separately optimized mode."""
     return await asyncio.to_thread(
         _safe, MANAGER.start_run, stan, data, method, seed, inits, method_args, inits_from
     )
@@ -392,13 +419,19 @@ async def get_run_geometry(
 
 @mcp.tool()
 async def run_loo(run_id: str, var_name: str = "log_lik") -> dict:
-    """PSIS-LOO cross-validation for a run (model must emit a `log_lik` GQ)."""
+    """PSIS-LOO for MCMC draws, including GQ snapshots of MCMC draws.
+
+    The model must emit a `log_lik` GQ. Approximate fits require target/proposal
+    correction and are rejected. External CSVs must retain sampling metadata."""
     return await asyncio.to_thread(_safe, diagnostics.run_loo, run_id, var_name)
 
 
 @mcp.tool()
 async def compare_runs(run_ids: list[str], var_name: str = "log_lik") -> dict:
-    """Rank runs by PSIS-LOO (best first). Model must emit a `log_lik` GQ."""
+    """Rank MCMC posterior runs by PSIS-LOO, best first.
+
+    Each model must emit a `log_lik` GQ. GQ runs must retain verified MCMC
+    provenance. Approximate fits require an unsupported importance correction."""
     return await asyncio.to_thread(_safe, diagnostics.compare_runs, run_ids, var_name)
 
 

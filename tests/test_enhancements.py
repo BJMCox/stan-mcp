@@ -167,7 +167,7 @@ def _typed_run(tmp_path, monkeypatch, method="sample", ragged=False):
     diagnostics.draws.schema_path(rid).write_text(
         json.dumps(
             {
-                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "schema": 2,
                 "files": ["a.csv", "b.csv"],
                 "params": {"theta": {"dims": [], "cols": [1]}, "z": {"dims": [2], "cols": [2, 3]}},
                 "sampler_stats": {"lp__": {"dims": [], "cols": [0]}},
@@ -240,7 +240,7 @@ def _typed_run_wide(tmp_path, monkeypatch, method="sample"):
     diagnostics.draws.schema_path(rid).write_text(
         json.dumps(
             {
-                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "schema": 2,
                 "files": ["chain0.csv", "chain1.csv"],
                 "params": {
                     "theta": {"dims": [], "cols": [1]},
@@ -291,12 +291,9 @@ def test_verdict_unknown_when_nothing_was_measured():
     }
 
 
-def test_verdict_stays_pass_when_a_warning_accompanies_measured_stats():
-    """A *_warning key must not, by itself, flip a partially-measured run to
-    "warn" -- that would read as "the model is pathological" when the truth is
-    "one statistic could not be checked"."""
+def test_verdict_is_unknown_when_required_stats_are_unavailable():
     v = diagnostics._verdict({"divergences": 0, "sampler_stats_warning": "boom"})
-    assert v == {"verdict": "pass", "issues": []}
+    assert v == {"verdict": "unknown", "issues": []}
 
 
 def test_extract_draws_by_chain(tmp_path, monkeypatch):
@@ -426,7 +423,7 @@ def _write_run_with_stats(run_id, *, diverging, tree_depth, max_td=10):
     diagnostics.draws.schema_path(run_id).write_text(
         json.dumps(
             {
-                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "schema": 2,
                 "files": files,
                 "params": {"theta": {"dims": [], "cols": [0]}},
                 "sampler_stats": {
@@ -574,7 +571,7 @@ def _write_typed_csv_run(run_id):
     diagnostics.draws.schema_path(run_id).write_text(
         json.dumps(
             {
-                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "schema": 2,
                 "files": ["c.csv"],
                 "params": {
                     "theta": {"dims": [], "cols": [1]},
@@ -643,7 +640,7 @@ def test_posterior_mean_inits_handles_matrices(tmp_path, monkeypatch):
     diagnostics.draws.schema_path(rid).write_text(
         json.dumps(
             {
-                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "schema": 2,
                 "files": ["a.csv"],
                 "params": {
                     "s": {"dims": [], "cols": [1]},
@@ -848,7 +845,7 @@ def test_extract_draws_by_chain_for_an_approximate_method(tmp_path, monkeypatch)
     diagnostics.draws.schema_path("variational-0001").write_text(
         json.dumps(
             {
-                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "schema": 2,
                 "files": ["c-1.csv", "c-2.csv"],
                 "params": {"theta": {"dims": [], "cols": [1]}},
                 "sampler_stats": {"lp__": {"dims": [], "cols": [0]}},
@@ -890,7 +887,7 @@ def test_run_summary_caps_rows(tmp_path, monkeypatch):
     diagnostics.draws.schema_path(rid).write_text(
         json.dumps(
             {
-                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "schema": 2,
                 "files": ["a.csv"],
                 "params": {"beta": {"dims": [50], "cols": list(range(1, 51))}},
                 "sampler_stats": {"lp__": {"dims": [], "cols": [0]}},
@@ -943,7 +940,7 @@ def test_run_summary_caps_rows_for_an_approximate_method(tmp_path, monkeypatch):
     diagnostics.draws.schema_path(rid).write_text(
         json.dumps(
             {
-                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "schema": 2,
                 "files": ["c-1.csv"],
                 "params": {"beta": {"dims": [20], "cols": list(range(1, 21))}},
                 "sampler_stats": {"lp__": {"dims": [], "cols": [0]}},
@@ -1046,7 +1043,7 @@ def test_summary_from_draws_keeps_significant_figures(tmp_path, monkeypatch):
     diagnostics.draws.schema_path(rid).write_text(
         json.dumps(
             {
-                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "schema": 2,
                 "files": ["c.csv"],
                 "params": {"tiny": {"dims": [], "cols": [1]}},
                 "sampler_stats": {"lp__": {"dims": [], "cols": [0]}},
@@ -1301,7 +1298,7 @@ def _write_divergent_run(run_id, n_div=20, planted=3.0, n_chain=2, n_draw=500, s
     diagnostics.draws.schema_path(run_id).write_text(
         json.dumps(
             {
-                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "schema": 2,
                 "files": files,
                 "params": {
                     "v": {"dims": [], "cols": [2]},
@@ -1402,7 +1399,7 @@ def test_pathologies_labels_matrix_elements_in_stan_syntax(tmp_path, monkeypatch
     diagnostics.draws.schema_path(rid).write_text(
         json.dumps(
             {
-                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "schema": 2,
                 "files": ["a.csv"],
                 "params": {"m": {"dims": [2, 2], "cols": [2, 4, 3, 5]}},
                 "sampler_stats": {
@@ -1484,7 +1481,7 @@ def test_constrained_matrix_maps_bridgestan_names_via_recorded_dims(tmp_path, mo
     diagnostics.draws.schema_path(rid).write_text(
         json.dumps(
             {
-                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "schema": 2,
                 "files": ["a.csv"],
                 "params": {
                     "s": {"dims": [], "cols": [1]},
@@ -1541,7 +1538,7 @@ def _geom_run(monkeypatch, tmp_path, cols: dict, n_chain=4, n_draw=500):
     diagnostics.draws.schema_path(rid).write_text(
         json.dumps(
             {
-                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "schema": 2,
                 "files": ["chain0.csv"],
                 "params": {"dummy": {"dims": [], "cols": [1]}},
                 "sampler_stats": {"lp__": {"dims": [], "cols": [0]}},
@@ -1551,7 +1548,7 @@ def _geom_run(monkeypatch, tmp_path, cols: dict, n_chain=4, n_draw=500):
     monkeypatch.setattr(
         diagnostics,
         "_unconstrained_draws",
-        lambda rid, d: (u3, names, {"scale": "unconstrained"}),
+        lambda rid, d, **kwargs: (u3, names, {"scale": "unconstrained"}),
     )
     _stub_stansummary(monkeypatch, rid)
     return rid
@@ -1695,7 +1692,7 @@ def test_geometry_reports_preparing_not_an_error(tmp_path, monkeypatch):
     diagnostics.draws.schema_path(rid).write_text(
         json.dumps(
             {
-                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "schema": 2,
                 "files": ["chain0.csv"],
                 "params": {"x": {"dims": [], "cols": [1]}},
                 "sampler_stats": {"lp__": {"dims": [], "cols": [0]}},
@@ -1703,7 +1700,7 @@ def test_geometry_reports_preparing_not_an_error(tmp_path, monkeypatch):
         )
     )
 
-    def _pending(rid, d):
+    def _pending(rid, d, **kwargs):
         raise diagnostics._GeometryPending("building")
 
     monkeypatch.setattr(diagnostics, "_unconstrained_draws", _pending)
@@ -1744,7 +1741,7 @@ def test_geometry_falls_back_when_draws_cannot_be_unconstrained(tmp_path, monkey
     diagnostics.draws.schema_path(rid).write_text(
         json.dumps(
             {
-                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "schema": 2,
                 "files": files,
                 "params": {
                     "theta": {"dims": [3], "cols": [1, 2, 3]},
@@ -2204,7 +2201,7 @@ def test_idata_with_loglik_is_built_from_typed_arrays(tmp_path, monkeypatch):
     diagnostics.draws.schema_path(rid).write_text(
         json.dumps(
             {
-                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "schema": 2,
                 "files": ["a.csv"],
                 "params": {
                     "theta": {"dims": [], "cols": [1]},
@@ -2239,7 +2236,7 @@ def test_missing_loglik_on_a_run_with_no_parameters_reads_as_prose(tmp_path, mon
     diagnostics.draws.schema_path(rid).write_text(
         json.dumps(
             {
-                "schema": diagnostics.draws.SCHEMA_VERSION,
+                "schema": 2,
                 "files": ["a.csv"],
                 "params": {},
                 "sampler_stats": {"lp__": {"dims": [], "cols": [0]}},
