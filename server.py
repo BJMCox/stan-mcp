@@ -16,7 +16,7 @@ offload of blocking work via asyncio.to_thread).
 
 import asyncio
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 import compile as _compile
 import density
@@ -25,7 +25,7 @@ import runstore
 from errors import StanMcpError, as_error_dict
 from sample import MANAGER
 
-mcp = FastMCP("stan-mcp")
+mcp = MCPServer("stan-mcp")
 
 
 def _safe(fn, *args, **kwargs):

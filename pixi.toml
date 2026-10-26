@@ -14,7 +14,7 @@ format = "ruff format ."
 typecheck = "pyright"
 
 [dependencies]
-python = ">=3.11,<3.13"
+python = ">=3.15.2,<3.16"
 cxx-compiler = "*"
 make = "*"
 numpy = "*"
@@ -29,6 +29,6 @@ pyright = "*"
 psutil = ">=7.2.2,<8"
 
 [pypi-dependencies]
-mcp = ">=1.0"
+mcp = ">=2.3,<3"
 bridgestan = "*"
 cmdstanpy = "*"
