@@ -19,6 +19,24 @@ source. `data` also accepts a dict, a path ending in `.json`, or a raw JSON
 string. See `compile.resolve_source` / `compile.canonical_data` in
 [docs/internals.md](internals.md).
 
+## Batch files and jobs
+
+Prefer absolute server-local JSON request paths. Numerical arrays live in
+Safetensors shards. See [batches.md](batches.md) for schemas and examples.
+
+| Tool | Input | Result |
+|---|---|---|
+| `evaluate_batch(request_file)` | JSON request naming a `.stan`, data `.json` and points manifest | Background `job_id`/`run_id` |
+| `compare_batches(request_file)` | JSON request naming supplied left/right result manifests | Background comparison `job_id`/`run_id` |
+| `get_batch_result(job_id)` | Persisted batch ID | Bounded summary and absolute output manifest path |
+| `resume_batch(job_id)` | Interrupted batch ID | Resume unfinished shards after identity and hash checks |
+
+Reuse `get_run_status`, `get_run_progress`, `await_run` and `cancel_run` for
+batch IDs. `list_runs` and `prune_runs` include batches. Batch results use
+`get_batch_result`; inference summary, draw and diagnostic tools apply to
+inference runs. `rerun` applies to inference; use a new request or `resume_batch`
+for batches. Completed comparison jobs may have failed or inconclusive verdicts.
+
 ## Compile / metadata
 
 ### `compile_model(stan, stanc_args=None, warn_pedantic=False) -> dict`

@@ -20,6 +20,7 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
+import batchjobs
 import compile as _compile
 import density
 import diagnostics
@@ -28,6 +29,7 @@ from errors import StanMcpError, as_error_dict
 from sample import MANAGER
 
 mcp = MCPServer("stan-mcp")
+BATCH_MANAGER = batchjobs.BatchManager()
 
 
 def _safe(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -274,21 +276,90 @@ async def start_run(
 
 
 @mcp.tool()
+async def evaluate_batch(request_file: str) -> dict:
+    """Use an absolute server-local JSON request path; keep numerical arrays in Safetensors files.
+
+    The request names `stan` (.stan path preferred), `data` (.json path preferred),
+    a `points` manifest path, and optional `quantities`, target flags, seed and workers.
+    Evaluate many points in one model/data context. Outputs include log_density,
+    gradient, Hessian and HVP. Native derivatives use Stan unconstrained coordinates.
+    Curvature uses an autodiff BridgeStan build, never implicit finite differences.
+    Returns a background job_id/run_id. Use get_run_progress, await_run, cancel_run,
+    get_batch_result and resume_batch. See docs/batches.md for the file schema."""
+    return await asyncio.to_thread(_safe, BATCH_MANAGER.start, "evaluate", request_file)
+
+
+@mcp.tool()
+async def compare_batches(request_file: str) -> dict:
+    """Use an absolute server-local JSON request path with `left` and `right` result manifests.
+
+    Compare supplied Safetensors files; this tool does not execute external runtimes.
+    Match constrained points and explicit target flags. Compare native derivatives
+    only with matching declared coordinates, names/order and HVP directions.
+    Explicit per-quantity atol/rtol enables pass/fail; otherwise report errors only.
+    Optional constant-offset and caller-supplied finite-difference stencils require
+    explicit settings. Unstable finite differences are inconclusive.
+    Returns a background job_id/run_id. Use get_batch_result for a bounded summary
+    and discrepancy manifest. See docs/batches.md for request and artifact schemas."""
+    return await asyncio.to_thread(_safe, BATCH_MANAGER.start, "compare", request_file)
+
+
+@mcp.tool()
+async def get_batch_result(job_id: str) -> dict:
+    """Return a bounded batch summary and absolute output manifest path.
+
+    Numerical arrays stay in Safetensors shards. A completed comparison job can
+    report failed or inconclusive checks; job completion is not numerical agreement."""
+    return await asyncio.to_thread(_safe, BATCH_MANAGER.result, job_id)
+
+
+@mcp.tool()
+async def resume_batch(job_id: str) -> dict:
+    """Resume unfinished shards of an interrupted batch using its owned file snapshots.
+
+    Verify inputs, settings, seed, build identity and completed output hashes.
+    Preserve completed shard bytes. Changed computation requires a new job.
+    A job interrupted before preparation finished cannot resume."""
+    return await asyncio.to_thread(_safe, BATCH_MANAGER.resume, job_id)
+
+
+def _batch_job(run_id: str) -> bool:
+    return runstore.read_meta(run_id).get("method") in {"evaluate_batch", "compare_batches"}
+
+
+def _run_status(run_id: str) -> dict:
+    return BATCH_MANAGER.status(run_id) if _batch_job(run_id) else MANAGER.get_run_status(run_id)
+
+
+def _run_progress(run_id: str) -> dict:
+    return (
+        BATCH_MANAGER.progress(run_id) if _batch_job(run_id) else MANAGER.get_run_progress(run_id)
+    )
+
+
+def _cancel_run(run_id: str) -> dict:
+    return BATCH_MANAGER.cancel(run_id) if _batch_job(run_id) else MANAGER.cancel_run(run_id)
+
+
+@mcp.tool()
 async def get_run_status(run_id: str) -> dict:
-    """Non-blocking status of a run."""
-    return await asyncio.to_thread(_safe, MANAGER.get_run_status, run_id)
+    """Non-blocking status of an inference run or batch job."""
+    return await asyncio.to_thread(_safe, _run_status, run_id)
 
 
 @mcp.tool()
 async def get_run_progress(run_id: str) -> dict:
-    """Run status plus elapsed wall-clock seconds."""
-    return await asyncio.to_thread(_safe, MANAGER.get_run_progress, run_id)
+    """Inference status and elapsed time, or batch status and completed row/shard counts."""
+    return await asyncio.to_thread(_safe, _run_progress, run_id)
 
 
 @mcp.tool()
 async def cancel_run(run_id: str) -> dict:
-    """Cancel a run. Only queued (not-yet-started) runs can be stopped."""
-    return await asyncio.to_thread(_safe, MANAGER.cancel_run, run_id)
+    """Cancel owned inference processes or interrupt a batch, preserving completed batch shards.
+
+    Batch compilation finishes before cancellation takes effect; active numerical
+    workers stop immediately."""
+    return await asyncio.to_thread(_safe, _cancel_run, run_id)
 
 
 @mcp.tool()
@@ -302,6 +373,8 @@ async def rerun(run_id: str) -> dict:
 async def await_run(run_id: str, timeout: float | None = None) -> dict:
     """Block server-side until the run finishes (or timeout), then return its status."""
     try:
+        if await asyncio.to_thread(_batch_job, run_id):
+            return await BATCH_MANAGER.await_job(run_id, timeout=timeout)
         return await MANAGER.await_run(run_id, timeout=timeout)
     except StanMcpError as exc:
         return as_error_dict(exc)
@@ -436,4 +509,7 @@ async def compare_runs(run_ids: list[str], var_name: str = "log_lik") -> dict:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    try:
+        mcp.run()
+    finally:
+        BATCH_MANAGER.shutdown()

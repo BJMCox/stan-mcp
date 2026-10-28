@@ -40,7 +40,7 @@ exec sh -c "$6"
     async with stdio_client(params) as (reader, writer):
         async with ClientSession(reader, writer) as session:
             await session.initialize()
-            assert len((await session.list_tools()).tools) == 28
+            assert len((await session.list_tools()).tools) == 32
             result = await session.call_tool("register_data", {"data": str(data)})
             handle = json.loads(next(item.text for item in result.content if item.type == "text"))[
                 "data_id"

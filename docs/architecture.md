@@ -1,6 +1,6 @@
 # Architecture
 
-`server.py` registers 28 MCP tools with `MCPServer`. Blocking work runs in
+`server.py` registers 32 MCP tools with `MCPServer`. Blocking work runs in
 `asyncio.to_thread`. Tool errors become structured error dictionaries. Results
 normalize nonfinite numbers recursively before MCP serialization.
 
@@ -8,6 +8,10 @@ normalize nonfinite numbers recursively before MCP serialization.
 |---|---|
 | `compile.py` | Resolve files and handles, snapshot includes, retain compiler settings, identify and build artifacts |
 | `density.py` | Bound model cache, serialize native calls, density derivatives and parameter transforms |
+| `batchstore.py` | Validate, snapshot and publish bounded Safetensors shards with content hashes |
+| `batcheval.py` | Reuse process-owned native contexts across point shards, select autodiff curvature builds |
+| `batchcompare.py` | Compare declared reference outputs and explicit finite-difference stencils |
+| `batchjobs.py` | Persist batch jobs, cap worker processes, checkpoint, cancel and resume |
 | `toolchain.py` | Provision BridgeStan and CmdStan without contaminating protocol stdout |
 | `sample.py` | Submit background inference, cancel owned processes, await completion, rerun saved inputs |
 | `runstore.py` | Reserve run IDs, recover abandoned owners, store inputs, outputs and metadata, prune runs |

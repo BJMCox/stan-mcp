@@ -8,7 +8,7 @@ platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 [tasks]
 serve = "python server.py"
 test = "pytest -q"
-test-live = "STAN_MCP_LIVE=1 pytest -q tests/test_live_smoke.py"
+test-live = "STAN_MCP_LIVE=1 pytest -q tests/test_live_smoke.py tests/test_batch_eval.py tests/test_batch_live.py"
 lint = "ruff check ."
 format = "ruff format ."
 typecheck = "pyright"
@@ -33,3 +33,4 @@ mcp = ">=2.3,<3"
 bridgestan = "*"
 cmdstanpy = "*"
 stanio = ">=0.5.1, <0.6"
+safetensors = ">=0.8.0, <0.9"

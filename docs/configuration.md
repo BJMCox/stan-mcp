@@ -9,9 +9,9 @@ There is no config file.
 |----------|---------|---------|
 | `STAN_MCP_HOME` | `~/stan-mcp` | Root directory for compiled artifacts, registered data, and runs (`config.home()`) |
 | `STAN_MCP_LRU_SIZE` | `8` | Max BridgeStan `StanModel` objects kept loaded in memory at once (`config.MODEL_LRU_SIZE`, read once at import) |
-| `STAN_MCP_MAX_WORKERS` | `2` | Size of the background run thread pool (`config.max_workers()`, read at `RunManager` construction) |
+| `STAN_MCP_MAX_WORKERS` | `2` | Size of the inference thread pool and, separately, the shared batch worker cap; each batch defaults to one process |
 | `STAN_MCP_MAX_PARALLEL_CHAINS` | `cpu_count // max_workers` | Per-run cap on concurrently executing CmdStan chain subprocesses (`config.max_parallel_chains()`, applied as the `parallel_chains` default for `sample`) |
-| `STAN_MCP_LIVE` | unset | Not read by application code — gates `tests/test_live_smoke.py` via `pytest.mark.skipif`; set to `1` to run the live-toolchain smoke test |
+| `STAN_MCP_LIVE` | unset | Gates native inference and batch tests; set to `1` to run `pixi run test-live` |
 
 `STAN_MCP_LRU_SIZE` is read once at module import (`int(os.environ.get(...) or
 8)`), so it must be set before the process starts. `STAN_MCP_MAX_WORKERS` is

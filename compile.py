@@ -237,6 +237,14 @@ def restore_source(source: str, manifest: dict[str, Any]) -> SourceSnapshot:
     return SourceSnapshot(source, manifest)
 
 
+def with_make_args(source: str, make_args: list[str]) -> SourceSnapshot:
+    """Bind explicit native build arguments to an immutable compilation identity."""
+    source = refresh_source(resolve_source(source))
+    manifest = {**source.manifest, "make_args": list(make_args)}
+    manifest["model_id"] = _identity(manifest)
+    return SourceSnapshot(str(source), manifest)
+
+
 # Per-model-id compile locks: two concurrent runs / density calls that miss the
 # cache for the same model must not drive bridgestan/cmdstan builds on the same
 # artifact targets at once (concurrent make on one .so/exe corrupts it).
@@ -581,7 +589,10 @@ def compiled_so(source: str, stanc_args: list[str] | None = None) -> Path:
         expected = stan_path.parent / f"{stan_path.stem}_model.so"
         if expected.exists():  # re-check under lock: another thread may have built it
             return expected
-        built = bridgestan.compile_model(stan_path, stanc_args=source.manifest["stanc_args"])
+        options: dict[str, Any] = {"stanc_args": source.manifest["stanc_args"]}
+        if "make_args" in source.manifest:
+            options["make_args"] = source.manifest["make_args"]
+        built = bridgestan.compile_model(stan_path, **options)
         return Path(built)
 
 

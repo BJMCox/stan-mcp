@@ -37,9 +37,8 @@ Single test: `pixi run pytest tests/test_density_eval.py::test_log_density_shape
 (swap in any test file/node id; `pixi run` prefixes any command with the
 project's pixi env, not just the declared tasks). `pytest.ini` sets
 `asyncio_mode = auto`, so async test functions need no `@pytest.mark.asyncio`
-marker. Live tests (`tests/test_live_smoke.py`) are `skipif`-gated on
-`STAN_MCP_LIVE=1` since they compile and sample a real Bernoulli model — every
-other test in `tests/` runs against fakes (`tests/fakes.py`) and needs no
+marker. Native inference and batch tests are gated on `STAN_MCP_LIVE=1` because
+they compile and execute real models. Ordinary tests use fakes and need no
 toolchain.
 
 ## Quickstart
@@ -104,6 +103,21 @@ the original files change or disappear. Draw
 summaries exclude saved warmup, intermediate optimization iterations, and the
 variational mean row. Use either `csv_files` or `from_run_id`, never both.
 
+Evaluate many points through file-based batches:
+
+```python
+evaluate_batch(request_file="/absolute/evaluate.json")
+await_run(run_id="<returned job_id>")
+get_batch_result(job_id="<returned job_id>")
+compare_batches(request_file="/absolute/compare.json")
+```
+
+Requests name `.stan`, `.json` and Safetensors manifest paths. Batches support
+log density, gradient, autodiff Hessian/HVP, explicit coordinate comparisons,
+bounded discrepancy reports, cancellation and resume. See
+[the batch schema](docs/batches.md) and the runnable
+[Gaussian example](examples/batch_gaussian.py).
+
 ## Documentation
 
 | Page | Contents |
@@ -113,6 +127,7 @@ variational mean row. Use either `csv_files` or `from_run_id`, never both.
 | [docs/architecture.md](docs/architecture.md) | Module map, data flow, design decisions |
 | [docs/internals.md](docs/internals.md) | Developer reference: internal functions and types |
 | [docs/remote.md](docs/remote.md) | SSH stdio transport and remote file paths |
+| [docs/batches.md](docs/batches.md) | Batched density/derivatives, reference comparisons, Safetensors schema and resume |
 
 Full design rationale: `docs/2026-07-14-stan-mcp-design.md` (local-only, not
 pushed to remotes).
