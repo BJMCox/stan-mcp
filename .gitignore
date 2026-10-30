@@ -12,3 +12,4 @@ docs/*
 !docs/internals.md
 !docs/remote.md
 !docs/batches.md
+!AGENTS.md

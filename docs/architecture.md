@@ -1,25 +1,32 @@
 # Architecture
 
-`server.py` registers 32 MCP tools with `MCPServer`. Blocking work runs in
+`stan_mcp/server.py` registers 32 MCP tools with `MCPServer`. Blocking work runs in
 `asyncio.to_thread`. Tool errors become structured error dictionaries. Results
 normalize nonfinite numbers recursively before MCP serialization.
 
 | Module | Responsibility |
 |---|---|
-| `compile.py` | Resolve files and handles, snapshot includes, retain compiler settings, identify and build artifacts |
-| `density.py` | Bound model cache, serialize native calls, density derivatives and parameter transforms |
-| `batchstore.py` | Validate, snapshot and publish bounded Safetensors shards with content hashes |
-| `batcheval.py` | Reuse process-owned native contexts across point shards, select autodiff curvature builds |
-| `batchcompare.py` | Compare declared reference outputs and explicit finite-difference stencils |
-| `batchjobs.py` | Persist batch jobs, cap worker processes, checkpoint, cancel and resume |
-| `toolchain.py` | Provision BridgeStan and CmdStan without contaminating protocol stdout |
-| `sample.py` | Submit background inference, cancel owned processes, await completion, rerun saved inputs |
-| `runstore.py` | Reserve run IDs, recover abandoned owners, store inputs, outputs and metadata, prune runs |
-| `draws.py` | Validate typed CSV sidecars and headers, stream numeric data, preserve component shapes |
-| `diagnostics.py` | Persist fits, summarize, extract, diagnose, inspect geometry, compute LOO, form warm starts |
-| `stansummary.py` | Invoke and parse CmdStan's MCMC summaries |
-| `methods.py` | Validate method-specific arguments |
-| `config.py` | Resolve storage roots and concurrency limits |
+| `stan_mcp/compilation.py` | Resolve files and handles, snapshot includes, retain compiler settings, identify and build artifacts |
+| `stan_mcp/density.py` | Bound model cache, serialize native calls, density derivatives and parameter transforms |
+| `stan_mcp/batch/store.py` | Validate, snapshot and publish bounded Safetensors shards with content hashes |
+| `stan_mcp/batch/evaluation.py` | Reuse process-owned native contexts across point shards, select autodiff curvature builds |
+| `stan_mcp/batch/comparison.py` | Compare declared reference outputs and explicit finite-difference stencils |
+| `stan_mcp/batch/jobs.py` | Persist batch jobs, cap worker processes, checkpoint, cancel and resume |
+| `stan_mcp/toolchain.py` | Provision BridgeStan and CmdStan without contaminating protocol stdout |
+| `stan_mcp/inference.py` | Submit background inference, cancel owned processes, await completion, rerun saved inputs |
+| `stan_mcp/runstore.py` | Reserve run IDs, recover abandoned owners, store inputs, outputs and metadata, prune runs |
+| `stan_mcp/draws.py` | Validate typed CSV sidecars and headers, stream numeric data, preserve component shapes |
+| `stan_mcp/fitstorage.py` | Persist fits, raw CSVs and typed sidecars |
+| `stan_mcp/diagnostics.py` | Summarize fits, report sampler health, localize divergences and compute LOO |
+| `stan_mcp/geometry.py` | Inspect posterior conditioning in verified parameter coordinates |
+| `stan_mcp/serialization.py` | Normalize numerical tool responses for JSON |
+| `stan_mcp/stansummary.py` | Invoke and parse CmdStan's MCMC summaries |
+| `stan_mcp/methods.py` | Validate method-specific arguments |
+| `stan_mcp/config.py` | Resolve storage roots and concurrency limits |
+
+`python -m stan_mcp` starts the server. Package imports do not start it.
+Root `server.py` remains a compatibility launcher. `pyproject.toml` holds
+pytest, Ruff and Pyright settings; Pixi owns the environment and dependencies.
 
 ## Source and data
 

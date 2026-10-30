@@ -7,12 +7,10 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
-import compile as compiler
-import density
-import diagnostics
-import draws
-import runstore
-from errors import RunError, ValidationError
+from stan_mcp import compilation as compiler
+from stan_mcp import density, diagnostics, draws, fitstorage, geometry, runstore
+from stan_mcp import inference as sample
+from stan_mcp.errors import RunError, ValidationError
 
 
 def store(tmp_path, monkeypatch, method="sample", columns="lp__,x,g", rows="-1,1,2\n-1,-1,-2\n"):
@@ -29,7 +27,7 @@ def store(tmp_path, monkeypatch, method="sample", columns="lp__,x,g", rows="-1,1
             stan_vars={"x": SimpleNamespace(dimensions=()), "g": SimpleNamespace(dimensions=())},
         ),
     )
-    diagnostics.persist_run(rid, method, fit)
+    fitstorage.persist_run(rid, method, fit)
     return rid
 
 
@@ -104,7 +102,7 @@ def test_failed_csv_copy_retains_every_original(tmp_path, monkeypatch):
     monkeypatch.setattr(runstore.shutil, "copy", fail_second)
     fit = SimpleNamespace(runset=SimpleNamespace(csv_files=paths))
     with pytest.raises(RunError):
-        diagnostics.persist_run(rid, "sample", fit)
+        fitstorage.persist_run(rid, "sample", fit)
     assert all(__import__("pathlib").Path(path).read_text() == "lp__,x\n-1,2\n" for path in paths)
     assert not draws.schema_path(rid).exists()
 
@@ -121,8 +119,8 @@ def test_optimize_persists_csv_and_shaped_warm_start(tmp_path, monkeypatch):
         optimized_params_dict={"lp__": -1, "v.1": 2, "v.2": 3},
         stan_variables=lambda: {"v": np.array([2.0, 3.0])},
     )
-    diagnostics.persist_run(rid, "optimize", fit)
-    assert diagnostics.posterior_mean_inits(rid) == {"v": [2.0, 3.0]}
+    fitstorage.persist_run(rid, "optimize", fit)
+    assert sample.posterior_mean_inits(rid) == {"v": [2.0, 3.0]}
     assert len(runstore.csv_paths(rid)) == 1
     assert not live.exists()
 
@@ -137,19 +135,19 @@ def test_geometry_excludes_gq_and_checks_size_before_transforms(tmp_path, monkey
     )
     monkeypatch.setattr(compiler, "request_so", lambda source: {"status": "ready"})
     monkeypatch.setattr(density, "get_model", lambda *args: model)
-    result, names, scale = diagnostics._unconstrained_draws(rid, draws.load(rid))
+    result, names, scale = geometry._unconstrained_draws(rid, draws.load(rid))
     assert names == ["x"] and result.shape == (1, 2, 1)
     assert scale["scale"] == "constrained"
     model.param_unc_names = lambda: ["x", "y"]
     model.param_unconstrain.reset_mock()
     with pytest.raises(ValidationError):
-        diagnostics._unconstrained_draws(rid, draws.load(rid), max_dims=1)
+        geometry._unconstrained_draws(rid, draws.load(rid), max_dims=1)
     assert not model.param_unconstrain.called
     monkeypatch.setattr(
         compiler, "request_so", lambda source: {"status": "failed", "error": "no compiler"}
     )
     with pytest.raises(RunError):
-        diagnostics._unconstrained_draws(rid, draws.load(rid))
+        geometry._unconstrained_draws(rid, draws.load(rid))
 
 
 def test_invalid_unit_vector_mean_uses_valid_draw(tmp_path, monkeypatch):
@@ -161,11 +159,11 @@ def test_invalid_unit_vector_mean_uses_valid_draw(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(density, "get_model", lambda *args: model)
     with np.errstate(invalid="ignore"):
-        assert diagnostics.posterior_mean_inits(rid) == {"x": 1.0}
+        assert sample.posterior_mean_inits(rid) == {"x": 1.0}
 
 
 def test_published_data_and_initialization_schema_and_strict_json():
-    import server
+    from stan_mcp import server
 
     schemas = {
         tool.name: tool.model_dump(by_alias=True)["inputSchema"]

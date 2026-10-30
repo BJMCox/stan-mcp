@@ -3,9 +3,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-import batchcompare
-import batchstore
-from errors import ValidationError
+from stan_mcp.batch import comparison as batchcompare
+from stan_mcp.batch import store as batchstore
+from stan_mcp.errors import ValidationError
 
 COORDINATES = {"kind": "stan_unconstrained", "names": ["x", "y"], "model_id": "analytic"}
 QUANTITIES = ["log_density", "gradient", "hessian", "hvp"]

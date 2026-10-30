@@ -8,12 +8,9 @@ import numpy as np
 import pytest
 from numpy.typing import DTypeLike
 
-import batcheval
-import batchstore
-import compile as compilation
-import density
-import errors
-import toolchain
+from stan_mcp import compilation, density, errors, toolchain
+from stan_mcp.batch import evaluation as batcheval
+from stan_mcp.batch import store as batchstore
 
 
 class Gaussian:

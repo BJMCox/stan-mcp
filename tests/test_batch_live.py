@@ -6,8 +6,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-import batchjobs
-import batchstore
+from stan_mcp.batch import jobs as batchjobs
+from stan_mcp.batch import store as batchstore
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("STAN_MCP_LIVE") != "1", reason="requires native compiler"
@@ -17,7 +17,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.asyncio
 async def test_server_native_parallel_evaluation_and_external_comparison(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "home"))
-    import server
+    from stan_mcp import server
 
     manager = batchjobs.BatchManager(max_workers=2)
     monkeypatch.setattr(server, "BATCH_MANAGER", manager)

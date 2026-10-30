@@ -15,9 +15,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
-import config
-import errors
-import toolchain
+from stan_mcp import config, errors, toolchain
 
 
 class SourceSnapshot(str):
@@ -274,8 +272,8 @@ def _compile_lock(key: str) -> Iterator[None]:
 # would stall that caller for a whole compile. Requests kick a build off here and
 # return immediately; the caller retries. Single worker, deliberately NOT the
 # RunManager pool, so a build can never occupy a slot an inference run needs.
-_SO_BUILDER: "ThreadPoolExecutor | None" = None
-_SO_BUILDS: dict[str, "Future"] = {}
+_SO_BUILDER: ThreadPoolExecutor | None = None
+_SO_BUILDS: dict[str, Future] = {}
 _SO_GUARD = threading.Lock()
 
 if TYPE_CHECKING:
@@ -284,7 +282,7 @@ if TYPE_CHECKING:
     from cmdstanpy import CmdStanModel
 
 
-def _so_builder() -> "ThreadPoolExecutor":
+def _so_builder() -> ThreadPoolExecutor:
     global _SO_BUILDER
     if _SO_BUILDER is None:
         from concurrent.futures import ThreadPoolExecutor
@@ -299,7 +297,7 @@ def so_path_if_built(source: str, stanc_args: list[str] | None = None) -> Path |
     return p if p.exists() else None
 
 
-def request_so(source: str, stanc_args: list[str] | None = None) -> dict:
+def request_so(source: str, stanc_args: list[str] | None = None) -> dict[str, Any]:
     """Ensure the BridgeStan .so exists, building it in the background if not.
 
     Returns {"status": "ready"|"building"|"failed", ...}. The build goes through
@@ -410,7 +408,7 @@ def register_data(data: object) -> str:
     return did
 
 
-def list_compiled(limit: int = 50) -> dict:
+def list_compiled(limit: int = 50) -> dict[str, Any]:
     """Enumerate the compiled-model and registered-data caches, newest use first.
 
     Without this a caller that loses a `model_id` / `data_id` has no way back to
@@ -439,7 +437,7 @@ def list_compiled(limit: int = 50) -> dict:
     return {"models": models, "data": data}
 
 
-def prune_compiled(keep: int | None = None, older_than_days: float | None = None) -> dict:
+def prune_compiled(keep: int | None = None, older_than_days: float | None = None) -> dict[str, Any]:
     """Prune the compiled/ cache (recomputable). Removes whole model artifact sets
     (.stan/.so/exe) and, when older_than_days is given, stale data-cache entries.
 
@@ -596,7 +594,7 @@ def compiled_so(source: str, stanc_args: list[str] | None = None) -> Path:
         return Path(built)
 
 
-def cmdstan_model(source: str, stanc_args: list[str] | None = None) -> "CmdStanModel":
+def cmdstan_model(source: str, stanc_args: list[str] | None = None) -> CmdStanModel:
     toolchain.ensure_cmdstan()
     import cmdstanpy
 
@@ -613,7 +611,7 @@ def cmdstan_model(source: str, stanc_args: list[str] | None = None) -> "CmdStanM
 
 def compile_model(
     stan: str, stanc_args: list[str] | None = None, warn_pedantic: bool = False
-) -> dict:
+) -> dict[str, Any]:
     try:
         source = refresh_source(resolve_source(stan, stanc_args))
         so = compiled_so(source, stanc_args)
@@ -624,7 +622,7 @@ def compile_model(
             source = prepared
             so = compiled_so(source)
             cm = cmdstan_model(source)
-        out: dict = {
+        out: dict[str, Any] = {
             "model_id": model_id(source, stanc_args),
             "so_path": str(so),
             "exe_path": str(cm.exe_file),

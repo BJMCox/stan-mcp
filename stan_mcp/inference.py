@@ -11,12 +11,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import compile as _compile
-import config
-import diagnostics
-import methods
-import runstore
-from errors import RunError
+import numpy as np
+
+from stan_mcp import compilation as _compile
+from stan_mcp import config, draws, fitstorage, methods, runstore
+from stan_mcp.errors import RunError
 
 
 def _now() -> str:
@@ -101,13 +100,13 @@ def _kill_run_processes(run_id: str) -> list[int]:
     for child in me.children(recursive=True):
         try:
             cmdline = child.cmdline()
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        except psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess:
             continue
         if any(marker in arg for arg in cmdline):
             try:
                 child.kill()
                 killed.append(child.pid)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
+            except psutil.NoSuchProcess, psutil.AccessDenied:
                 pass
     return killed
 
@@ -135,7 +134,7 @@ class RunManager:
     def _compile(self, source: str, stanc_args: list[str] | None) -> Any:
         return _compile.cmdstan_model(source, stanc_args)
 
-    def _runner(self, method: str, model: Any, data: object, kwargs: dict) -> Any:
+    def _runner(self, method: str, model: Any, data: object, kwargs: dict[str, Any]) -> Any:
         kwargs = dict(kwargs)
         # Every method can feed a later warm start or generated-quantities run.
         # Preserve enough precision for constrained values to roundtrip.
@@ -179,11 +178,10 @@ class RunManager:
         return getattr(model, cmd)(data=data, **kwargs)
 
     def _persist(self, run_id: str, method: str, fit: Any) -> None:
-        # diagnostics.persist_run lands in Task 12; tests monkeypatch this seam.
-        diagnostics.persist_run(run_id, method, fit)  # pyright: ignore[reportAttributeAccessIssue]
+        fitstorage.persist_run(run_id, method, fit)
 
     @staticmethod
-    def _stamp_finish(meta: dict) -> None:
+    def _stamp_finish(meta: dict[str, Any]) -> None:
         meta["finished_at"] = _now()
         started = meta.get("created_at")
         if started:
@@ -202,13 +200,13 @@ class RunManager:
         data: object,
         method: str = "sample",
         seed: int | None = None,
-        inits: dict | list | float | int | str | None = None,
-        method_args: dict | None = None,
+        inits: dict[str, Any] | list | float | int | str | None = None,
+        method_args: dict[str, Any] | None = None,
         inits_from: str | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Submit owned inputs; warm starts use a valid mean or stored draw."""
         if inits_from is not None and inits is None:
-            inits = diagnostics.posterior_mean_inits(inits_from)
+            inits = posterior_mean_inits(inits_from)
         if isinstance(inits, str):
             inits = json.loads(Path(inits).expanduser().read_text())
         elif isinstance(inits, list):
@@ -288,7 +286,7 @@ class RunManager:
             raise
         return {"run_id": run_id, "method": method, "status": "running"}
 
-    def rerun(self, run_id: str) -> dict:
+    def rerun(self, run_id: str) -> dict[str, Any]:
         """Start a fresh run from a prior run's persisted source, data, method,
         seed, resolved initialization, and method_args."""
         meta = runstore.read_meta(run_id)
@@ -317,7 +315,7 @@ class RunManager:
             except RuntimeError:
                 pass
 
-    def cancel_run(self, run_id: str) -> dict:
+    def cancel_run(self, run_id: str) -> dict[str, Any]:
         """Cancel queued work or kill this server's live CmdStan subprocesses."""
         with self._lock:
             handle = self._handles.get(run_id)
@@ -367,11 +365,11 @@ class RunManager:
                 else "no live CmdStan process found (still compiling or between chains); retry",
             }
 
-    def get_run_progress(self, run_id: str) -> dict:
+    def get_run_progress(self, run_id: str) -> dict[str, Any]:
         """Status, elapsed wall time, and (for a running sample) draws written so
         far vs expected, parsed from CmdStan's live CSV output."""
         meta = runstore.read_meta(run_id)
-        out: dict = {"run_id": run_id, "status": meta.get("status")}
+        out: dict[str, Any] = {"run_id": run_id, "status": meta.get("status")}
         if meta.get("duration_s") is not None:
             out["elapsed_s"] = meta["duration_s"]
         elif meta.get("created_at"):
@@ -392,10 +390,16 @@ class RunManager:
         return out
 
     def _execute(
-        self, run_id: str, source: str, data: object, method: str, kwargs: dict, handle: _Handle
+        self,
+        run_id: str,
+        source: str,
+        data: object,
+        method: str,
+        kwargs: dict[str, Any],
+        handle: _Handle,
     ) -> None:
         try:
-            meta: dict = {"run_id": run_id, "method": method}
+            meta: dict[str, Any] = {"run_id": run_id, "method": method}
             try:
                 meta = runstore.read_meta(run_id)
                 model = self._compile(source, None)
@@ -455,7 +459,7 @@ class RunManager:
             with self._lock:
                 self._handles.pop(run_id, None)
 
-    def get_run_status(self, run_id: str) -> dict:
+    def get_run_status(self, run_id: str) -> dict[str, Any]:
         meta = runstore.read_meta(run_id)
         out = {k: meta[k] for k in ("run_id", "method", "status") if k in meta}
         if meta.get("stderr"):
@@ -467,7 +471,7 @@ class RunManager:
                 out[w] = meta[w]
         return out
 
-    async def await_run(self, run_id: str, timeout: float | None = None) -> dict:
+    async def await_run(self, run_id: str, timeout: float | None = None) -> dict[str, Any]:
         with self._lock:
             handle = self._handles.get(run_id)
         if handle is None:
@@ -499,6 +503,70 @@ class RunManager:
                 handle.aio_events.remove(waiter)
         meta = runstore.read_meta(run_id)
         return {"status": meta["status"], "run_dir": str(runstore.run_dir(run_id)), "meta": meta}
+
+
+def posterior_mean_inits(run_id: str) -> dict[str, Any]:
+    """Return a shaped estimate or a valid posterior warm start.
+
+    A constrained mean can leave a curved support. Verify the mean against the
+    model transform, then use a stored draw when the mean is invalid.
+    """
+    from stan_mcp import compilation as _compile
+    from stan_mcp import density
+
+    meta = runstore.read_meta(run_id)
+    inputs = runstore.load_inputs(run_id)
+    source = inputs["source"]
+    if source is not None and inputs.get("source_manifest"):
+        source = _compile.restore_source(source, inputs["source_manifest"])
+    if meta.get("method") == "optimize":
+        shaped = runstore.load_initialization(run_id)
+        if shaped is not None:
+            if source is not None:
+                model = density.get_model(source, inputs["data"])
+                unc = density.unconstrain_parameters(model, shaped)
+                return density.constrained_values(
+                    list(model.param_names()), model.param_constrain(unc)
+                )
+            return shaped
+        # Old estimates retain flattened CSV names. Reassemble containers rather
+        # than letting CmdStan silently ignore their element names.
+        estimate = {k: v for k, v in runstore.load_estimate(run_id).items() if k != "lp__"}
+        return density.constrained_values(list(estimate), list(estimate.values()))
+    d = draws.load(run_id)
+    if source is None:
+        # Historical runs may predate input persistence. Keep their shaped
+        # means available, but record the missing support check explicitly.
+        meta["initialization_warning"] = (
+            "legacy run has no model source; warm-start support is unverified"
+        )
+        runstore.write_meta(run_id, meta)
+        return {name: np.asarray(arr).mean(axis=(0, 1)).tolist() for name, arr in d.params.items()}
+    model = density.get_model(source, inputs["data"])
+    names = list(model.param_names())
+    constrained = draws.parameter_matrix(d, names)
+
+    def valid(values: np.ndarray) -> dict[str, Any] | None:
+        if not np.isfinite(values).all():
+            return None
+        nested = density.constrained_values(names, values)
+        try:
+            unc = density.unconstrain_parameters(model, nested)
+            restored = model.param_constrain(unc)
+        except RuntimeError, ValueError:
+            return None
+        # A transform roundtrip tests support even when *_free only tests a
+        # weaker condition, as for nonzero, nonunit unit_vector inputs.
+        if np.isfinite(unc).all() and np.allclose(values, restored, rtol=1e-8, atol=1e-10):
+            return nested
+        return None
+
+    if (mean := valid(constrained.mean(axis=0))) is not None:
+        return mean
+    for row in constrained:
+        if (state := valid(row)) is not None:
+            return state
+    raise RunError(f"run {run_id!r} has no valid constrained state for a warm start")
 
 
 MANAGER = RunManager()

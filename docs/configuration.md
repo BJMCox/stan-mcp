@@ -1,6 +1,6 @@
 # Configuration
 
-All configuration is environment-variable based, resolved in `config.py`.
+All configuration is environment-variable based, resolved in `stan_mcp/config.py`.
 There is no config file.
 
 ## Environment variables
@@ -16,7 +16,7 @@ There is no config file.
 `STAN_MCP_LRU_SIZE` is read once at module import (`int(os.environ.get(...) or
 8)`), so it must be set before the process starts. `STAN_MCP_MAX_WORKERS` is
 read via a function (`config.max_workers()`) called when `RunManager` is
-constructed (module-level `MANAGER = RunManager()` in `sample.py`), so it's
+constructed (module-level `MANAGER = RunManager()` in `stan_mcp/inference.py`), so it's
 also effectively fixed at process start.
 
 `STAN_MCP_MAX_PARALLEL_CHAINS` is read per run. Without it CmdStanPy defaults

@@ -1,7 +1,6 @@
 import pytest
 
-import errors
-import toolchain
+from stan_mcp import errors, toolchain
 
 
 def test_ensure_bridgestan_returns_path(monkeypatch):

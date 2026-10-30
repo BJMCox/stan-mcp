@@ -1,18 +1,11 @@
 import asyncio
 import json
-from pathlib import Path
-from types import SimpleNamespace
 
-import cmdstanpy
 import pytest
-from cmdstanpy.stanfit.metadata import InferenceMetadata
 
-import density
-import diagnostics
-import runstore
-import sample
-import server
-from tests.fakes import FakeModel
+from stan_mcp import density, draws, runstore, server
+from stan_mcp import inference as sample
+from tests.fakes import FakeModel, _fit_csv, _GeneratedModel
 
 
 def _tool_result(result) -> dict:
@@ -79,75 +72,6 @@ async def test_parameter_file_errors_return_without_cpp(tmp_path, monkeypatch, f
     assert result["error_type"] == "ValidationError"
 
 
-def _fit_csv(path, method, extra_rows=False, values=(1.0, 2.0)):
-    config = {"model": "input", "method": method, "id": 1}
-    header = "lp__,x\n"
-    body = "".join(f"-1,{v}\n" for v in values)
-    if method == "sample":
-        config.update(
-            algorithm="hmc",
-            engine="nuts",
-            metric="diag_e",
-            max_depth=10,
-            num_samples=2,
-            num_warmup=1,
-            save_warmup=int(extra_rows),
-            thin=1,
-        )
-        header = "lp__,accept_stat__,stepsize__,treedepth__,n_leapfrog__,divergent__,energy__,x\n"
-        body = "-1,1,1,1,1,0,1,999\n" if extra_rows else ""
-        body += (
-            "# Adaptation terminated\n# Step size = 1\n"
-            "# Diagonal elements of inverse mass matrix:\n# 1\n"
-        )
-        body += "".join(f"-1,1,1,1,1,0,1,{v}\n" for v in values)
-        body += (
-            "#  Elapsed Time: 0 seconds (Warm-up)\n#  0 seconds (Sampling)\n#  0 seconds (Total)\n"
-        )
-    elif method == "variational":
-        config.update(
-            algorithm="meanfield",
-            iter=10,
-            grad_samples=1,
-            elbo_samples=1,
-            eta=1,
-            tol_rel_obj=0.01,
-            eval_elbo=1,
-            output_samples=2,
-        )
-        body = "# Stepsize adaptation complete.\n# eta = 1\n-1,999\n" + body
-    else:
-        config.update(algorithm="lbfgs", save_iterations=int(extra_rows))
-        body = ("-1,999\n" if extra_rows else "") + f"-1,{values[-1]}\n"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(f"# {k} = {v}\n" for k, v in config.items()) + header + body)
-    return path
-
-
-class _GeneratedModel:
-    def generate_quantities(self, data, previous_fit, gq_output_dir, **kwargs):
-        if isinstance(previous_fit, list):
-            previous_fit = cmdstanpy.from_csv(previous_fit)
-        assert isinstance(
-            previous_fit, (cmdstanpy.CmdStanMCMC, cmdstanpy.CmdStanMLE, cmdstanpy.CmdStanVB)
-        )
-        outputs = []
-        for i, path in enumerate(previous_fit.runset.csv_files):
-            rows = [
-                ln for ln in Path(path).read_text().splitlines() if ln and not ln.startswith("#")
-            ]
-            target = Path(gq_output_dir) / f"gq_{i + 1}.csv"
-            target.write_text(
-                "g\n" + "".join(f"{2 * float(ln.split(',')[-1])}\n" for ln in rows[1:])
-            )
-            outputs.append(str(target))
-        return SimpleNamespace(
-            previous_fit=previous_fit,
-            metadata=InferenceMetadata({"raw_header": "g"}),
-            runset=SimpleNamespace(csv_files=outputs),
-        )
-
-
 @pytest.mark.parametrize(
     "method,extra_rows,expected",
     [
@@ -179,7 +103,7 @@ async def test_external_gq_csvs_keep_only_draws(
         )
         result = await mgr.await_run(started["run_id"], timeout=5)
         assert result["status"] == "done", result
-        assert diagnostics.extract_draws(started["run_id"], "g")["draws"] == expected
+        assert draws.extract_draws(started["run_id"], "g")["draws"] == expected
     finally:
         mgr._pool.shutdown(wait=True)
 
@@ -208,7 +132,7 @@ def test_external_gq_snapshots_preserve_order_and_rerun(tmp_path, monkeypatch):
         second = asyncio.run(mgr.await_run(rerun["run_id"], timeout=5))
         assert second["status"] == "done", second
         for run in (started, rerun):
-            got = diagnostics.extract_draws(run["run_id"], "g", by_chain=True)
+            got = draws.extract_draws(run["run_id"], "g", by_chain=True)
             assert got["draws"] == [[6.0, 8.0], [2.0, 4.0]]
     finally:
         mgr._pool.shutdown(wait=True)

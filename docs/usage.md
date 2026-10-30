@@ -1,6 +1,6 @@
 # Usage: MCP tools
 
-All tools are registered in `server.py` via `@mcp.tool()` and are thin wrappers:
+All tools are registered in `stan_mcp/server.py` via `@mcp.tool()` and are thin wrappers:
 they validate/resolve arguments, offload the actual work to a module function
 via `asyncio.to_thread` (so a slow compile or density call doesn't block the
 event loop), and catch `StanMcpError` (and generic exceptions) into a
@@ -345,7 +345,7 @@ draws (`extract_draws`) mostly just consume context.
   `arviz.bfmi` — the one sampler diagnostic `stansummary` doesn't report
   (CmdStan has it only in `diagnose`, as prose). `verdict` is `"warn"` if
   R-hat > 1.01, bulk/tail ESS < 400, any divergences, any tree-depth
-  saturations, or E-BFMI < 0.3 (see `diagnostics._RHAT_MAX` / `_ESS_MIN` /
+  saturations, or E-BFMI < 0.3 (see `diagnostics.RHAT_MAX` / `_ESS_MIN` /
   `_EBFMI_MIN`). Undefined or missing convergence metrics and undefined BFMI
   chains remain visible. Incomplete coverage yields `"unknown"` unless a
   measured failure already yields `"warn"`. A pass requires clean available

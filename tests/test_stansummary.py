@@ -8,8 +8,7 @@ summary as a model with no parameters.
 
 import pytest
 
-import errors
-import stansummary
+from stan_mcp import errors, stansummary
 
 SAMPLE = """name,Mean,MCSE,StdDev,MAD,5%,50%,95%,ESS_bulk,ESS_tail,ESS_bulk/s,R_hat
 "lp__",-79.9936610583333589,0.606804122372384,8.70491691166983,7.877681681,-95.73361925,-79.3718975,-65.7694671,209.617931654,324.534706969,6352.058535,1.00083007

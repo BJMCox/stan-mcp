@@ -1,7 +1,6 @@
 import pytest
 
-import density
-import errors
+from stan_mcp import density, errors
 from tests.fakes import FakeModel
 
 

@@ -7,10 +7,8 @@ import numpy as np
 import pytest
 from cmdstanpy.stanfit.metadata import InferenceMetadata
 
-import diagnostics
-import draws
-import runstore
-from errors import RunError, ValidationError
+from stan_mcp import diagnostics, draws, fitstorage, runstore
+from stan_mcp.errors import RunError, ValidationError
 
 
 def _run(tmp_path, monkeypatch, header, rows, method="pathfinder"):
@@ -20,7 +18,7 @@ def _run(tmp_path, monkeypatch, header, rows, method="pathfinder"):
     csvdir = runstore.run_dir(rid) / "csv"
     csvdir.mkdir()
     fit = SimpleNamespace(metadata=InferenceMetadata({"raw_header": header}))
-    sidecar = diagnostics._sidecar_from_fit(fit, method, rid)
+    sidecar = fitstorage._sidecar_from_fit(fit, method, rid)
     sidecar["files"] = []
     for chain, values in enumerate(rows):
         name = f"chain_{chain}.csv"
@@ -35,7 +33,7 @@ def _run(tmp_path, monkeypatch, header, rows, method="pathfinder"):
 def test_extraction_uses_common_rows_and_whole_call_cap(tmp_path, monkeypatch, by_chain):
     rows = [[[i, 10 * i, 10 * i + 1] for i in range(10 * c, 10 * c + 10)] for c in range(2)]
     rid = _run(tmp_path, monkeypatch, "x,v.1,v.2", rows)
-    out = diagnostics.extract_draws(rid, params=["x", "v"], by_chain=by_chain, max_draws=12)
+    out = draws.extract_draws(rid, params=["x", "v"], by_chain=by_chain, max_draws=12)
     x = np.asarray(out["draws"]["x"])
     v = np.asarray(out["draws"]["v"])
     assert x.size + v.size <= 12
@@ -51,14 +49,14 @@ def test_extraction_uses_common_rows_and_whole_call_cap(tmp_path, monkeypatch, b
 def test_cap_requires_a_complete_row_across_chains(tmp_path, monkeypatch):
     rid = _run(tmp_path, monkeypatch, "v.1,v.2,v.3", [[[1, 2, 3]], [[4, 5, 6]]])
     with pytest.raises(ValidationError, match="cannot hold one retained row"):
-        diagnostics.extract_draws(rid, "v", by_chain=True, max_draws=5)
-    out = diagnostics.extract_draws(rid, "v", by_chain=True, max_draws=6)
+        draws.extract_draws(rid, "v", by_chain=True, max_draws=5)
+    out = draws.extract_draws(rid, "v", by_chain=True, max_draws=6)
     assert out["draws"] == [[[1, 2, 3]], [[4, 5, 6]]]
 
 
 def test_extract_preserves_singleton_and_matrix_axes(tmp_path, monkeypatch):
     rid = _run(tmp_path, monkeypatch, "x,v.1,m.1.1,m.2.1,m.1.2,m.2.2", [[[1, 2, 11, 21, 12, 22]]])
-    out = diagnostics.extract_draws(rid, params=["x", "v", "m"])
+    out = draws.extract_draws(rid, params=["x", "v", "m"])
     assert out["draws"] == {"x": [1], "v": [[2]], "m": [[[11, 12], [21, 22]]]}
 
 
@@ -160,7 +158,7 @@ def test_legacy_sidecar_explicitly_reports_unverified_header(tmp_path, monkeypat
     sidecar["schema"] = 2
     del sidecar["header"]
     draws.schema_path(rid).write_text(json.dumps(sidecar))
-    assert diagnostics.extract_draws(rid, "x")["header_warning"]
+    assert draws.extract_draws(rid, "x")["header_warning"]
     assert diagnostics.run_summary(rid)["header_warning"]
 
 

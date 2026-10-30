@@ -3,6 +3,9 @@
 See [architecture.md](architecture.md) for module ownership and
 [usage.md](usage.md) for the public tools.
 
+All modules live under `stan_mcp`. Batch modules live under `stan_mcp.batch`.
+Import canonical package paths to retain one cache, native lock and manager.
+
 ## Compilation
 
 `resolve_source(stan, stanc_args=None)` accepts source, a `.stan` path or a
@@ -72,7 +75,7 @@ Scalar, length-one vector, matrix and array axes remain distinct.
 
 ## Diagnostics and persistence
 
-`diagnostics.persist_run` copies every raw CSV before writing a success sidecar
+`fitstorage.persist_run` copies every raw CSV before writing a success sidecar
 or deleting live output. Copy failure records a warning and raises. Optimize
 stores both the flattened estimate and shaped JSON initialization.
 
@@ -84,12 +87,15 @@ Generated-quantities runs retain the source sampling law in run metadata.
 `run_diagnostics` tracks undefined metrics and incomplete chain coverage.
 `run_loo` and `compare_runs` verify posterior provenance before ordinary ArviZ LOO.
 
-`posterior_mean_inits` returns a shaped estimate or verified constrained mean,
+`inference.posterior_mean_inits` returns a shaped estimate or verified constrained mean,
 then a valid stored draw if the mean leaves the support. Historical runs without
 source retain their means with an explicit initialization warning in metadata.
 
-`_unconstrained_draws` restores compiler settings, checks dimensions, selects
+`geometry._unconstrained_draws` restores compiler settings, checks dimensions, selects
 model parameters and transforms them. If inverse transforms reject rounded
 CSV values, the constrained fallback still excludes derived quantities. If the
 model cannot be rebuilt, geometry fails explicitly rather than guessing its
 coordinate set.
+
+`serialization.json_safe` handles NumPy arrays/scalars and replaces nonfinite
+numbers with JSON nulls. Tool response normalization uses this shared function.

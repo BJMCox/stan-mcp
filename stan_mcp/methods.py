@@ -1,8 +1,10 @@
 """Inference-method registry and kwargs builder for CmdStanPy."""
 
-from errors import ValidationError
+from typing import Any
 
-METHODS: dict[str, dict] = {
+from stan_mcp.errors import ValidationError
+
+METHODS: dict[str, dict[str, Any]] = {
     # `save_warmup` and `thin` are deliberately absent from "sample"'s args, and
     # must stay absent. The draws sidecar records only each variable's dims and
     # CSV column indices -- it has no notion of which ROWS are warmup. Exposing
@@ -76,9 +78,9 @@ def is_draws_method(method: str) -> bool:
 def build_kwargs(
     method: str,
     seed: int | None,
-    inits: dict | list | float | int | str | None,
-    method_args: dict,
-) -> dict:
+    inits: dict[str, Any] | list | float | int | str | None,
+    method_args: dict[str, Any],
+) -> dict[str, Any]:
     if method not in METHODS:
         raise ValidationError(f"unknown method {method!r}; choose from {sorted(METHODS)}")
     allowed = METHODS[method]["args"]

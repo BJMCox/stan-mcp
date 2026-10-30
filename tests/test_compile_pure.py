@@ -1,7 +1,7 @@
 import json
 
-import compile as c
-import errors
+from stan_mcp import compilation as c
+from stan_mcp import errors
 
 
 def test_resolve_inline_source_passthrough():

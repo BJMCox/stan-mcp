@@ -1,4 +1,4 @@
-import density
+from stan_mcp import density
 from tests.fakes import FakeModel
 
 

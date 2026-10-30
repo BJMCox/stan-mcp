@@ -8,7 +8,7 @@ Persists, per run:
   draws, and what `generate_quantities` reuses as `previous_fit`.
 - `draws_schema.json` — the draws sidecar (each Stan variable's dims and its
   row-major CSV column indices, plus chain order); draws-producing methods
-  only, written by `diagnostics.persist_run` and read by `draws.py`. A few
+  only, written by `fitstorage.persist_run` and read by `draws.py`. A few
   hundred bytes to a few KB, holding no draws itself.
 - `estimate.json` / `initialization.json` — the flattened point estimate and
   shaped parameter initialization, `optimize` only (alongside its raw CSV).
@@ -32,9 +32,10 @@ import shutil
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
-import config
-from errors import RunError, ValidationError
+from stan_mcp import config
+from stan_mcp.errors import RunError, ValidationError
 
 
 def new_run_id(method: str, seq: int) -> str:
@@ -95,7 +96,7 @@ def reconcile_abandoned() -> None:
                 process = psutil.Process(owner["pid"])
                 if process.create_time() == owner["create_time"] and process.is_running():
                     continue
-            except (psutil.NoSuchProcess, KeyError):
+            except psutil.NoSuchProcess, KeyError:
                 pass
             except psutil.AccessDenied:
                 continue  # Unable to prove that this owner died.
@@ -120,7 +121,7 @@ def _meta_path(run_id: str, create: bool = False) -> Path:
     return run_dir(run_id, create=create) / "meta.json"
 
 
-def write_meta(run_id: str, meta: dict) -> None:
+def write_meta(run_id: str, meta: dict[str, Any]) -> None:
     m = dict(meta)
     m["run_id"] = run_id
     path = _meta_path(run_id, create=True)
@@ -135,7 +136,7 @@ def write_meta(run_id: str, meta: dict) -> None:
             tmp.unlink(missing_ok=True)
 
 
-def read_meta(run_id: str) -> dict:
+def read_meta(run_id: str) -> dict[str, Any]:
     """Read a run's meta.json, raising RunError (not a raw FileNotFoundError
     naming an internal path) when the run_id is unknown — every tool funnels
     through here, so the mapping belongs in one place."""
@@ -153,7 +154,7 @@ def list_runs(
     limit: int = 50,
     status: str | None = None,
     method: str | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     rows = []
     for d in config.runs_dir().iterdir():
         mp = d / "meta.json"
@@ -161,7 +162,7 @@ def list_runs(
             continue
         try:
             meta = json.loads(mp.read_text())
-        except (FileNotFoundError, json.JSONDecodeError):
+        except FileNotFoundError, json.JSONDecodeError:
             continue  # Concurrent pruning or corrupt metadata.
         if model_id is not None and meta.get("model_id") != model_id:
             continue
@@ -192,7 +193,7 @@ def max_seq() -> int:
             continue
         try:
             seq = json.loads(mp.read_text()).get("seq", 0)
-        except (FileNotFoundError, json.JSONDecodeError):
+        except FileNotFoundError, json.JSONDecodeError:
             continue
         if isinstance(seq, int) and seq > best:
             best = seq
@@ -251,13 +252,13 @@ def persist_input_csvs(run_id: str, csv_files: str | list[str]) -> list[str]:
     return [str((dest / f"{i:08d}.csv").resolve()) for i in range(len(sources))]
 
 
-def persist_initialization(run_id: str, initialization: dict) -> None:
+def persist_initialization(run_id: str, initialization: dict[str, Any]) -> None:
     (run_dir(run_id, create=True) / "initialization.json").write_text(
         json.dumps(initialization, indent=2)
     )
 
 
-def load_initialization(run_id: str) -> dict | None:
+def load_initialization(run_id: str) -> dict[str, Any] | None:
     path = run_dir(run_id) / "initialization.json"
     return json.loads(path.read_text()) if path.is_file() else None
 
@@ -279,11 +280,11 @@ def csv_paths(run_id: str) -> list[str]:
     return sorted(str(p) for p in dest.glob("*.csv"))
 
 
-def persist_estimate(run_id: str, estimate: dict) -> None:
+def persist_estimate(run_id: str, estimate: dict[str, Any]) -> None:
     (run_dir(run_id, create=True) / "estimate.json").write_text(json.dumps(estimate, indent=2))
 
 
-def load_estimate(run_id: str) -> dict:
+def load_estimate(run_id: str) -> dict[str, Any]:
     return json.loads((run_dir(run_id) / "estimate.json").read_text())
 
 
@@ -291,8 +292,8 @@ def persist_inputs(
     run_id: str,
     source: str,
     data: object,
-    inits: dict | list | float | int | str | None = None,
-    source_manifest: dict | None = None,
+    inits: dict[str, Any] | list | float | int | str | None = None,
+    source_manifest: dict[str, Any] | None = None,
 ) -> None:
     """Persist the exact model source and data so a run can be reproduced."""
     d = run_dir(run_id, create=True)
@@ -305,7 +306,7 @@ def persist_inputs(
         (d / "source_manifest.json").write_text(json.dumps(source_manifest, indent=2))
 
 
-def load_inputs(run_id: str) -> dict:
+def load_inputs(run_id: str) -> dict[str, Any]:
     """Return the persisted source and data for a run (for reproduction)."""
     d = run_dir(run_id)
     if not d.is_dir():
@@ -335,7 +336,7 @@ def prune_runs(keep: int | None = None, older_than_days: float | None = None) ->
     if keep is not None and keep < 1:
         raise ValueError("keep must be >= 1; refusing to delete every run")
     rows = list_runs(limit=10**9)  # newest first
-    victims: list[dict] = []
+    victims: list[dict[str, Any]] = []
     if keep is not None:
         victims.extend(rows[keep:])
     if older_than_days is not None:

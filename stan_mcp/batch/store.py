@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 from safetensors.numpy import load_file, save_file
 
-from errors import ValidationError
+from stan_mcp.errors import ValidationError
 
 SCHEMA = "stan-mcp.batch.v1"
 MAX_SHARD_BYTES = 64 * 1024 * 1024
@@ -261,7 +261,7 @@ def write_shard(
     directory: Path,
     index: int,
     arrays: dict[str, np.ndarray],
-    errors: dict | None = None,
+    errors: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{index:08d}.safetensors"
@@ -300,7 +300,7 @@ def write_shard(
         temporary.unlink(missing_ok=True)
 
 
-def publish(directory: Path, metadata: dict[str, Any], descriptors: list[dict]) -> Path:
+def publish(directory: Path, metadata: dict[str, Any], descriptors: list[dict[str, Any]]) -> Path:
     result = {
         k: v for k, v in metadata.items() if not k.startswith("_") and k not in ("shards", "count")
     }

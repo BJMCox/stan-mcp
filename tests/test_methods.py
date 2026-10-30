@@ -1,7 +1,6 @@
 import pytest
 
-import errors
-import methods
+from stan_mcp import errors, methods
 
 
 def test_unknown_method_raises():

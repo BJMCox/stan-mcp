@@ -3,7 +3,7 @@
 Replaced/expanded by real unit tests during the build (see design "Testing").
 """
 
-import config
+from stan_mcp import config
 
 
 def test_home_default(tmp_path, monkeypatch):

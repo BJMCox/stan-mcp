@@ -1,6 +1,6 @@
 """Typed access to a run's persisted draws.
 
-Reads the per-run sidecar written by `diagnostics.persist_run` and returns draws as
+Reads the per-run sidecar written by `fitstorage.persist_run` and returns draws as
 correctly-shaped arrays keyed by Stan variable name.
 
 Deliberately depends on numpy, stdlib and `runstore` only:
@@ -24,8 +24,8 @@ from typing import Any
 
 import numpy as np
 
-import runstore
-from errors import RunError
+from stan_mcp import runstore
+from stan_mcp.errors import RunError, ValidationError
 
 SCHEMA_VERSION = 3
 
@@ -174,7 +174,7 @@ def load(run_id: str) -> Draws:
     # variational's first data row is cmdstanpy's own mean-field mean, not a
     # draw (cmdstanpy stanfit/vb.py: draws_np[0] is the mean, draws_np[1:] the
     # sample) -- every other method's rows are all draws, so this is 0 for
-    # them. Recorded at persist time (diagnostics._sidecar_from_fit) since
+    # them. Recorded at persist time (fitstorage._sidecar_from_fit) since
     # this reader must stay method-agnostic.
     offset = sc.get("draw_row_offset", 0)
     csvdir = runstore.run_dir(run_id) / "csv"
@@ -321,3 +321,90 @@ def parameter_matrix(d: Draws, names: list[str]) -> np.ndarray:
     if not names:
         return np.empty((d.n_chain * d.n_draw, 0))
     return np.column_stack([columns[name] for name in names])
+
+
+# Default ceiling on the draws one extract_draws call returns. Deliberately
+# small: draws come back through the MCP transport into a model's context, and
+# there is nothing useful to do by reading thousands of raw numbers — that is
+# what run_summary (statistics) and run_diagnostics (convergence) are for. The
+# default is a spot-check of the posterior's location and spread; callers
+# feeding the draws somewhere else raise it or pass max_draws=0.
+#
+# The ceiling bounds the WHOLE call: split across requested parameters and
+# chains and scaled by each draw's width, since capping per chain per parameter
+# really admits max_draws x chains x params x vector-length numbers.
+DEFAULT_MAX_DRAWS = 100
+
+
+def _thin_step(n: int, thin: int, budget: int) -> int:
+    """Thinning step that also honours a ceiling of `budget` draws (0 = none)."""
+    if budget > 0 and len(range(0, n, thin)) > budget:
+        return max(thin, -(-n // budget))  # ceil division
+    return thin
+
+
+def _draw_budget(max_draws: int, width: int, n_chains: int = 1) -> int:
+    """Common rows per chain within the whole-call scalar-value cap."""
+    if max_draws == 0:
+        return 0
+    row_width = width * n_chains
+    if row_width > max_draws:
+        raise ValidationError(
+            f"max_draws={max_draws} cannot hold one retained row of the selected "
+            f"parameters ({row_width} scalar values); select fewer parameters, "
+            "increase max_draws, or use max_draws=0 for unlimited output"
+        )
+    return max_draws // row_width if row_width else 0
+
+
+def _from_typed_source(d: Draws, param: str, step: int, by_chain: bool) -> dict[str, Any]:
+    arr = d.params[param]
+    # Preserve every declared variable axis, including a vector of length one.
+    values = arr[:, ::step] if by_chain else arr.reshape(-1, *arr.shape[2:])[::step]
+    out = {"param": param, "draws": values.tolist(), "thin": step}
+    if by_chain:
+        out["by_chain"] = True
+    if d.header_warning:
+        out["header_warning"] = d.header_warning
+    return out
+
+
+def extract_draws(
+    run_id: str,
+    param: str | None = None,
+    thin: int = 1,
+    by_chain: bool = False,
+    params: list[str] | None = None,
+    max_draws: int = DEFAULT_MAX_DRAWS,
+) -> dict[str, Any]:
+    if thin < 1:
+        raise ValidationError(f"thin must be >= 1, got {thin}")
+    if max_draws < 0:
+        raise ValidationError(f"max_draws must be >= 0 (0 = unlimited), got {max_draws}")
+    meta = runstore.read_meta(run_id)
+    if meta.get("method") == "optimize":
+        raise RunError("extract_draws is not available for optimize runs")
+    wanted = list(dict.fromkeys(params)) if params else ([param] if param else [])
+    if not wanted:
+        raise ValidationError("extract_draws requires `param` or `params`")
+    d = load(run_id)
+    for name in wanted:
+        if name not in d.params:
+            raise RunError(
+                f"parameter {name!r} not found in run {run_id!r} "
+                f"(have: {', '.join(sorted(d.params))})"
+            )
+    width = sum(int(np.prod(d.params[name].shape[2:])) for name in wanted)
+    budget = _draw_budget(max_draws, width, d.n_chain if by_chain else 1)
+    n = d.n_draw if by_chain else d.n_chain * d.n_draw
+    step = _thin_step(n, thin, budget)
+    if params:
+        out = {
+            "draws": {p: _from_typed_source(d, p, step, by_chain)["draws"] for p in wanted},
+            "by_chain": by_chain,
+            "thin": step,
+        }
+        if d.header_warning:
+            out["header_warning"] = d.header_warning
+        return out
+    return _from_typed_source(d, wanted[0], step, by_chain)

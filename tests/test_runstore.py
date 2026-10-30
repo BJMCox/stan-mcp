@@ -1,6 +1,6 @@
 from pathlib import Path
 
-import runstore
+from stan_mcp import runstore
 
 
 def test_run_id_format():

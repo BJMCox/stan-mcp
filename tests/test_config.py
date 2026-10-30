@@ -1,4 +1,4 @@
-import config
+from stan_mcp import config
 
 
 def test_dirs_created_under_home(tmp_path, monkeypatch):

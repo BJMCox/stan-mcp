@@ -24,7 +24,7 @@ exec sh -c "$6"
 """)
     ssh.chmod(0o755)
     pixi = binary / "remote ' pixi"
-    pixi.write_text(f'#!/bin/sh\nexec "{sys.executable}" server.py\n')
+    pixi.write_text(f'#!/bin/sh\nexec "{sys.executable}" -m stan_mcp\n')
     pixi.chmod(0o755)
     data = tmp_path / "data.json"
     data.write_text('{"n": 2}')

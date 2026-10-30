@@ -6,8 +6,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-import batchstore
-from errors import ValidationError
+from stan_mcp.batch import store as batchstore
+from stan_mcp.errors import ValidationError
 
 
 def artifact(directory: Path) -> Path:

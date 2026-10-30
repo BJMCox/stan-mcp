@@ -4,6 +4,8 @@ Every tool converts a caught StanMcpError into a plain dict via as_error_dict
 so FastMCP returns structured JSON, never a raw traceback.
 """
 
+from typing import Any
+
 
 class StanMcpError(Exception):
     """Base class for all stan-mcp tool errors."""
@@ -25,5 +27,5 @@ class RunError(StanMcpError):
     """A sampling/inference run failed or was referenced incorrectly."""
 
 
-def as_error_dict(exc: Exception) -> dict:
+def as_error_dict(exc: Exception) -> dict[str, Any]:
     return {"error": str(exc), "error_type": type(exc).__name__}

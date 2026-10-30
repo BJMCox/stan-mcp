@@ -12,12 +12,34 @@ from typing import Any
 import numpy as np
 import pytest
 
-import batcheval
-import batchjobs
-import batchstore
-import compile as compilation
-import runstore
-from errors import RunError, ValidationError
+from stan_mcp import compilation, runstore
+from stan_mcp.batch import evaluation as batcheval
+from stan_mcp.batch import jobs as batchjobs
+from stan_mcp.batch import store as batchstore
+from stan_mcp.errors import RunError, ValidationError
+
+
+def test_packaged_worker_exits_cleanly_on_stop_sentinel(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe()
+    watch_child, watch_parent = context.Pipe(duplex=False)
+    process = context.Process(
+        target=batchjobs._worker, args=({}, str(tmp_path), child, watch_child)
+    )
+    try:
+        process.start()
+        child.close()
+        watch_child.close()
+        parent.send(None)
+        process.join(10)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.kill()
+        if process.pid is not None:
+            process.join(10)
+        for connection in (parent, child, watch_child, watch_parent):
+            connection.close()
 
 
 def _wait(predicate: Callable[[], Any]) -> Any:
@@ -439,7 +461,7 @@ def test_missing_input_shard_rejects_submission_before_workers_start(batch_setup
 def test_comparison_cancel_resume_keeps_verdict_separate_from_job_status(
     batch_setup, monkeypatch, tmp_path, bad_checkpoint
 ):
-    import batchcompare
+    from stan_mcp.batch import comparison as batchcompare
 
     create, _, _, points = batch_setup
     source = batchstore.load(points)

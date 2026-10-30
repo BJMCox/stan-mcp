@@ -6,10 +6,8 @@ from typing import Any
 
 import numpy as np
 
-import batchstore
-import compile as compilation
-import density
-import errors
+from stan_mcp import compilation, density, errors
+from stan_mcp.batch import store as batchstore
 
 _CONTEXT: tuple[str, density._SerializedModel, dict[str, Any]] | None = None
 _QUANTITIES = ("log_density", "gradient", "hessian", "hvp")

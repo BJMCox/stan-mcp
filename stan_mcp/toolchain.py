@@ -7,7 +7,7 @@ import sys
 from importlib.metadata import version
 from pathlib import Path
 
-from errors import ToolchainError
+from stan_mcp.errors import ToolchainError
 
 
 def _provision(script: str) -> str:

@@ -12,8 +12,8 @@ from typing import Any
 
 import numpy as np
 
-import batchstore
-from errors import ValidationError
+from stan_mcp.batch import store as batchstore
+from stan_mcp.errors import ValidationError
 
 _QUANTITIES = ("log_density", "gradient", "hessian", "hvp")
 _WORST_LIMIT = 8

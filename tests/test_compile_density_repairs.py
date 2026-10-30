@@ -12,10 +12,7 @@ import cmdstanpy
 import numpy as np
 import pytest
 
-import compile as compilation
-import density
-import errors
-import toolchain
+from stan_mcp import compilation, density, errors, toolchain
 
 
 def _compile_process(

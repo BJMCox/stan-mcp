@@ -3,10 +3,8 @@ from pathlib import Path
 
 import pytest
 
-import diagnostics
-import errors
-import runstore
-import sample
+from stan_mcp import errors, fitstorage, runstore
+from stan_mcp import inference as sample
 
 
 def test_start_and_await(tmp_path, monkeypatch):
@@ -63,7 +61,7 @@ def test_sidecar_write_failure_fails_the_run(tmp_path, monkeypatch):
     status="failed", not "done" -- the draws sidecar (diagnostics.py) is now
     the only way to read a run's draws, so a run that never got one must not
     look like an unqualified success. Exercises the real (unmonkeypatched)
-    `_persist` -> `diagnostics.persist_run` path; only `_sidecar_from_fit`
+    `_persist` -> `fitstorage.persist_run` path; only `_sidecar_from_fit`
     itself is forced to fail, to simulate a real write failure without
     needing a specific malformed fit."""
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
@@ -83,7 +81,7 @@ def test_sidecar_write_failure_fails_the_run(tmp_path, monkeypatch):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(mgr, "_runner", runner)
-    monkeypatch.setattr(diagnostics, "_sidecar_from_fit", boom)
+    monkeypatch.setattr(fitstorage, "_sidecar_from_fit", boom)
 
     started = mgr.start_run("model {}", None, method="sample")
     result = asyncio.run(mgr.await_run(started["run_id"], timeout=5))

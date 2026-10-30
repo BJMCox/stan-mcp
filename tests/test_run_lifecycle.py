@@ -6,11 +6,9 @@ from pathlib import Path
 
 import pytest
 
-import compile as compilation
-import methods
-import runstore
-import sample
-from tests.test_file_inputs import _fit_csv, _GeneratedModel
+from stan_mcp import compilation, methods, runstore
+from stan_mcp import inference as sample
+from tests.fakes import _fit_csv, _GeneratedModel
 
 
 def _reserve_worker(home, ready, release, output):

@@ -2,7 +2,7 @@ import asyncio
 
 
 def test_safe_catches_generic_exceptions_as_error_dict():
-    import server
+    from stan_mcp import server
 
     def boom():
         raise ValueError("boom")
@@ -11,7 +11,7 @@ def test_safe_catches_generic_exceptions_as_error_dict():
 
 
 def test_density_tools_registered():
-    import server
+    from stan_mcp import server
 
     names = asyncio.run(server.mcp.list_tools())
     tool_names = {t.name for t in names}
@@ -31,7 +31,7 @@ def test_density_tools_registered():
 def test_run_tools_registered():
     import asyncio
 
-    import server
+    from stan_mcp import server
 
     names = {t.name for t in asyncio.run(server.mcp.list_tools())}
     for expected in [

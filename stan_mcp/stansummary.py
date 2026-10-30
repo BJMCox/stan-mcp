@@ -13,7 +13,7 @@ input: handed a variational run it reports `R_hat 0.999997` and `ESS_bulk 991.43
 for IID approximate draws — meaningless numbers in valid-looking output.
 
 Every failure of this module's public surface (`summarize`, `parse`) is a
-`RunError`. That is a contract, not an accident: `diagnostics._convergence`
+`RunError`. That is a contract, not an accident: `diagnostics.convergence`
 degrades a failure here into a warning so `run_diagnostics` still answers, and a
 third-party exception type leaking through instead used to escape both
 `run_diagnostics` and `run_geometry` as an unhandled `ValueError`.
@@ -25,7 +25,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from errors import RunError
+from stan_mcp.errors import RunError
 
 # stansummary's own default is 2 significant figures, which would silently round
 # every number this tool reports. 18 is CmdStan's maximum and matches the output

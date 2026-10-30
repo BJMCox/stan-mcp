@@ -19,11 +19,10 @@ from typing import Any
 
 import numpy as np
 
-import compile as _compile
-import config
-import errors
+from stan_mcp import compilation as _compile
+from stan_mcp import config, errors
 
-_CACHE: "OrderedDict[tuple, _SerializedModel]" = OrderedDict()
+_CACHE: OrderedDict[tuple, _SerializedModel] = OrderedDict()
 _CACHE_LOCK = threading.Lock()
 _NATIVE_LOCK = threading.RLock()
 
@@ -229,7 +228,7 @@ def unconstrain_parameters(model: _SerializedModel, constrained: dict[str, Any])
         if isinstance(expected, dict):
             if not isinstance(actual, dict):
                 raise errors.ValidationError("constrained tuple must contain named fields")
-            result: dict = {}
+            result: dict[str, Any] = {}
             for key, item in expected.items():
                 actual_key = key if key in actual else str(key)
                 if actual_key not in actual:
@@ -261,7 +260,7 @@ def unconstrain_parameters(model: _SerializedModel, constrained: dict[str, Any])
     return np.asarray(model.param_unconstrain(np.asarray(values, dtype=float)))
 
 
-def param_unconstrain(stan: str, data: Any, constrained: dict | str) -> dict[str, Any]:
+def param_unconstrain(stan: str, data: Any, constrained: dict[str, Any] | str) -> dict[str, Any]:
     if isinstance(constrained, str):
         constrained = _compile.read_json_file(constrained, "constrained")
     if not isinstance(constrained, dict):

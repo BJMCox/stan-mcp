@@ -11,13 +11,13 @@ import traceback
 from collections.abc import Callable
 from datetime import UTC, datetime
 from multiprocessing.connection import Connection
+from multiprocessing.process import BaseProcess
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
-import batchstore
-import config
-import runstore
-from errors import RunError, StanMcpError, ValidationError
+from stan_mcp import config, runstore
+from stan_mcp.batch import store as batchstore
+from stan_mcp.errors import RunError, StanMcpError, ValidationError
 
 _METHODS = {"evaluate": "evaluate_batch", "compare": "compare_batches"}
 _ACTIVE = {"running", "cancelling"}
@@ -27,9 +27,11 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _worker(plan: dict, directory: str, connection: Connection, parent: Connection) -> None:
+def _worker(
+    plan: dict[str, Any], directory: str, connection: Connection, parent: Connection
+) -> None:
     """Keep native models process-local, and exit if the owning server dies."""
-    import batcheval
+    from stan_mcp.batch import evaluation as batcheval
 
     def watch_parent() -> None:
         try:
@@ -54,14 +56,14 @@ def _worker(plan: dict, directory: str, connection: Connection, parent: Connecti
 
 
 class _Handle:
-    def __init__(self, lease: Any) -> None:
+    def __init__(self, lease: TextIO) -> None:
         self.lease = lease
         self.cancelled = threading.Event()
         self.failed = threading.Event()
         self.lock = threading.RLock()
         self.thread: threading.Thread | None = None
-        self.processes: list[Any] = []
-        self.owners: dict[int, dict] = {}
+        self.processes: list[BaseProcess] = []
+        self.owners: dict[int, dict[str, int | float]] = {}
         self.finished = False
 
 
@@ -71,7 +73,7 @@ class BatchManager:
         if self.max_workers < 1:
             raise ValidationError("batch worker cap must be positive")
         self._slots = threading.BoundedSemaphore(self.max_workers)
-        self._worker_target: Callable[[dict, str, Connection, Connection], None] = _worker
+        self._worker_target: Callable[[dict[str, Any], str, Connection, Connection], None] = _worker
         self._handles: dict[str, _Handle] = {}
         self._lock = threading.RLock()
         runstore.reconcile_abandoned()
@@ -81,7 +83,7 @@ class BatchManager:
         return runstore.run_dir(job_id) / "batch"
 
     @staticmethod
-    def _lease(directory: Path) -> Any:
+    def _lease(directory: Path) -> TextIO:
         lease = (directory / ".lease").open("a")
         try:
             fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -91,24 +93,24 @@ class BatchManager:
         return lease
 
     @staticmethod
-    def _prepare(kind: str, request: dict, directory: Path) -> dict:
+    def _prepare(kind: str, request: dict[str, Any], directory: Path) -> dict[str, Any]:
         if kind == "evaluate":
-            import batcheval
+            from stan_mcp.batch import evaluation as batcheval
 
             return batcheval.prepare(request, directory)
-        import batchcompare
+        from stan_mcp.batch import comparison as batchcompare
 
         return batchcompare.prepare(request, directory)
 
     @staticmethod
-    def _snapshot_request(kind: str, request: dict, directory: Path) -> dict:
+    def _snapshot_request(kind: str, request: dict[str, Any], directory: Path) -> dict[str, Any]:
         request = dict(request)
         for name in ("points",) if kind == "evaluate" else ("left", "right"):
             if not isinstance(request.get(name), str):
                 raise ValidationError(f"batch request requires a {name} manifest path")
             request[name] = str(batchstore.snapshot(request[name], directory / name))
         if kind == "evaluate":
-            import compile as compilation
+            from stan_mcp import compilation
 
             if not isinstance(request.get("stan"), str):
                 raise ValidationError("batch request requires stan source or a model path")
@@ -124,7 +126,7 @@ class BatchManager:
             request["finite_difference"] = fd
         return request
 
-    def start(self, kind: str, request_file: str) -> dict:
+    def start(self, kind: str, request_file: str) -> dict[str, Any]:
         if kind not in _METHODS:
             raise ValidationError("batch kind must be evaluate or compare")
         path = Path(request_file).expanduser().resolve()
@@ -175,7 +177,7 @@ class BatchManager:
             raise
         return {"run_id": job_id, "job_id": job_id, "status": "running"}
 
-    def _launch(self, job_id: str, lease: Any) -> None:
+    def _launch(self, job_id: str, lease: TextIO) -> None:
         handle = _Handle(lease)
         thread = threading.Thread(target=self._execute, args=(job_id, handle), daemon=True)
         handle.thread = thread
@@ -263,8 +265,8 @@ class BatchManager:
                     self._handles.pop(job_id, None)
 
     def _evaluate(
-        self, job_id: str, handle: _Handle, plan: dict, output: Path, workers: int
-    ) -> dict:
+        self, job_id: str, handle: _Handle, plan: dict[str, Any], output: Path, workers: int
+    ) -> dict[str, Any]:
         manifest = batchstore.load(plan["input_manifest"])
         checkpoint = output.parent / "checkpoint.json"
         completed = json.loads(checkpoint.read_text()) if checkpoint.exists() else {}
@@ -290,8 +292,11 @@ class BatchManager:
         def consume() -> None:
             if not self._acquire(handle):
                 return
-            parent = child = watch_child = watch_parent = None
-            process = None
+            parent: Connection | None = None
+            child: Connection | None = None
+            watch_child: Connection | None = None
+            watch_parent: Connection | None = None
+            process: BaseProcess | None = None
             try:
                 context = multiprocessing.get_context("spawn")
                 parent, child = context.Pipe()
@@ -385,8 +390,10 @@ class BatchManager:
             result["manifest"] = str(output / "manifest.json")
         return result
 
-    def _compare(self, job_id: str, handle: _Handle, plan: dict, output: Path) -> dict:
-        import batchcompare
+    def _compare(
+        self, job_id: str, handle: _Handle, plan: dict[str, Any], output: Path
+    ) -> dict[str, Any]:
+        from stan_mcp.batch import comparison as batchcompare
 
         if not self._acquire(handle):
             return {"cancelled": True}
@@ -422,7 +429,7 @@ class BatchManager:
         finally:
             self._slots.release()
 
-    def status(self, job_id: str) -> dict:
+    def status(self, job_id: str) -> dict[str, Any]:
         meta = runstore.read_meta(job_id)
         if meta.get("method") not in _METHODS.values():
             raise RunError(f"run {job_id!r} is not a batch job")
@@ -431,7 +438,7 @@ class BatchManager:
             result["error"] = meta["stderr"][-800:]
         return result
 
-    def progress(self, job_id: str) -> dict:
+    def progress(self, job_id: str) -> dict[str, Any]:
         result = self.status(job_id)
         meta = runstore.read_meta(job_id)
         result.update(
@@ -443,7 +450,7 @@ class BatchManager:
         )
         return result
 
-    def result(self, job_id: str) -> dict:
+    def result(self, job_id: str) -> dict[str, Any]:
         result = self.progress(job_id)
         meta = runstore.read_meta(job_id)
         result.update(meta.get("result", {}))
@@ -452,7 +459,7 @@ class BatchManager:
             result["manifest"] = str(manifest)
         return result
 
-    def cancel(self, job_id: str) -> dict:
+    def cancel(self, job_id: str) -> dict[str, Any]:
         status = self.status(job_id)
         with self._lock:
             handle = self._handles.get(job_id)
@@ -473,7 +480,7 @@ class BatchManager:
                     process.terminate()
         return {"run_id": job_id, "status": "cancelling", "cancelled": True}
 
-    def resume(self, job_id: str) -> dict:
+    def resume(self, job_id: str) -> dict[str, Any]:
         self.status(job_id)
         directory = self._directory(job_id)
         lease = self._lease(directory)
@@ -494,7 +501,7 @@ class BatchManager:
                         and owner != runstore.process_owner()
                     ):
                         raise RunError("batch job still has a live owner")
-                except (psutil.NoSuchProcess, KeyError):
+                except psutil.NoSuchProcess, KeyError:
                     pass
             if not (directory / "identity.json").is_file():
                 raise RunError(
@@ -511,7 +518,7 @@ class BatchManager:
             if current != identity:
                 raise RunError("owned batch inputs or computation settings changed")
             if meta["kind"] == "evaluate":
-                import batcheval
+                from stan_mcp.batch import evaluation as batcheval
 
                 batcheval.validate_plan(plan)
             self._validate_completed(directory, plan, meta["kind"])
@@ -534,7 +541,7 @@ class BatchManager:
         return {"run_id": job_id, "job_id": job_id, "status": "running"}
 
     @staticmethod
-    def _drain_abandoned_workers(meta: dict) -> None:
+    def _drain_abandoned_workers(meta: dict[str, Any]) -> None:
         import psutil
 
         workers: list[psutil.Process] = []
@@ -553,7 +560,7 @@ class BatchManager:
             raise RunError("abandoned batch workers have not stopped")
 
     @staticmethod
-    def _validate_completed(directory: Path, plan: dict, kind: str) -> None:
+    def _validate_completed(directory: Path, plan: dict[str, Any], kind: str) -> None:
         output = directory / "results"
         checkpoint = (
             directory / "checkpoint.json"
@@ -610,7 +617,7 @@ class BatchManager:
             if path.is_file() and str(path.relative_to(output)) not in owned:
                 path.unlink()
 
-    async def await_job(self, job_id: str, timeout: float | None = None) -> dict:
+    async def await_job(self, job_id: str, timeout: float | None = None) -> dict[str, Any]:
         deadline = None if timeout is None else time.monotonic() + max(0, timeout)
         while True:
             status = self.status(job_id)

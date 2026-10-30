@@ -1,4 +1,4 @@
-import density
+from stan_mcp import density
 
 
 def test_lru_evicts_beyond_capacity(monkeypatch):

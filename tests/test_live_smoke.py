@@ -5,6 +5,8 @@ import os
 import numpy as np
 import pytest
 
+from stan_mcp import draws, fitstorage, geometry
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("STAN_MCP_LIVE") != "1", reason="set STAN_MCP_LIVE=1 to run"
 )
@@ -43,8 +45,8 @@ def _sample(mgr, stan, seed):
 
 def test_live_full_diagnostics_verdict(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    import diagnostics
-    import sample
+    from stan_mcp import diagnostics
+    from stan_mcp import inference as sample
 
     run_id = _sample(sample.RunManager(), BERNOULLI, 1)
     diag = diagnostics.run_diagnostics(run_id)
@@ -55,8 +57,8 @@ def test_live_full_diagnostics_verdict(tmp_path, monkeypatch):
 
 def test_live_run_loo_and_compare(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    import diagnostics
-    import sample
+    from stan_mcp import diagnostics
+    from stan_mcp import inference as sample
 
     mgr = sample.RunManager()
     a = _sample(mgr, BERNOULLI_LL, 1)
@@ -69,8 +71,8 @@ def test_live_run_loo_and_compare(tmp_path, monkeypatch):
 
 def test_live_progress_and_inputs(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    import runstore
-    import sample
+    from stan_mcp import inference as sample
+    from stan_mcp import runstore
 
     mgr = sample.RunManager()
     run_id = _sample(mgr, BERNOULLI, 1)
@@ -82,7 +84,7 @@ def test_live_progress_and_inputs(tmp_path, monkeypatch):
 
 def test_live_compile_pedantic_warns(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    import compile as c
+    from stan_mcp import compilation as c
 
     out = c.compile_model("parameters { real x; } model { }", warn_pedantic=True)
     assert "error" not in out
@@ -91,7 +93,7 @@ def test_live_compile_pedantic_warns(tmp_path, monkeypatch):
 
 def test_live_pedantic_does_not_change_model_id(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    import compile as c
+    from stan_mcp import compilation as c
 
     plain = c.compile_model(BERNOULLI)
     pedantic = c.compile_model(BERNOULLI, warn_pedantic=True)
@@ -104,9 +106,8 @@ def test_live_method_diagnostics(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     import asyncio
 
-    import diagnostics
-    import runstore
-    import sample
+    from stan_mcp import diagnostics, runstore
+    from stan_mcp import inference as sample
 
     mgr = sample.RunManager()
     expect = {"variational": "eta", "pathfinder": "is_resampled", "laplace": "mode_lp"}
@@ -126,15 +127,15 @@ def test_live_method_diagnostics(tmp_path, monkeypatch):
         # every method now; none of them ever get an inference.nc)
         summ = diagnostics.run_summary(started["run_id"], params=["theta"])
         assert any(r["param"] == "theta" for r in summ["summary"])
-        draws = diagnostics.extract_draws(started["run_id"], "theta")
-        assert len(draws["draws"]) > 0
+        extracted = draws.extract_draws(started["run_id"], "theta")
+        assert len(extracted["draws"]) > 0
 
 
 def test_live_inits_from_prior_run(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     import asyncio
 
-    import sample
+    from stan_mcp import inference as sample
 
     mgr = sample.RunManager()
     first = _sample(mgr, BERNOULLI, 1)
@@ -161,7 +162,7 @@ def test_live_concurrent_runs_same_model(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     import asyncio
 
-    import sample
+    from stan_mcp import inference as sample
 
     mgr = sample.RunManager(max_workers=2)
     args = {"chains": 2, "iter_warmup": 300, "iter_sampling": 1500}
@@ -186,8 +187,8 @@ def test_live_pathologies_localize_funnel_neck(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     import asyncio
 
-    import diagnostics
-    import sample
+    from stan_mcp import diagnostics
+    from stan_mcp import inference as sample
 
     mgr = sample.RunManager()
     started = mgr.start_run(
@@ -231,8 +232,7 @@ def test_live_geometry_finds_collinearity(tmp_path, monkeypatch):
     import asyncio
     import time
 
-    import diagnostics
-    import sample
+    from stan_mcp import inference as sample
 
     rng = np.random.default_rng(7)
     n = 100
@@ -257,7 +257,7 @@ def test_live_geometry_finds_collinearity(tmp_path, monkeypatch):
 
     saw_preparing = False
     for _ in range(60):
-        geom = diagnostics.run_geometry(started["run_id"])
+        geom = geometry.run_geometry(started["run_id"])
         if geom.get("status") != "preparing":
             break
         saw_preparing = True
@@ -279,8 +279,7 @@ def test_live_geometry_finds_collinearity(tmp_path, monkeypatch):
 
 def test_live_validate_data(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    import density
-    import errors
+    from stan_mcp import density, errors
 
     ok = density.validate_data(BERNOULLI, DATA)
     assert ok["ok"] is True and ok["param_unc_num"] == 1
@@ -291,7 +290,7 @@ def test_live_validate_data(tmp_path, monkeypatch):
 
 def test_compile_model_returns_artifacts(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    import compile as c
+    from stan_mcp import compilation as c
 
     out = c.compile_model(BERNOULLI)
     assert "error" not in out
@@ -302,7 +301,7 @@ def test_compile_model_returns_artifacts(tmp_path, monkeypatch):
 
 def test_param_info(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    import density
+    from stan_mcp import density
 
     info = density.param_info(BERNOULLI, DATA)
     assert info["param_names"] == ["theta"]
@@ -312,7 +311,7 @@ def test_param_info(tmp_path, monkeypatch):
 
 def test_live_log_density(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    import density
+    from stan_mcp import density
 
     out = density.log_density_gradient(BERNOULLI, DATA, [0.0])
     assert isinstance(out["lp"], float)
@@ -321,7 +320,7 @@ def test_live_log_density(tmp_path, monkeypatch):
 
 def test_live_check_gradient(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
-    import density
+    from stan_mcp import density
 
     out = density.check_gradient(BERNOULLI, DATA, [0.1])
     assert out["max_abs_err"] < 1e-3
@@ -331,8 +330,8 @@ def test_live_sample_run(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     import asyncio
 
-    import diagnostics
-    import sample
+    from stan_mcp import diagnostics
+    from stan_mcp import inference as sample
 
     mgr = sample.RunManager()
     started = mgr.start_run(
@@ -353,9 +352,8 @@ def test_live_generate_quantities(tmp_path, monkeypatch):
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     import asyncio
 
-    import diagnostics
-    import runstore
-    import sample
+    from stan_mcp import diagnostics, runstore
+    from stan_mcp import inference as sample
 
     mgr = sample.RunManager()
 
@@ -389,7 +387,7 @@ def test_live_generate_quantities(tmp_path, monkeypatch):
     # still left status="done"; it is now unreachable and would mask a real
     # regression.
     assert runstore.csv_paths(run_id_gq)
-    drawn = diagnostics.extract_draws(run_id_gq, "y_sim")
+    drawn = draws.extract_draws(run_id_gq, "y_sim")
     assert len(drawn["draws"]) > 0
     assert "summary" in diagnostics.run_summary(run_id_gq)
 
@@ -431,10 +429,8 @@ def test_live_bridgestan_name_mapping_on_shaped_params(tmp_path, monkeypatch):
     import time
     from pathlib import Path
 
-    import density
-    import diagnostics
-    import runstore
-    import sample
+    from stan_mcp import density, diagnostics, runstore
+    from stan_mcp import inference as sample
 
     mgr = sample.RunManager()
     started = mgr.start_run(
@@ -455,7 +451,7 @@ def test_live_bridgestan_name_mapping_on_shaped_params(tmp_path, monkeypatch):
     assert len(bs_names) == 10, bs_names
 
     d = diagnostics.draws.load(rid)
-    X = diagnostics._constrained_matrix(d, bs_names)
+    X = geometry._constrained_matrix(d, bs_names)
     assert X.shape == (1000, 10)
 
     # (1) each matrix element must land on its own prior mean, 10*i + j
@@ -507,7 +503,7 @@ def test_live_bridgestan_name_mapping_on_shaped_params(tmp_path, monkeypatch):
     # up with param_names().
     assert model.param_unc_num() == 9
     for _ in range(60):
-        geom = diagnostics.run_geometry(rid)
+        geom = geometry.run_geometry(rid)
         if geom.get("status") != "preparing":
             break
         time.sleep(3)
@@ -520,11 +516,11 @@ def test_live_bridgestan_name_mapping_on_shaped_params(tmp_path, monkeypatch):
 def test_live_optimize_mode_and_gq_survive_owned_input_snapshots(tmp_path, monkeypatch):
     import asyncio
 
-    import diagnostics
-    import runstore
-    import sample
+    from stan_mcp import runstore
 
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "home"))
+    from stan_mcp import inference as sample
+
     source = """
     parameters { real<lower=0> sigma; vector[2] v; }
     model { sigma ~ lognormal(0,1); v ~ std_normal(); }
@@ -534,7 +530,7 @@ def test_live_optimize_mode_and_gq_survive_owned_input_snapshots(tmp_path, monke
         source, {}, method="optimize", seed=42, method_args={"jacobian": True}
     )["run_id"]
     assert asyncio.run(mgr.await_run(optimized, timeout=120))["status"] == "done"
-    initial = diagnostics.posterior_mean_inits(optimized)
+    initial = sample.posterior_mean_inits(optimized)
     np.testing.assert_allclose(initial["sigma"], 1, rtol=1e-4)
     np.testing.assert_allclose(initial["v"], [0, 0], atol=1e-4)
     laplace = mgr.start_run(
@@ -557,8 +553,7 @@ def test_live_optimize_mode_and_gq_survive_owned_input_snapshots(tmp_path, monke
     rerun = mgr.rerun(gq)["run_id"]
     assert asyncio.run(mgr.await_run(rerun, timeout=120))["status"] == "done"
     assert (
-        diagnostics.extract_draws(rerun, "norm_v")["draws"]
-        == diagnostics.extract_draws(gq, "norm_v")["draws"]
+        draws.extract_draws(rerun, "norm_v")["draws"] == draws.extract_draws(gq, "norm_v")["draws"]
     )
 
 
@@ -566,11 +561,11 @@ def test_live_unit_vector_warm_start_avoids_invalid_mean(tmp_path, monkeypatch):
     import asyncio
     from types import SimpleNamespace
 
-    import diagnostics
-    import runstore
-    import sample
+    from stan_mcp import runstore
 
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "home"))
+    from stan_mcp import inference as sample
+
     source = "parameters {unit_vector[2] u;} model {u[1] ~ normal(0,1);}"
     rid = "sample-0001"
     runstore.write_meta(rid, {"method": "sample", "status": "done"})
@@ -585,8 +580,8 @@ def test_live_unit_vector_warm_start_avoids_invalid_mean(tmp_path, monkeypatch):
             stan_vars={"u": SimpleNamespace(dimensions=(2,))},
         ),
     )
-    diagnostics.persist_run(rid, "sample", fit)
-    initial = diagnostics.posterior_mean_inits(rid)
+    fitstorage.persist_run(rid, "sample", fit)
+    initial = sample.posterior_mean_inits(rid)
     assert initial == {"u": [1.0, 0.0]}
     mgr = sample.RunManager()
     result = mgr.start_run(

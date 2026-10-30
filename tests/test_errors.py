@@ -1,4 +1,4 @@
-import errors
+from stan_mcp import errors
 
 
 def test_as_error_dict_includes_type_and_message():
