@@ -5,6 +5,13 @@ from typing import Any
 from stan_mcp.errors import ValidationError
 
 METHODS: dict[str, dict[str, Any]] = {
+    # RNG-only simulation is a different sampling law from posterior MCMC.
+    "fixed_param": {
+        "cmd": "sample",
+        "draws": True,
+        "inits": True,
+        "args": {"chains", "iter_sampling", "parallel_chains", "sig_figs"},
+    },
     # `save_warmup` and `thin` are deliberately absent from "sample"'s args, and
     # must stay absent. The draws sidecar records only each variable's dims and
     # CSV column indices -- it has no notion of which ROWS are warmup. Exposing
@@ -93,6 +100,8 @@ def build_kwargs(
     if method == "generate_quantities" and ma.get("from_run_id") and "csv_files" in ma:
         raise ValidationError("choose either method_args.from_run_id or method_args.csv_files")
     kw = dict(ma)
+    if method == "fixed_param":
+        kw.update(fixed_param=True, iter_warmup=0, adapt_engaged=False)
     # Preserve CmdStanPy's measures: optimize defaults to a constrained-space
     # mode; Laplace defaults to a density including the transform Jacobian.
     # Reusing an optimize CSV as a Laplace mode requires matching both settings.

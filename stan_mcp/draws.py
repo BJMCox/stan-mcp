@@ -51,6 +51,18 @@ class Draws:
     header_warning: str | None = None
 
 
+def sampling_method(run_id: str) -> str | None:
+    """Resolve the sampling law through generated-quantities snapshots."""
+    meta = runstore.read_meta(run_id)
+    method = meta.get("method")
+    if method != "generate_quantities":
+        return method
+    if meta.get("input_method") is not None:
+        return meta["input_method"]
+    source = meta.get("method_args", {}).get("from_run_id")
+    return sampling_method(source) if source else None
+
+
 def schema_path(run_id: str) -> Path:
     return runstore.run_dir(run_id) / "draws_schema.json"
 

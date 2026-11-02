@@ -6,8 +6,18 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
+from stan_mcp import (
+    calibration,
+    density,
+    diagnostics,
+    draws,
+    geometry,
+    predictive,
+    runstore,
+    serialization,
+    studies,
+)
 from stan_mcp import compilation as _compile
-from stan_mcp import density, diagnostics, draws, geometry, runstore, serialization
 from stan_mcp.batch import jobs as batchjobs
 from stan_mcp.errors import StanMcpError, as_error_dict
 from stan_mcp.inference import MANAGER
@@ -15,6 +25,7 @@ from stan_mcp.inference import MANAGER
 # Keep the JSON text response format independent of Python return annotations.
 mcp = MCPServer("stan-mcp")
 BATCH_MANAGER = batchjobs.BatchManager()
+STUDY_MANAGER = studies.StudyManager(MANAGER)
 
 
 def _safe(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -251,7 +262,7 @@ async def start_run(
     mean row are excluded from stored draw summaries. Alternatively, use
     `method_args={"from_run_id": "sample-0001"}` for a managed run. Choose one source.
 
-    Start a background inference run (sample/optimize/variational/pathfinder/
+    Start a background inference run (sample/fixed_param/optimize/variational/pathfinder/
     laplace/generate_quantities). Returns a run_id immediately. `inits_from` warm-
     starts at a shaped estimate or verified posterior mean, using a stored draw
     when the mean violates constraints (ignored if `inits` is set).
@@ -260,6 +271,71 @@ async def start_run(
     return await asyncio.to_thread(
         _safe, MANAGER.start_run, stan, data, method, seed, inits, method_args, inits_from
     )
+
+
+@mcp.tool(structured_output=False)
+async def check_predictive(request_file: str) -> dict[str, Any]:
+    """Use an absolute server-local JSON request path; prefer observed data in a .json file.
+
+    Name run_id, observed (.json path or inline object), kind (prior/posterior),
+    and checks: [{observed: "y", replicated: "y_rep", statistic: "mean"}].
+    Supported statistics: mean, sd (sample SD), min, max, median, q05, q95,
+    zero_fraction. The model must explicitly emit replicated quantities.
+    Compare matching event shapes, retaining chain/draw axes for MCSE.
+    Return bounded predictive discrepancies, uncertainty, and report/SVG paths.
+    Tail fractions use >=. They are not calibrated goodness-of-fit p-values.
+    For fixed_param iid uncertainty, declare independent_draws=true only when
+    every stochastic ancestor is redrawn each iteration; it is not inferred.
+    Use method=fixed_param for RNG-only prior simulation. See docs/validation.md."""
+    return await asyncio.to_thread(_safe, predictive.check_predictive, request_file)
+
+
+@mcp.tool(structured_output=False)
+async def start_study(request_file: str) -> dict[str, Any]:
+    """Use an absolute server-local JSON study manifest path, with .stan and .json inputs preferred.
+
+    Schema stan-mcp.study.v1 names seed, tasks, optional replicates and max_parallel.
+    Each task names a stable id, stan, data, method, method_args and optional inits.
+    An optional simulate block names an explicit joint simulator, data_variables,
+    truth_variables, and integer_data. No model rewrite or simulator is inferred.
+    Snapshot all inputs and seed each stage. Return a background study_id/run_id.
+    Use get_study_result, await_run, cancel_run, and resume_study. Completed tasks
+    remain immutable. A completed study can contain failed fits.
+    See docs/validation.md for the manifest and simulation mapping contracts."""
+    return await asyncio.to_thread(_safe, STUDY_MANAGER.start, request_file)
+
+
+@mcp.tool(structured_output=False)
+async def get_study_result(study_id: str) -> dict[str, Any]:
+    """Return bounded study counts, failure excerpts and absolute manifest/checkpoint paths.
+
+    Retain all planned cases, including failed, cancelled and unstarted cases.
+    Full data, truth, seeds and child-run references remain in owned files."""
+    return await asyncio.to_thread(_safe, STUDY_MANAGER.result, study_id)
+
+
+@mcp.tool(structured_output=False)
+async def resume_study(study_id: str) -> dict[str, Any]:
+    """Resume unfinished cases using owned input, simulator, and completed fit snapshots.
+
+    Verify settings, build identity and artifact hashes. Preserve successful tasks
+    and reuse each completed simulation when retrying a failed fit. Refuse a second
+    coordinator or surviving orphan computation. Changed inputs require a new study."""
+    return await asyncio.to_thread(_safe, STUDY_MANAGER.resume, study_id)
+
+
+@mcp.tool(structured_output=False)
+async def check_sbc(request_file: str) -> dict[str, Any]:
+    """Use an absolute server-local JSON request path naming study_id, draws, thin, bins and seed.
+
+    Read explicit truth mappings from a finished joint-simulation study. Compare
+    selected fitted quantities with their simulated truths, including user-supplied
+    data-dependent quantities. Return randomized exact-tie ranks, finite-draw
+    interval coverage, Wilson uncertainty and missing-case bounds.
+    Raw case arrays stay in Safetensors, with JSON reports and SVG plot artifacts.
+    MCMC independence remains unverified after thinning: ranks are descriptive,
+    without a calibrated uniformity verdict. See docs/validation.md."""
+    return await asyncio.to_thread(_safe, calibration.check_sbc, request_file)
 
 
 @mcp.tool(structured_output=False)
@@ -315,16 +391,22 @@ def _batch_job(run_id: str) -> bool:
 
 
 def _run_status(run_id: str) -> dict[str, Any]:
+    if runstore.read_meta(run_id).get("method") == "study":
+        return STUDY_MANAGER.result(run_id)
     return BATCH_MANAGER.status(run_id) if _batch_job(run_id) else MANAGER.get_run_status(run_id)
 
 
 def _run_progress(run_id: str) -> dict[str, Any]:
+    if runstore.read_meta(run_id).get("method") == "study":
+        return STUDY_MANAGER.result(run_id)
     return (
         BATCH_MANAGER.progress(run_id) if _batch_job(run_id) else MANAGER.get_run_progress(run_id)
     )
 
 
 def _cancel_run(run_id: str) -> dict[str, Any]:
+    if runstore.read_meta(run_id).get("method") == "study":
+        return STUDY_MANAGER.cancel(run_id)
     return BATCH_MANAGER.cancel(run_id) if _batch_job(run_id) else MANAGER.cancel_run(run_id)
 
 
@@ -360,6 +442,8 @@ async def rerun(run_id: str) -> dict[str, Any]:
 async def await_run(run_id: str, timeout: float | None = None) -> dict[str, Any]:
     """Block server-side until the run finishes (or timeout), then return its status."""
     try:
+        if await asyncio.to_thread(lambda: runstore.read_meta(run_id).get("method") == "study"):
+            return await STUDY_MANAGER.await_job(run_id, timeout=timeout)
         if await asyncio.to_thread(_batch_job, run_id):
             return await BATCH_MANAGER.await_job(run_id, timeout=timeout)
         return await MANAGER.await_run(run_id, timeout=timeout)
@@ -502,4 +586,5 @@ def main() -> None:
     try:
         mcp.run()
     finally:
+        STUDY_MANAGER.shutdown()
         BATCH_MANAGER.shutdown()

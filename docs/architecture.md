@@ -1,6 +1,6 @@
 # Architecture
 
-`stan_mcp/server.py` registers 32 MCP tools with `MCPServer`. Blocking work runs in
+`stan_mcp/server.py` registers 37 MCP tools with `MCPServer`. Blocking work runs in
 `asyncio.to_thread`. Tool errors become structured error dictionaries. Results
 normalize nonfinite numbers recursively before MCP serialization.
 
@@ -19,6 +19,10 @@ normalize nonfinite numbers recursively before MCP serialization.
 | `stan_mcp/fitstorage.py` | Persist fits, raw CSVs and typed sidecars |
 | `stan_mcp/diagnostics.py` | Summarize fits, report sampler health, localize divergences and compute LOO |
 | `stan_mcp/geometry.py` | Inspect posterior conditioning in verified parameter coordinates |
+| `stan_mcp/predictive.py` | Compare explicit observed and replicated statistics, write plots and reports |
+| `stan_mcp/studies.py` | Snapshot study inputs, coordinate shared run workers, preserve and resume cases |
+| `stan_mcp/calibration.py` | Report descriptive SBC ranks, coverage and missing-case bounds |
+| `stan_mcp/validation_stats.py` | Calculate Wilson intervals and draw-law-aware Monte Carlo uncertainty |
 | `stan_mcp/serialization.py` | Normalize numerical tool responses for JSON |
 | `stan_mcp/stansummary.py` | Invoke and parse CmdStan's MCMC summaries |
 | `stan_mcp/methods.py` | Validate method-specific arguments |

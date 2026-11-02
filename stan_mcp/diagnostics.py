@@ -482,17 +482,8 @@ def _idata_with_loglik(run_id: str, var_name: str) -> Any:
 def _require_posterior_draws(run_id: str) -> None:
     meta = runstore.read_meta(run_id)
     method = meta.get("method")
-    if method == "sample":
+    if draws.sampling_method(run_id) == "sample":
         return
-    if method == "generate_quantities":
-        # A CSV snapshot retains the source sampling law after pruning.
-        source_method = meta.get("input_method")
-        source = meta.get("method_args", {}).get("from_run_id")
-        if source_method is None and source:
-            _require_posterior_draws(source)
-            return
-        if source_method == "sample":
-            return
     raise RunError(
         f"run {run_id!r} has no verified posterior sampling law ({method!r}); "
         "ordinary PSIS-LOO requires MCMC posterior draws. Approximate fits need "

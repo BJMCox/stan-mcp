@@ -43,5 +43,6 @@ Batch inputs and outputs use Safetensors shards with JSON manifests.
 
 - [Tools and examples](docs/usage.md)
 - [Batch evaluation and comparisons](docs/batches.md)
+- [Predictive checks, studies and calibration](docs/validation.md)
 - [Remote execution over SSH](docs/remote.md)
 - [Configuration and storage](docs/configuration.md)

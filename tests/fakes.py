@@ -247,3 +247,72 @@ class _GeneratedModel:
             metadata=InferenceMetadata({"raw_header": "g"}),
             runset=SimpleNamespace(csv_files=outputs),
         )
+
+
+def write_draws_run(run_id, params, method="sample", seed=0):
+    """Persist arbitrary shaped arrays through the public typed CSV reader."""
+    from stan_mcp import draws
+
+    directory = runstore.run_dir(run_id, create=True)
+    if not (directory / "meta.json").exists():
+        runstore.write_meta(run_id, {"method": method, "status": "done", "seed": seed})
+    csvdir = directory / "csv"
+    csvdir.mkdir(exist_ok=True)
+    first = next(iter(params.values()))
+    specs = {}
+    headers = []
+    blocks = []
+    for name, values in params.items():
+        values = np.asarray(values)
+        labels = list(draws.element_labels(name, values.shape[2:]))
+        specs[name] = {
+            "dims": list(values.shape[2:]),
+            "cols": list(range(len(headers), len(headers) + len(labels))),
+        }
+        headers.extend(column for _, column in labels)
+        blocks.append(values.reshape(*values.shape[:2], -1))
+    array = np.concatenate(blocks, axis=-1)
+    files = []
+    for chain in range(first.shape[0]):
+        filename = f"chain-{chain}.csv"
+        np.savetxt(
+            csvdir / filename,
+            array[chain],
+            delimiter=",",
+            header=",".join(headers),
+            comments="",
+            fmt="%.17g",
+        )
+        files.append(filename)
+    draws.schema_path(run_id).write_text(
+        json.dumps(
+            {"schema": 3, "header": headers, "files": files, "params": specs, "sampler_stats": {}}
+        )
+    )
+
+
+def analytic_study_manager(monkeypatch):
+    """Real run/study coordination with exact Normal–Normal simulation and fitting."""
+    from stan_mcp import compilation, inference, studies
+
+    manager = inference.RunManager(max_workers=2)
+    # Unit tests own no native children; real process inspection is tested at
+    # the native boundary and with explicit process stand-ins.
+    monkeypatch.setattr(studies, "_no_surviving_process", lambda run_id: None)
+    monkeypatch.setattr(inference, "_kill_run_processes", lambda run_id: [])
+    monkeypatch.setattr(compilation, "cmdstan_model", lambda source, args=None: source)
+    monkeypatch.setattr(manager, "_compile", lambda source, args: source)
+
+    def runner(method, model, data, kwargs):
+        rng = np.random.default_rng(kwargs["seed"])
+        if "theta_sim" in model:
+            truth = rng.normal()
+            return {"theta_sim": np.array([[truth]]), "y_sim": np.array([[rng.normal(truth)]])}
+        y = data["y"]
+        return {"theta": rng.normal(y / 2, np.sqrt(0.5), size=(2, 100))}
+
+    monkeypatch.setattr(manager, "_runner", runner)
+    monkeypatch.setattr(
+        manager, "_persist", lambda run_id, method, fit: write_draws_run(run_id, fit, method)
+    )
+    return studies.StudyManager(manager)

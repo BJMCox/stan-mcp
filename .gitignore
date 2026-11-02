@@ -12,4 +12,5 @@ docs/*
 !docs/internals.md
 !docs/remote.md
 !docs/batches.md
+!docs/validation.md
 !AGENTS.md

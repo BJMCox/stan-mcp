@@ -128,9 +128,9 @@ component. Returns `{"max_abs_err", "max_rel_err", "mismatches": [{"index",
 "autodiff", "finite_diff"}, ...]}` where `mismatches` lists only components
 whose absolute error exceeds `tol`.
 
-## Runs (all six CmdStanPy methods)
+## Runs
 
-`method` is one of `sample`, `optimize`, `variational`, `pathfinder`,
+`method` is one of `sample`, `fixed_param`, `optimize`, `variational`, `pathfinder`,
 `laplace`, `generate_quantities` (see `methods.METHODS` in
 [docs/internals.md](internals.md) for each method's allowed `method_args` and
 capabilities).

@@ -8,6 +8,51 @@ from stan_mcp import draws, runstore
 from stan_mcp.errors import RunError
 
 
+def read_fitted_csvs(csvs: list[str]) -> Any:
+    """Load fitted parameters, retaining the fixed-parameter sampling law.
+
+    CmdStanPy 1.3's from_csv reconstructs fixed_param CSVs with adaptation
+    enabled. Its zero-warmup validation then fails. Keep that compatibility
+    adapter here, and let CmdStanMCMC validate every supplied chain normally.
+    """
+    import cmdstanpy
+    from cmdstanpy.cmdstan_args import CmdStanArgs, SamplerArgs
+    from cmdstanpy.stanfit.runset import RunSet
+    from cmdstanpy.utils.stancsv import parse_config
+
+    comments = []
+    with Path(csvs[0]).open("rb") as stream:
+        for line in stream:
+            if line.strip() and not line.startswith(b"#"):
+                break
+            comments.append(line)
+    config = parse_config(comments)
+    if config.get("method") != "sample" or config.get("algorithm") != "fixed_param":
+        return cmdstanpy.from_csv(csvs)
+    sampler = SamplerArgs(
+        iter_sampling=int(config["num_samples"]),
+        iter_warmup=int(config["num_warmup"]),
+        thin=int(config["thin"]),
+        save_warmup=bool(config["save_warmup"]),
+        fixed_param=True,
+        adapt_engaged=False,
+    )
+    args = CmdStanArgs(
+        model_name=str(config["model"]),
+        model_exe=str(config["model"]),
+        chain_ids=list(range(1, len(csvs) + 1)),
+        method_args=sampler,
+    )
+    runset = RunSet(args=args, chains=len(csvs))
+    # The same RunSet attachment used by CmdStanPy's from_csv implementation.
+    runset._csv_files = list(csvs)
+    for index in range(len(csvs)):
+        runset._set_retcode(index, 0)
+    fit = cmdstanpy.CmdStanMCMC(runset)
+    fit.draws()
+    return fit
+
+
 def _method_diagnostics(method: str, fit: Any) -> dict[str, Any]:
     """Method-specific health scalars pulled from the fit.
 

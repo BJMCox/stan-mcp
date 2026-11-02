@@ -33,6 +33,10 @@ Keep plans, review ledgers and experiment reports outside Git.
 - `stan_mcp/draws.py` owns typed draw loading and bounded extraction.
 - `stan_mcp/diagnostics.py` owns summaries, convergence, pathologies and LOO.
 - `stan_mcp/geometry.py` owns posterior conditioning checks.
+- `stan_mcp/predictive.py` owns checks of explicit replicated and observed quantities.
+- `stan_mcp/studies.py` owns multi-run studies, simulator mappings and resume checkpoints.
+- `stan_mcp/calibration.py` owns descriptive SBC reports and artifacts.
+- `stan_mcp/validation_stats.py` owns shared uncertainty calculations.
 - `stan_mcp/batch/` separates artifact storage, evaluation, comparison and job coordination.
 - `stan_mcp/serialization.py` normalizes numerical values for JSON tool responses.
 
@@ -57,6 +61,9 @@ Import each module through its canonical package path. Avoid `sys.path` and `sys
 - Keep raw CmdStan CSVs as the durable draw values. Preserve typed sidecar column ordering.
 - Preserve input CSV and initialization snapshots for reproducible reruns.
 - Use MCMC diagnostics only for MCMC draws. Approximate fits do not acquire R-hat/ESS claims.
+- Treat fixed-parameter simulation separately from MCMC. Require an explicit declaration for iid uncertainty.
+- Preserve every planned study case. Never replace a failed simulated dataset with a new successful case.
+- Keep SBC ranks descriptive when retained posterior independence is unverified.
 - Keep numerical payloads and error summaries bounded. Send arrays through files for batches.
 - Keep installer/build progress on stderr. Reserve stdout for the MCP protocol.
 

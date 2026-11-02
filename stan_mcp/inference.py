@@ -10,6 +10,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 
@@ -95,9 +96,10 @@ def _kill_run_processes(run_id: str) -> list[int]:
     killed: list[int] = []
     try:
         me = psutil.Process(os.getpid())
-    except psutil.Error:
+        children = me.children(recursive=True)
+    except psutil.Error, OSError:
         return killed
-    for child in me.children(recursive=True):
+    for child in children:
         try:
             cmdline = child.cmdline()
         except psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess:
@@ -128,6 +130,7 @@ class RunManager:
         )
         self._handles: dict[str, _Handle] = {}
         self._lock = threading.Lock()
+        self._token = uuid4().hex
         runstore.reconcile_abandoned()
 
     # --- injectable seams (replaced in tests) ---
@@ -146,7 +149,7 @@ class RunManager:
             if csvs is not None:
                 import cmdstanpy
 
-                previous_fit = cmdstanpy.from_csv(csvs)
+                previous_fit = fitstorage.read_fitted_csvs(csvs)
                 if not isinstance(
                     previous_fit, (cmdstanpy.CmdStanMCMC, cmdstanpy.CmdStanMLE, cmdstanpy.CmdStanVB)
                 ):
@@ -168,8 +171,10 @@ class RunManager:
             # ADVI is approximate; don't hard-fail the run on the convergence
             # gate (draws are still returned and summarized from the CSVs).
             kwargs.setdefault("require_converged", False)
-        if method == "sample":
+        if method in {"sample", "fixed_param"}:
             kwargs = dict(kwargs)
+            # Progress bars can emit blank stdout lines and corrupt MCP stdio.
+            kwargs.setdefault("show_progress", False)
             # CmdStanPy would otherwise default parallel_chains to
             # min(cpu_count(), chains) per run, so `max_workers` concurrent
             # runs would oversubscribe the machine several times over.
@@ -203,6 +208,8 @@ class RunManager:
         inits: dict[str, Any] | list | float | int | str | None = None,
         method_args: dict[str, Any] | None = None,
         inits_from: str | None = None,
+        *,
+        study: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Submit owned inputs; warm starts use a valid mean or stored draw."""
         if inits_from is not None and inits is None:
@@ -262,7 +269,9 @@ class RunManager:
                     "seed": seed,
                     "created_at": _now(),
                     "owner": runstore.process_owner(),
+                    "manager_token": self._token,
                     "input_method": input_method,
+                    **({"study": dict(study)} if study is not None else {}),
                 },
             )
         except Exception:
@@ -349,20 +358,19 @@ class RunManager:
                 with self._lock:
                     self._handles.pop(run_id, None)
                 return {"run_id": run_id, "cancelled": True, "status": "cancelled"}
+            # Compilation has no CmdStan PID yet. Remember the request so the
+            # worker cannot start inference after compilation completes.
+            handle.cancelled = True
             killed = _kill_run_processes(run_id)
-            handle.cancelled = handle.cancelled or bool(killed)
-            if handle.cancelled:
-                meta = runstore.read_meta(run_id)
-                meta["status"] = "cancelling"
-                runstore.write_meta(run_id, meta)
+            meta = runstore.read_meta(run_id)
+            meta["status"] = "cancelling"
+            runstore.write_meta(run_id, meta)
             return {
                 "run_id": run_id,
                 "cancelled": handle.cancelled,
-                "status": "cancelling" if handle.cancelled else "running",
+                "status": "cancelling",
                 "killed_pids": killed,
-                "reason": None
-                if handle.cancelled
-                else "no live CmdStan process found (still compiling or between chains); retry",
+                "reason": None if killed else "waiting for compilation or process shutdown",
             }
 
     def get_run_progress(self, run_id: str) -> dict[str, Any]:
@@ -413,6 +421,8 @@ class RunManager:
                     meta = runstore.read_meta(run_id)
                     meta["model_id"] = manifest["model_id"]
                     runstore.write_meta(run_id, meta)
+                    if handle.cancelled:
+                        raise RunError("run cancelled before inference started")
                 # Route CmdStan's live CSV output to a per-run dir so cancel can
                 # target this run's subprocesses and progress can be measured.
                 # generate_quantities spells the argument gq_output_dir.
@@ -424,7 +434,12 @@ class RunManager:
                     # Record the verified law for external inputs and reruns,
                     # whose CSV snapshots no longer reference a source run.
                     meta = runstore.read_meta(run_id)
-                    meta["input_method"] = fit.previous_fit.metadata.cmdstan_config["method"]
+                    prior_config = fit.previous_fit.metadata.cmdstan_config
+                    meta["input_method"] = (
+                        "fixed_param"
+                        if prior_config.get("algorithm") == "fixed_param"
+                        else prior_config["method"]
+                    )
                     runstore.write_meta(run_id, meta)
                 self._persist(run_id, method, fit)
                 # re-read: _persist may have written its own warning fields
@@ -460,8 +475,16 @@ class RunManager:
                 self._handles.pop(run_id, None)
 
     def get_run_status(self, run_id: str) -> dict[str, Any]:
+        with self._lock:
+            active = run_id in self._handles
         meta = runstore.read_meta(run_id)
         out = {k: meta[k] for k in ("run_id", "method", "status") if k in meta}
+        if (
+            not active
+            and meta.get("manager_token") == self._token
+            and meta.get("status") in {"running", "cancelling"}
+        ):
+            out.update(status="failed", error="worker exited without committing terminal metadata")
         if meta.get("stderr"):
             out["error"] = _error_excerpt(meta["stderr"])
         # Surface persist warnings so a status="done" run whose draws failed to
@@ -478,7 +501,7 @@ class RunManager:
             # already finished in a prior process/session: read from disk
             meta = runstore.read_meta(run_id)
             return {
-                "status": meta["status"],
+                "status": self.get_run_status(run_id)["status"],
                 "run_dir": str(runstore.run_dir(run_id)),
                 "meta": meta,
             }
@@ -502,7 +525,11 @@ class RunManager:
             with handle.lock:
                 handle.aio_events.remove(waiter)
         meta = runstore.read_meta(run_id)
-        return {"status": meta["status"], "run_dir": str(runstore.run_dir(run_id)), "meta": meta}
+        return {
+            "status": self.get_run_status(run_id)["status"],
+            "run_dir": str(runstore.run_dir(run_id)),
+            "meta": meta,
+        }
 
 
 def posterior_mean_inits(run_id: str) -> dict[str, Any]:
