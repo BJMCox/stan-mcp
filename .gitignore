@@ -1,5 +1,5 @@
 .pixi/
-pixi.lock
+!pixi.lock
 __pycache__/
 *.pyc
 *.egg-info/
@@ -13,4 +13,5 @@ docs/*
 !docs/remote.md
 !docs/batches.md
 !docs/validation.md
+!docs/install.md
 !AGENTS.md

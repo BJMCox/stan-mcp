@@ -4,27 +4,19 @@ Use [Stan](https://mc-stan.org) from an MCP client. Compile models, evaluate log
 densities and derivatives, run inference, and inspect convergence. Batch jobs
 evaluate many points or compare Stan against results from another implementation.
 
-## Run
+## Install
 
-Install [Pixi](https://pixi.sh), then run:
+Install [Pixi](https://pixi.sh) 0.83 or later, then run:
 
 ```sh
-pixi install
-pixi run serve
+pixi run --script https://raw.githubusercontent.com/BJMCox/stan-mcp/main/install.py
 ```
 
-The server uses stdio. Example MCP client configuration:
-
-```json
-{
-  "mcpServers": {
-    "stan": {
-      "command": "pixi",
-      "args": ["run", "--manifest-path", "/absolute/path/stan-mcp/pixi.toml", "serve"]
-    }
-  }
-}
-```
+Toggle **Claude Code** and **Codex** independently, then press Enter.
+The installer downloads the repo and installs its Pixi environment.
+No prior checkout or GitHub account is needed. Restart the selected clients.
+See [installation](docs/install.md) for unattended setup, updates, and removal.
+From an existing checkout, run `pixi run setup` or `pixi run serve`.
 
 BridgeStan and CmdStan download their source trees on first use. Pixi supplies
 Python and the C++ toolchain. Compiled models and run results live in

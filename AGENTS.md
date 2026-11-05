@@ -7,6 +7,7 @@ Use Python MCP for interactive Python work when available.
 
 ```sh
 pixi install
+pixi run setup
 pixi run serve
 pixi run test
 pixi run test-live
@@ -21,6 +22,8 @@ Pytest, Ruff and Pyright settings live in `pyproject.toml`.
 
 Keep the README short and written for users. Put agent instructions here.
 Keep plans, review ledgers and experiment reports outside Git.
+Keep `pixi.lock` tracked. The installer and client launch commands use `--locked`.
+Test client registration with isolated `CODEX_HOME` and `CLAUDE_CONFIG_DIR` directories.
 
 ## Module ownership
 

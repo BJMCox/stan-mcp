@@ -1,11 +1,50 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+
+async def test_pixi_launcher_from_foreign_directory(tmp_path):
+    from stan_mcp import server
+
+    pixi = shutil.which("pixi")
+    if pixi is None:
+        pytest.skip("requires the Pixi launcher")
+    project = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "STAN_MCP_HOME": str(tmp_path / "home")}
+    setup = subprocess.run(
+        [sys.executable, str(project / "install.py"), "--source", str(project), "--no-clients"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert setup.returncode == 0, setup.stderr
+    params = StdioServerParameters(
+        command=pixi,
+        args=["run", "--locked", "--manifest-path", str(project / "pixi.toml"), "serve"],
+        cwd=str(tmp_path),
+        env=env,
+    )
+    async with stdio_client(params) as (reader, writer):
+        async with ClientSession(reader, writer) as session:
+            await session.initialize()
+            tools = (await session.list_tools()).tools
+            expected = await server.mcp.list_tools()
+            assert {tool.name: tool.input_schema for tool in tools} == {
+                tool.name: tool.input_schema for tool in expected
+            }
+            result = await session.call_tool("register_data", {"data": {"n": 2}})
+            assert not result.is_error
+            payload = json.loads(next(item.text for item in result.content if item.type == "text"))
+            assert len(payload["data_id"]) == 16
 
 
 async def test_ssh_launcher_preserves_protocol_and_quoted_paths(tmp_path):
