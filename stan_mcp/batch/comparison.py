@@ -6,6 +6,7 @@ stencils; no foreign coordinate transform or supplied weights are executed.
 """
 
 from bisect import bisect_left
+from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -22,13 +23,16 @@ _WORST_LIMIT = 8
 class _Rows:
     """A shard range index with at most one loaded shard per input artifact."""
 
-    def __init__(self, manifest: dict[str, Any]) -> None:
+    def __init__(self, manifest: dict[str, Any], tensors: tuple[str, ...] | None = None) -> None:
         self.manifest = manifest
         self.ends: list[int] = []
         self.indices: list[int] = []
         self.count = 0
         self.index = -1
         self.arrays: dict[str, np.ndarray] = {}
+        self.tensors = tensors
+        self.projected: OrderedDict[int, tuple[dict[str, np.ndarray], int]] = OrderedDict()
+        self.projected_bytes = 0
         for index, descriptor in enumerate(manifest["shards"]):
             self.count += descriptor["rows"]
             if descriptor["rows"]:
@@ -40,14 +44,37 @@ class _Rows:
         if position == len(self.ends):
             return None
         index = self.indices[position]
-        if index != self.index:
-            self.arrays = batchstore.read_shard(self.manifest, self.manifest["shards"][index])
-            self.index = index
-        offset = int(np.searchsorted(self.arrays["row_id"], row_id))
-        ids = self.arrays["row_id"]
+        if self.tensors is None:
+            if index != self.index:
+                self.arrays = batchstore.read_shard(self.manifest, self.manifest["shards"][index])
+                self.index = index
+            arrays = self.arrays
+        else:
+            arrays = self._project(index)
+        ids = arrays["row_id"]
+        offset = int(np.searchsorted(ids, row_id))
         if offset == len(ids) or ids[offset] != row_id:
             return None
-        return self.arrays, offset
+        return arrays, offset
+
+    def _project(self, index: int) -> dict[str, np.ndarray]:
+        if index in self.projected:
+            self.projected.move_to_end(index)
+            return self.projected[index][0]
+        arrays = batchstore.read_shard(
+            self.manifest, self.manifest["shards"][index], tensors=self.tensors
+        )
+        size = sum(values.nbytes for values in arrays.values())
+        budget = 16 * 1024 * 1024
+        if size <= budget:
+            while self.projected and (
+                self.projected_bytes + size > budget or len(self.projected) >= 64
+            ):
+                _, (_, released) = self.projected.popitem(last=False)
+                self.projected_bytes -= released
+            self.projected[index] = arrays, size
+            self.projected_bytes += size
+        return arrays
 
 
 def _coordinates(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -87,7 +114,12 @@ def _tolerances(request: dict[str, Any], quantities: list[str]) -> dict[str, dic
 
 
 def _fd_plan(
-    request: dict[str, Any], directory: Path, right: dict[str, Any], quantities: list[str]
+    request: dict[str, Any],
+    directory: Path,
+    right: dict[str, Any],
+    quantities: list[str],
+    *,
+    owned: bool,
 ) -> dict[str, Any] | None:
     supplied = request.get("finite_difference")
     if supplied is None:
@@ -122,7 +154,11 @@ def _fd_plan(
         or set(selected) - (set(quantities) - {"log_density"})
     ):
         raise ValidationError("Finite-difference quantities must name requested derivatives")
-    path = batchstore.snapshot(supplied["stencils"], directory / "stencils")
+    path = (
+        Path(supplied["stencils"])
+        if owned
+        else batchstore.snapshot(supplied["stencils"], directory / "stencils")
+    )
     stencil = batchstore.load(path)
     if stencil["kind"] != "points" or stencil["point_space"] != "constrained":
         raise ValidationError(
@@ -133,11 +169,17 @@ def _fd_plan(
     return {"steps": steps, "quantities": selected, "manifest": str(path)}
 
 
-def prepare(request: dict[str, Any], directory: Path) -> dict[str, Any]:
+def prepare(request: dict[str, Any], directory: Path, *, owned: bool = False) -> dict[str, Any]:
     """Snapshot and validate comparison inputs before publishing discrepancies."""
     directory.mkdir(parents=True, exist_ok=True)
-    left_path = batchstore.snapshot(request["left"], directory / "left")
-    right_path = batchstore.snapshot(request["right"], directory / "right")
+    left_path = (
+        Path(request["left"]) if owned else batchstore.snapshot(request["left"], directory / "left")
+    )
+    right_path = (
+        Path(request["right"])
+        if owned
+        else batchstore.snapshot(request["right"], directory / "right")
+    )
     left, right = batchstore.load(left_path), batchstore.load(right_path)
     for manifest in (left, right):
         if manifest["kind"] != "results" or manifest["point_space"] != "constrained":
@@ -156,7 +198,7 @@ def prepare(request: dict[str, Any], directory: Path) -> dict[str, Any]:
     ):
         raise ValidationError("Comparison quantities must be present in right results")
     tolerances = _tolerances(request, quantities)
-    fd = _fd_plan(request, directory, right, quantities)
+    fd = _fd_plan(request, directory, right, quantities, owned=owned)
     fd_quantities = set(fd["quantities"]) if fd else set()
     native = set(quantities) - fd_quantities
     if native - set(left.get("quantities", [])):
@@ -169,6 +211,7 @@ def prepare(request: dict[str, Any], directory: Path) -> dict[str, Any]:
     if not isinstance(offset_mode, bool) or (offset_mode and "log_density" not in quantities):
         raise ValidationError("additive_constant must be boolean and requires log_density")
     left_rows = _Rows(left)
+    perturbations = _Rows(left, ("row_id",))
     stencil_rows = _Rows(batchstore.load(fd["manifest"])) if fd else None
     matched = 0
     output_row_bytes = 0
@@ -225,7 +268,7 @@ def prepare(request: dict[str, Any], directory: Path) -> dict[str, Any]:
                     if ids.dtype != np.int64 or np.any(ids < 0):
                         raise ValidationError("Stencil row references must be nonnegative int64")
                     for perturbation in ids.flat:
-                        if left_rows.get(int(perturbation)) is None:
+                        if perturbations.get(int(perturbation)) is None:
                             raise ValidationError(f"Missing perturbation result row {perturbation}")
     output_rows = min(4096, (batchstore.MAX_SHARD_BYTES - 16384) // max(output_row_bytes, 1))
     if output_rows < 1:
@@ -455,6 +498,7 @@ def execute(
     quantities = metadata["quantities"]
     fd = metadata["finite_difference"]
     left_rows = _Rows(left)
+    perturbations = _Rows(left, ("row_id", "status", "log_density"))
     stencil_rows = _Rows(batchstore.load(fd["manifest"])) if fd else None
     fd_quantities = set(fd["quantities"]) if fd else set()
     completed = list(plan.get("completed", []))
@@ -510,7 +554,7 @@ def execute(
                         quantity,
                         stencil[f"fd_{quantity}_rows"][position],
                         fd["steps"],
-                        left_rows,
+                        perturbations,
                         cancelled,
                     )
                     if estimate is None:
@@ -611,7 +655,7 @@ def execute(
         descriptor["comparison_summary"] = shard_summary
         descriptor["offset"] = offset
         completed.append(descriptor)
-        batchstore.atomic_json(directory / "comparison-checkpoint.json", {"completed": completed})
+        batchstore.record_completed(directory, shard_index, descriptor)
         progress(len(completed), len(right["shards"]))
     finished = len(completed) == len(right["shards"])
     summary = {q: _summary() for q in quantities}

@@ -68,7 +68,7 @@ class _Handle:
 
 
 class BatchManager:
-    def __init__(self, max_workers: int | None = None) -> None:
+    def __init__(self, max_workers: int | None = None, *, reconcile: bool = True) -> None:
         self.max_workers = config.max_workers() if max_workers is None else max_workers
         if self.max_workers < 1:
             raise ValidationError("batch worker cap must be positive")
@@ -76,7 +76,8 @@ class BatchManager:
         self._worker_target: Callable[[dict[str, Any], str, Connection, Connection], None] = _worker
         self._handles: dict[str, _Handle] = {}
         self._lock = threading.RLock()
-        runstore.reconcile_abandoned()
+        if reconcile:
+            runstore.reconcile_abandoned()
 
     @staticmethod
     def _directory(job_id: str) -> Path:
@@ -97,10 +98,10 @@ class BatchManager:
         if kind == "evaluate":
             from stan_mcp.batch import evaluation as batcheval
 
-            return batcheval.prepare(request, directory)
+            return batcheval.prepare(request, directory, owned=True)
         from stan_mcp.batch import comparison as batchcompare
 
-        return batchcompare.prepare(request, directory)
+        return batchcompare.prepare(request, directory, owned=True)
 
     @staticmethod
     def _snapshot_request(kind: str, request: dict[str, Any], directory: Path) -> dict[str, Any]:
@@ -267,29 +268,24 @@ class BatchManager:
     def _evaluate(
         self, job_id: str, handle: _Handle, plan: dict[str, Any], output: Path, workers: int
     ) -> dict[str, Any]:
-        manifest = batchstore.load(plan["input_manifest"])
-        checkpoint = output.parent / "checkpoint.json"
-        completed = json.loads(checkpoint.read_text()) if checkpoint.exists() else {}
-        pending = iter(
-            index for index in range(len(manifest["shards"])) if str(index) not in completed
-        )
+        manifest = plan.get("input_artifact") or batchstore.load(plan["input_manifest"])
+        completed = self._completed(output, "evaluate")
+        pending = iter(index for index in range(len(manifest["shards"])) if index not in completed)
         errors: list[str] = []
+        processed_rows = sum(item["rows"] for item in completed.values())
 
-        def publish() -> None:
-            descriptors = [completed[key] for key in sorted(completed, key=int)]
-            batchstore.atomic_json(checkpoint, completed)
-            if descriptors:
-                batchstore.publish(output, plan["output_metadata"], descriptors)
+        def progress() -> None:
             self._update(
                 job_id,
                 handle,
-                processed_shards=len(descriptors),
+                processed_shards=len(completed),
                 total_shards=len(manifest["shards"]),
                 total_rows=manifest["count"],
-                processed_rows=sum(item["rows"] for item in descriptors),
+                processed_rows=processed_rows,
             )
 
         def consume() -> None:
+            nonlocal processed_rows
             if not self._acquire(handle):
                 return
             parent: Connection | None = None
@@ -335,8 +331,11 @@ class BatchManager:
                     if "error" in reply:
                         raise RunError(reply["error"])
                     with handle.lock:
-                        completed[str(index)] = reply["descriptor"]
-                        publish()
+                        descriptor = reply["descriptor"]
+                        batchstore.record_completed(output, index, descriptor)
+                        completed[index] = descriptor
+                        processed_rows += descriptor["rows"]
+                        progress()
                 if process.is_alive():
                     parent.send(None)
             except Exception:
@@ -364,8 +363,7 @@ class BatchManager:
                             connection.close()
                     self._slots.release()
 
-        with handle.lock:
-            publish()
+        progress()
         threads = [
             threading.Thread(target=consume)
             for _ in range(min(workers, len(manifest["shards"]) - len(completed)))
@@ -387,7 +385,7 @@ class BatchManager:
             raise RunError("batch workers stopped before all shards were completed")
         result: dict[str, Any] = {"completed_shards": len(completed)}
         if completed:
-            result["manifest"] = str(output / "manifest.json")
+            result["manifest"] = str(self._publish_evaluation(output, plan))
         return result
 
     def _compare(
@@ -398,9 +396,8 @@ class BatchManager:
         if not self._acquire(handle):
             return {"cancelled": True}
         try:
-            checkpoint = output / "comparison-checkpoint.json"
-            if checkpoint.exists():
-                plan = {**plan, "completed": json.loads(checkpoint.read_text())["completed"]}
+            completed = self._completed(output, "compare")
+            plan = {**plan, "completed": [completed[i] for i in range(len(completed))]}
             right = batchstore.read_json(plan["right_manifest"])
             prefix = [0]
             for descriptor in right["shards"]:
@@ -429,6 +426,35 @@ class BatchManager:
         finally:
             self._slots.release()
 
+    @staticmethod
+    def _completed(output: Path, kind: str) -> dict[int, dict[str, Any]]:
+        comparison = kind == "compare"
+        legacy = (
+            output / "comparison-checkpoint.json"
+            if comparison
+            else output.parent / "checkpoint.json"
+        )
+        records = batchstore.completed_records(output, legacy, comparison=comparison)
+        if comparison and set(records) != set(range(len(records))):
+            raise RunError("comparison checkpoint must be a contiguous prefix")
+        return records
+
+    @classmethod
+    def _publish_evaluation(cls, output: Path, plan: dict[str, Any]) -> Path:
+        # Another server may request a partial manifest while this server
+        # finishes the job. Read the immutable records inside the publish lock
+        # so a partial manifest cannot overwrite a later result.
+        with (output / ".publish.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            completed = cls._completed(output, "evaluate")
+            descriptors = [completed[key] for key in sorted(completed)]
+            manifest = output / "manifest.json"
+            if not descriptors or (
+                manifest.is_file() and batchstore.read_json(manifest)["shards"] == descriptors
+            ):
+                return manifest
+            return batchstore.publish(output, plan["output_metadata"], descriptors)
+
     def status(self, job_id: str) -> dict[str, Any]:
         meta = runstore.read_meta(job_id)
         if meta.get("method") not in _METHODS.values():
@@ -454,7 +480,22 @@ class BatchManager:
         result = self.progress(job_id)
         meta = runstore.read_meta(job_id)
         result.update(meta.get("result", {}))
-        manifest = self._directory(job_id) / "results" / "manifest.json"
+        directory = self._directory(job_id)
+        output = directory / "results"
+        manifest = output / "manifest.json"
+        if (
+            meta["kind"] == "evaluate"
+            and (
+                meta["status"] == "failed"
+                or (meta["status"] in _ACTIVE and meta["processed_shards"])
+            )
+            and (directory / "plan.json").is_file()
+        ):
+            try:
+                plan = batchstore.read_json(directory / "plan.json")
+                manifest = self._publish_evaluation(output, plan)
+            except (OSError, StanMcpError) as exc:
+                result["manifest_warning"] = str(exc)[:800]
         if manifest.exists():
             result["manifest"] = str(manifest)
         return result
@@ -521,7 +562,11 @@ class BatchManager:
                 from stan_mcp.batch import evaluation as batcheval
 
                 batcheval.validate_plan(plan)
-            self._validate_completed(directory, plan, meta["kind"])
+            with (directory / "results" / ".publish.lock").open("a") as publication:
+                fcntl.flock(publication, fcntl.LOCK_EX)
+                self._validate_completed(
+                    directory, plan, meta["kind"], meta.get("processed_shards", 0)
+                )
             meta.update(status="running", owner=runstore.process_owner(), resumed_at=_now())
             meta.pop("finished_at", None)
             meta.pop("stderr", None)
@@ -559,25 +604,20 @@ class BatchManager:
         if any(worker.status() != psutil.STATUS_ZOMBIE for worker in alive):
             raise RunError("abandoned batch workers have not stopped")
 
-    @staticmethod
-    def _validate_completed(directory: Path, plan: dict[str, Any], kind: str) -> None:
+    @classmethod
+    def _validate_completed(
+        cls, directory: Path, plan: dict[str, Any], kind: str, reported: int
+    ) -> None:
         output = directory / "results"
-        checkpoint = (
-            directory / "checkpoint.json"
-            if kind == "evaluate"
-            else output / "comparison-checkpoint.json"
-        )
-        state = json.loads(checkpoint.read_text()) if checkpoint.exists() else {}
-        descriptors = list(state.values()) if kind == "evaluate" else state.get("completed", [])
+        state = cls._completed(output, kind)
+        if len(state) < reported:
+            raise RunError("batch checkpoint is missing committed shards")
+        descriptors = list(state.values())
         if len({descriptor["path"] for descriptor in descriptors}) != len(descriptors):
             raise RunError("batch checkpoint repeats a completed shard")
         inputs = batchstore.load(plan["input_manifest"])
-        if kind == "evaluate":
-            indices = {str(i) for i in range(len(inputs["shards"]))}
-            if any(key not in indices for key in state):
-                raise RunError("batch checkpoint contains an unknown input shard")
-        elif len(descriptors) > len(inputs["shards"]):
-            raise RunError("batch checkpoint exceeds its comparison input shards")
+        if any(not 0 <= key < len(inputs["shards"]) for key in state):
+            raise RunError("batch checkpoint contains an unknown input shard")
         manifest = output / "manifest.json"
         if manifest.exists():
             saved = batchstore.load(manifest)
@@ -589,7 +629,8 @@ class BatchManager:
                     for key in ("path", "sha256", "rows", "errors", "errors_sha256")
                 ):
                     raise RunError("completed batch manifest differs from its checkpoint")
-        owned = {"manifest.json", "comparison-checkpoint.json"}
+        owned = {"manifest.json", "comparison-checkpoint.json", ".publish.lock"}
+        owned.update(f".completed/{index:08d}.json" for index in state)
         for descriptor in descriptors:
             for key, hash_key in (("path", "sha256"), ("errors", "errors_sha256")):
                 if key not in descriptor:
@@ -605,9 +646,8 @@ class BatchManager:
                 raise RunError("completed batch shard row count changed")
         import numpy as np
 
-        entries = state.items() if kind == "evaluate" else enumerate(descriptors)
-        for key, descriptor in entries:
-            original = batchstore.read_shard(inputs, inputs["shards"][int(key)])
+        for key, descriptor in state.items():
+            original = batchstore.read_shard(inputs, inputs["shards"][key])
             saved_arrays = batchstore.read_shard({"_root": str(output)}, descriptor)
             if not np.array_equal(original["row_id"], saved_arrays["row_id"]):
                 raise RunError("batch checkpoint shard does not match its input rows")

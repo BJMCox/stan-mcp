@@ -455,9 +455,9 @@ def test_cancel_resume_keeps_shards_and_offset_anchor(tmp_path):
     assert partial["summary"]["verdict"] == "unknown"
     first_path = Path(partial["manifest"]).parent / partial["completed"][0]["path"]
     before = first_path.read_bytes()
-    checkpoint = batchstore.read_json(tmp_path / "output" / "comparison-checkpoint.json")
+    descriptor = batchstore.read_json(tmp_path / "output" / ".completed" / "00000000.json")
     resumed = batchcompare.execute(
-        {**plan, "completed": checkpoint["completed"]},
+        {**plan, "completed": [descriptor]},
         tmp_path / "output",
         lambda: False,
         lambda *_: None,

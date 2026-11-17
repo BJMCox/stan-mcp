@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from safetensors import safe_open
 from safetensors.numpy import load_file, save_file
 
 from stan_mcp.errors import ValidationError
@@ -65,14 +66,48 @@ def _names(value: Any, label: str) -> list[str]:
     return value
 
 
-def read_shard(manifest: dict[str, Any], descriptor: dict[str, Any]) -> dict[str, np.ndarray]:
+def read_shard(
+    manifest: dict[str, Any],
+    descriptor: dict[str, Any],
+    *,
+    tensors: tuple[str, ...] | None = None,
+) -> dict[str, np.ndarray]:
     path = resolve(manifest, descriptor["path"])
     try:
         if path.stat().st_size > MAX_SHARD_BYTES:
             raise ValidationError(f"shard {path.name!r} exceeds {MAX_SHARD_BYTES} bytes; split it")
-        return load_file(path)
+        if tensors is None:
+            return load_file(path)
+        with safe_open(path, framework="np") as source:
+            return {name: source.get_tensor(name) for name in tensors}
     except (OSError, ValueError, RuntimeError) as exc:
         raise ValidationError(f"cannot read batch shard {path.name!r}: {exc}") from exc
+
+
+def completed_records(output: Path, legacy: Path, *, comparison: bool) -> dict[int, dict[str, Any]]:
+    """Read durable shard records, including jobs saved by older servers."""
+    records: dict[int, dict[str, Any]] = {}
+    if legacy.is_file():
+        original = read_json(legacy)
+        if comparison:
+            records.update(enumerate(original.get("completed", [])))
+        else:
+            for key, descriptor in original.items():
+                index = int(key)
+                if str(index) != key:
+                    raise ValidationError("invalid legacy checkpoint shard index")
+                records[index] = descriptor
+    for path in (output / ".completed").glob("*.json"):
+        index = int(path.stem)
+        descriptor = read_json(path)
+        if path.name != f"{index:08d}.json" or (index in records and records[index] != descriptor):
+            raise ValidationError("inconsistent batch checkpoint shard record")
+        records[index] = descriptor
+    return records
+
+
+def record_completed(output: Path, index: int, descriptor: dict[str, Any]) -> None:
+    atomic_json(output / ".completed" / f"{index:08d}.json", descriptor)
 
 
 def _validate_arrays(manifest: dict[str, Any], arrays: dict[str, np.ndarray], rows: int) -> None:

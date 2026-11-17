@@ -34,12 +34,12 @@ def _model(plan: dict[str, Any]) -> density._SerializedModel:
     if any(q in plan["quantities"] for q in ("hessian", "hvp")):
         if "BRIDGESTAN_AD_HESSIAN=true" not in model.model_info():
             raise errors.ValidationError("batch curvature requires an AD-enabled native library")
-    manifest = batchstore.load(plan["input_manifest"])
+    manifest = plan.get("input_artifact") or batchstore.load(plan["input_manifest"])
     _CONTEXT = key, model, manifest
     return model
 
 
-def prepare(request: dict[str, Any], directory: Path) -> dict[str, Any]:
+def prepare(request: dict[str, Any], directory: Path, *, owned: bool = False) -> dict[str, Any]:
     """Snapshot a model, data and point collection and preflight every shard."""
     quantities = request.get("quantities", ["log_density"])
     if (
@@ -63,7 +63,12 @@ def prepare(request: dict[str, Any], directory: Path) -> dict[str, Any]:
     ):
         raise errors.ValidationError("chunk_rows must be a positive integer")
     directory.mkdir(parents=True, exist_ok=True)
-    original = batchstore.load(batchstore.snapshot(request["points"], directory / "points"))
+    input_manifest = (
+        Path(request["points"])
+        if owned
+        else batchstore.snapshot(request["points"], directory / "points")
+    )
+    original = batchstore.load(input_manifest)
     if original["kind"] != "points":
         raise errors.ValidationError("evaluation input must be a points manifest")
     source = (
@@ -91,14 +96,12 @@ def prepare(request: dict[str, Any], directory: Path) -> dict[str, Any]:
     order = [provided.index(name) for name in expected]
     dimensions = len(unc_names)
     directions: int | None = None
-    descriptors: list[dict[str, Any]] = []
-    rows = 0
-    # Rechunk owned inputs once: workers never hash or rewrite files per point.
-    owned = directory / "inputs"
-    for descriptor in original["shards"]:
-        arrays = batchstore.read_shard(original, descriptor)
-        vectors = arrays.get("vectors")
-        if "hvp" in quantities:
+    # HVP needs one common direction count across shards before the output
+    # row capacity can be calculated.
+    if "hvp" in quantities:
+        for descriptor in original["shards"]:
+            arrays = batchstore.read_shard(original, descriptor)
+            vectors = arrays.get("vectors")
             if (
                 vectors is None
                 or vectors.dtype not in (np.dtype("float32"), np.dtype("float64"))
@@ -113,23 +116,29 @@ def prepare(request: dict[str, Any], directory: Path) -> dict[str, Any]:
             directions = vectors.shape[1]
             if not directions or not np.isfinite(vectors).all():
                 raise errors.ValidationError("HVP vectors must have finite, nonempty directions")
-        width = len(names) + 2 + (directions or 0) * dimensions
-        width += 1 if "log_density" in quantities else 0
-        width += dimensions if "gradient" in quantities else 0
-        width += dimensions**2 if "hessian" in quantities else 0
-        width += (directions or 0) * dimensions if "hvp" in quantities else 0
-        capacity = (batchstore.MAX_SHARD_BYTES - 16384) // (8 * max(width, 1))
-        if capacity < 1:
-            raise errors.ValidationError("one requested output row exceeds the shard size limit")
-        count = min(capacity, chunk_rows or capacity, 4096)
-        for start in range(0, len(arrays["row_id"]), count):
-            part = {key: value[start : start + count] for key, value in arrays.items()}
-            part["points"] = np.ascontiguousarray(part["points"][:, order])
-            descriptors.append(batchstore.write_shard(owned, len(descriptors), part))
-            rows += len(part["row_id"])
-    input_metadata = {key: value for key, value in original.items() if not key.startswith("_")}
-    input_metadata["parameter_names"] = expected
-    input_manifest = batchstore.publish(owned, input_metadata, descriptors)
+    width = len(names) + 2 + (directions or 0) * dimensions
+    width += 1 if "log_density" in quantities else 0
+    width += dimensions if "gradient" in quantities else 0
+    width += dimensions**2 if "hessian" in quantities else 0
+    width += (directions or 0) * dimensions if "hvp" in quantities else 0
+    capacity = (batchstore.MAX_SHARD_BYTES - 16384) // (8 * max(width, 1))
+    if capacity < 1:
+        raise errors.ValidationError("one requested output row exceeds the shard size limit")
+    count = min(capacity, chunk_rows or capacity, 4096)
+    if provided != expected or any(shard["rows"] > count for shard in original["shards"]):
+        normalized = directory / "inputs"
+        descriptors = []
+        for descriptor in original["shards"]:
+            arrays = batchstore.read_shard(original, descriptor)
+            for start in range(0, descriptor["rows"], count):
+                part = {key: value[start : start + count] for key, value in arrays.items()}
+                if provided != expected:
+                    part["points"] = np.ascontiguousarray(part["points"][:, order])
+                descriptors.append(batchstore.write_shard(normalized, len(descriptors), part))
+        input_manifest = batchstore.publish(
+            normalized, {**original, "parameter_names": expected}, descriptors
+        )
+        original = batchstore.load(input_manifest)
     source_path = directory / "source.stan"
     source_path.write_text(str(source))
     source_manifest = directory / "source_manifest.json"
@@ -174,6 +183,7 @@ def prepare(request: dict[str, Any], directory: Path) -> dict[str, Any]:
     }
     plan = {
         "input_manifest": str(input_manifest.resolve()),
+        "input_artifact": original,
         "source": str(source),
         "source_manifest": source.manifest,
         "source_path": str(source_path.resolve()),
@@ -185,8 +195,8 @@ def prepare(request: dict[str, Any], directory: Path) -> dict[str, Any]:
         "quantities": quantities,
         "derivative_coordinates": coordinates,
         "output_metadata": metadata,
-        "rows": rows,
-        "shard_count": len(descriptors),
+        "rows": original["count"],
+        "shard_count": len(original["shards"]),
         "so_path": str(binary.resolve()),
         "so_sha256": binary_hash,
     }
@@ -199,7 +209,13 @@ def execute_shard(plan: dict[str, Any], index: int, directory: Path) -> dict[str
     model = _model(plan)
     assert _CONTEXT is not None
     manifest = _CONTEXT[2]
-    inputs = batchstore.read_shard(manifest, manifest["shards"][index])
+    descriptor = manifest["shards"][index]
+    if (
+        batchstore.file_hash(batchstore.resolve(manifest, descriptor["path"]))
+        != descriptor["sha256"]
+    ):
+        raise errors.ValidationError("batch input shard content changed")
+    inputs = batchstore.read_shard(manifest, descriptor)
     count = len(inputs["row_id"])
     dimensions = len(plan["derivative_coordinates"]["names"])
     names = plan["output_metadata"]["parameter_names"]

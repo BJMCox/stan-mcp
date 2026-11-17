@@ -213,6 +213,11 @@ def test_cancel_resume_preserves_completed_shards_and_owns_inputs(batch_setup):
     assert manager.cancel(job_id)["cancelled"]
     assert asyncio.run(manager.await_job(job_id, timeout=10))["status"] == "cancelled"
     assert not manager._handles
+    # Resume a checkpoint written by a server from before per-shard records.
+    output = first.parent
+    record = output / ".completed" / "00000000.json"
+    batchstore.atomic_json(output.parent / "checkpoint.json", {"0": batchstore.read_json(record)})
+    record.unlink()
     # Neither the request nor its original manifests are needed after submission.
     points.unlink()
     for index in (1, 2):
@@ -268,18 +273,15 @@ def test_resume_refuses_changed_owned_computation(batch_setup, changed):
     elif changed == "completed":
         path = directory / "results" / "00000000.safetensors"
     else:
-        path = directory / "checkpoint.json"
-    if changed in {"checkpoint", "wrong_rows", "duplicate", "unknown_index"}:
-        state = json.loads(path.read_text())
-        if changed == "checkpoint":
-            state = {}
-        elif changed == "wrong_rows":
-            state = {"1": state["0"]}
-        elif changed == "duplicate":
-            state["1"] = state["0"]
-        else:
-            state = {"3": state["0"]}
-        batchstore.atomic_json(path, state)
+        path = directory / "results" / ".completed" / "00000000.json"
+    if changed == "checkpoint":
+        path.unlink()
+    elif changed in {"wrong_rows", "duplicate", "unknown_index"}:
+        descriptor = batchstore.read_json(path)
+        if changed != "duplicate":
+            path.unlink()
+        index = 3 if changed == "unknown_index" else 1
+        batchstore.record_completed(path.parent.parent, index, descriptor)
     else:
         path.write_bytes(path.read_bytes() + b"changed")
     with pytest.raises((RunError, ValidationError)):
@@ -310,7 +312,9 @@ def test_worker_crash_keeps_checkpoint_and_repeats_only_unfinished_work(batch_se
     handle = manager._handles[job_id]
     with handle.lock:
         handle.processes[0].kill()
-    assert asyncio.run(manager.await_job(job_id, timeout=10))["status"] == "failed"
+    failed = asyncio.run(manager.await_job(job_id, timeout=10))
+    assert failed["status"] == "failed"
+    assert batchstore.load(failed["manifest"])["count"] == 1
     # An interrupted publication was never checkpointed and may be replaced.
     output = runstore.run_dir(job_id) / "batch" / "results"
     (output / "00000001.safetensors").write_bytes(b"unfinished")
@@ -332,21 +336,21 @@ def test_manifest_write_failure_preserves_checkpointed_shards(batch_setup, monke
     failed = threading.Event()
 
     def disk_failure(directory: Path, metadata: dict, descriptors: list[dict]) -> Path:
-        if directory.name == "results" and len(descriptors) == 2 and not failed.is_set():
+        if directory.name == "results" and len(descriptors) == 3 and not failed.is_set():
             failed.set()
             raise OSError("manifest disk failure")
         return publish(directory, metadata, descriptors)
 
     monkeypatch.setattr(batchstore, "publish", disk_failure)
     (control / "release-1").touch()
+    (control / "release-2").touch()
     assert asyncio.run(manager.await_job(job_id, timeout=10))["status"] == "failed"
     output = runstore.run_dir(job_id) / "batch" / "results"
     committed = [
         (path, path.stat().st_ino, batchstore.file_hash(path))
         for path in sorted(output.glob("*.safetensors"))
     ]
-    assert len(committed) == 2
-    (control / "release-2").touch()
+    assert len(committed) == 3
     manager.resume(job_id)
     finished = asyncio.run(manager.await_job(job_id, timeout=10))
     assert finished["status"] == "done"
@@ -522,13 +526,10 @@ def test_comparison_cancel_resume_keeps_verdict_separate_from_job_status(
         result.unlink()
         if bad_checkpoint:
             output = saved.parent
-            checkpoint = batchstore.read_json(output / "comparison-checkpoint.json")
+            committed = batchstore.read_json(output / ".completed" / "00000000.json")
             descriptor = batchstore.write_shard(output, 3, arrays)
-            descriptor.update(
-                comparison_summary=checkpoint["completed"][0]["comparison_summary"], offset=None
-            )
-            checkpoint["completed"].append(descriptor)
-            batchstore.atomic_json(output / "comparison-checkpoint.json", checkpoint)
+            descriptor.update(comparison_summary=committed["comparison_summary"], offset=None)
+            batchstore.record_completed(output, 3, descriptor)
             with pytest.raises(RunError):
                 manager.resume(job_id)
             assert manager.status(job_id)["status"] == "cancelled"
