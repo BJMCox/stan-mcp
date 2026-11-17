@@ -188,7 +188,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/ce/48/32583066b155bb5d4507e7887dc88ee23118cc4de8e2a12870c49719e2a8/mcp_types-2.3.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/cf/49/35053078cdfcf639237e8bee6dc6f34f1b3a3cc8d01800a1e213e1660ff6/sse_starlette-3.6.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/e1/04/e8135ebd1ad02c56ec633277529b2602ff99ff634be76cdba5744cf554fd/python_multipart-0.0.32-py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/ef/04/7bbe85aa6abf99236cc657ceb5a629f63a82a01910a095533111ea3860f3/cmdstanpy-1.3.0-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/f6/af/9594c375a1e2493ae712add13b6411a6de1ff478eb066b4a4789c37dc01e/cmdstanpy-1.3.2-py3-none-any.whl
       linux-aarch64:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/binutils_impl_linux-aarch64-2.46.1-default_h5f4c503_103.conda
@@ -353,7 +353,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/cf/49/35053078cdfcf639237e8bee6dc6f34f1b3a3cc8d01800a1e213e1660ff6/sse_starlette-3.6.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/e1/04/e8135ebd1ad02c56ec633277529b2602ff99ff634be76cdba5744cf554fd/python_multipart-0.0.32-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/e2/31/9e1313b0a6e30e91b3b3d3fff51ae99c857c07738e3afcce1f7334e1b7ab/cffi-2.1.1-cp315-cp315-manylinux2014_aarch64.manylinux_2_17_aarch64.whl
-      - pypi: https://files.pythonhosted.org/packages/ef/04/7bbe85aa6abf99236cc657ceb5a629f63a82a01910a095533111ea3860f3/cmdstanpy-1.3.0-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/f6/af/9594c375a1e2493ae712add13b6411a6de1ff478eb066b4a4789c37dc01e/cmdstanpy-1.3.2-py3-none-any.whl
       osx-arm64:
       - conda: https://conda.anaconda.org/conda-forge/noarch/arviz-1.3.0-pyhc364b38_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/arviz-base-1.3.1-pyhd8ed1ab_0.conda
@@ -527,8 +527,8 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/ce/48/32583066b155bb5d4507e7887dc88ee23118cc4de8e2a12870c49719e2a8/mcp_types-2.3.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/cf/49/35053078cdfcf639237e8bee6dc6f34f1b3a3cc8d01800a1e213e1660ff6/sse_starlette-3.6.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/e1/04/e8135ebd1ad02c56ec633277529b2602ff99ff634be76cdba5744cf554fd/python_multipart-0.0.32-py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/ef/04/7bbe85aa6abf99236cc657ceb5a629f63a82a01910a095533111ea3860f3/cmdstanpy-1.3.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/f5/b1/fa7c600e7dceae12e9606c7578cbc9ff1e1ed55844883ee5c92205e86226/safetensors-0.8.0-cp310-abi3-macosx_11_0_arm64.whl
+      - pypi: https://files.pythonhosted.org/packages/f6/af/9594c375a1e2493ae712add13b6411a6de1ff478eb066b4a4789c37dc01e/cmdstanpy-1.3.2-py3-none-any.whl
 packages:
 - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
   build_number: 20
@@ -6181,35 +6181,6 @@ packages:
   requires_dist:
   - pycparser ; implementation_name != 'PyPy'
   requires_python: '>=3.10'
-- pypi: https://files.pythonhosted.org/packages/ef/04/7bbe85aa6abf99236cc657ceb5a629f63a82a01910a095533111ea3860f3/cmdstanpy-1.3.0-py3-none-any.whl
-  name: cmdstanpy
-  version: 1.3.0
-  sha256: 67d83fbb823948c3ca8a84912359d6c0a5c616a62025526dba5f43a1d970bc52
-  requires_dist:
-  - pandas
-  - numpy>=1.21
-  - tqdm
-  - stanio>=0.4.0,<2.0.0
-  - xarray ; extra == 'all'
-  - polars>=1.8.2 ; extra == 'all'
-  - flake8 ; extra == 'test'
-  - pylint ; extra == 'test'
-  - pytest ; extra == 'test'
-  - pytest-cov ; extra == 'test'
-  - pytest-order ; extra == 'test'
-  - mypy ; extra == 'test'
-  - xarray ; extra == 'test'
-  - polars>=1.8.2 ; extra == 'test'
-  - sphinx>5,<6 ; extra == 'docs'
-  - pydata-sphinx-theme<0.9 ; extra == 'docs'
-  - nbsphinx ; extra == 'docs'
-  - ipython ; extra == 'docs'
-  - ipykernel<7 ; extra == 'docs'
-  - ipywidgets ; extra == 'docs'
-  - sphinx-copybutton ; extra == 'docs'
-  - xarray ; extra == 'docs'
-  - matplotlib ; extra == 'docs'
-  requires_python: '>=3.9'
 - pypi: https://files.pythonhosted.org/packages/f5/b1/fa7c600e7dceae12e9606c7578cbc9ff1e1ed55844883ee5c92205e86226/safetensors-0.8.0-cp310-abi3-macosx_11_0_arm64.whl
   name: safetensors
   version: 0.8.0
@@ -6252,3 +6223,32 @@ packages:
   - safetensors[numpy] ; extra == 'torch'
   - torch>=2.4 ; extra == 'torch'
   requires_python: '>=3.10'
+- pypi: https://files.pythonhosted.org/packages/f6/af/9594c375a1e2493ae712add13b6411a6de1ff478eb066b4a4789c37dc01e/cmdstanpy-1.3.2-py3-none-any.whl
+  name: cmdstanpy
+  version: 1.3.2
+  sha256: 426d0e32c4bfe72d2287a6788d25c0b9c2ac82f88fee4d673f833194208b143a
+  requires_dist:
+  - pandas
+  - numpy>=1.21
+  - tqdm
+  - stanio>=0.4.0,<2.0.0
+  - xarray ; extra == 'all'
+  - polars>=1.8.2 ; extra == 'all'
+  - flake8 ; extra == 'test'
+  - pylint ; extra == 'test'
+  - pytest ; extra == 'test'
+  - pytest-cov ; extra == 'test'
+  - pytest-order ; extra == 'test'
+  - mypy ; extra == 'test'
+  - xarray ; extra == 'test'
+  - polars>=1.8.2 ; extra == 'test'
+  - sphinx<9 ; extra == 'docs'
+  - pydata-sphinx-theme<0.17 ; extra == 'docs'
+  - nbsphinx ; extra == 'docs'
+  - ipython ; extra == 'docs'
+  - ipykernel<7 ; extra == 'docs'
+  - ipywidgets ; extra == 'docs'
+  - sphinx-copybutton ; extra == 'docs'
+  - xarray ; extra == 'docs'
+  - matplotlib ; extra == 'docs'
+  requires_python: '>=3.9'
