@@ -230,3 +230,20 @@ def test_sample_defaults_to_round_tripping_output_precision():
     seen.clear()
     mgr._runner("sample", _Model(), {}, {"chains": 2, "sig_figs": 8})
     assert seen["sig_figs"] == 8
+
+
+def test_progress_handles_split_appends_and_replaced_csv(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path))
+    manager = sample.RunManager()
+    rid = "sample-0001"
+    runstore.write_meta(rid, {"method": "sample", "status": "running"})
+    csv = runstore.live_dir(rid, create=True) / "chain.csv"
+    csv.write_bytes(b"lp__,x\n0,1\n0,")
+    assert manager.get_run_progress(rid)["draws_written"] == 1
+    with csv.open("ab") as stream:
+        stream.write(b"2\n")
+    assert manager.get_run_progress(rid)["draws_written"] == 2
+    replacement = csv.with_suffix(".tmp")
+    replacement.write_bytes(b"# new chain\nlp__,x\n0,3\n")
+    replacement.replace(csv)
+    assert manager.get_run_progress(rid)["draws_written"] == 1

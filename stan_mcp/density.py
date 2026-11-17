@@ -11,10 +11,12 @@ Implemented during the build (see design tool group B).
 
 import hashlib
 import json
+import os
 import re
 import threading
 from collections import OrderedDict
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -24,6 +26,7 @@ from stan_mcp import config, errors
 
 _CACHE: OrderedDict[tuple, _SerializedModel] = OrderedDict()
 _CACHE_LOCK = threading.Lock()
+_DATA_STAMPS: OrderedDict[Path, tuple[int, int, int, int, int]] = OrderedDict()
 _NATIVE_LOCK = threading.RLock()
 
 
@@ -66,16 +69,62 @@ def _new_model(
 def clear_cache() -> None:
     with _CACHE_LOCK:
         _CACHE.clear()
+        _DATA_STAMPS.clear()
+
+
+def _file_stamp(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def _data_digest(payload: str) -> str:
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def _registered_snapshot(data_id: str, path: Path) -> str:
+    try:
+        with path.open() as stream:
+            snapshot_stamp = _file_stamp(os.fstat(stream.fileno()))
+            payload = json.dumps(json.load(stream), sort_keys=True)
+            if _file_stamp(os.fstat(stream.fileno())) != snapshot_stamp:
+                raise errors.ValidationError(f"registered data {data_id!r} changed during reading")
+    except FileNotFoundError as exc:
+        raise errors.ValidationError(
+            f"unknown data_id {data_id!r} (register the data first)"
+        ) from exc
+    if _data_digest(payload) != data_id:
+        raise errors.ValidationError(f"registered data {data_id!r} does not match its content hash")
+    with _CACHE_LOCK:
+        _DATA_STAMPS[path] = snapshot_stamp
+        _DATA_STAMPS.move_to_end(path)
+        if len(_DATA_STAMPS) > 32:
+            _DATA_STAMPS.popitem(last=False)
+    return payload
 
 
 def get_model(
     source: str, data: Any, stanc_args: list[str] | None = None, seed: int = 1234
 ) -> _SerializedModel:
     source = _compile.resolve_source(source, stanc_args)
-    # Resolve mutable file inputs once; both cache identity and native loading
-    # consume exactly this owned JSON snapshot.
-    payload = json.dumps(_compile.canonical_data(data), sort_keys=True)
-    key = (_compile.model_id(source), hashlib.sha256(payload.encode()).hexdigest()[:16], seed)
+    model_id = _compile.model_id(source)
+    if isinstance(data, str) and _compile._is_hash_id(data):
+        path = config.home() / "compiled" / "data" / f"{data}.json"
+        key = (model_id, data, seed)
+        try:
+            stamp = _file_stamp(path.stat())
+        except FileNotFoundError as exc:
+            raise errors.ValidationError(
+                f"unknown data_id {data!r} (register the data first)"
+            ) from exc
+        with _CACHE_LOCK:
+            if _DATA_STAMPS.get(path) == stamp and key in _CACHE:
+                _DATA_STAMPS.move_to_end(path)
+                _CACHE.move_to_end(key)
+                return _CACHE[key]
+        payload = _registered_snapshot(data, path)
+    else:
+        # Mutable inputs still identify exactly the JSON snapshot loaded.
+        payload = json.dumps(_compile.canonical_data(data), sort_keys=True)
+        key = (model_id, _data_digest(payload), seed)
     with _CACHE_LOCK:
         if key in _CACHE:
             _CACHE.move_to_end(key)

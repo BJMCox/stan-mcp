@@ -24,7 +24,7 @@ from stan_mcp.inference import MANAGER
 
 # Keep the JSON text response format independent of Python return annotations.
 mcp = MCPServer("stan-mcp")
-BATCH_MANAGER = batchjobs.BatchManager()
+BATCH_MANAGER = batchjobs.BatchManager(reconcile=False)
 STUDY_MANAGER = studies.StudyManager(MANAGER)
 
 

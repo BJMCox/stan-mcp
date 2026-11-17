@@ -2,11 +2,14 @@
 
 import asyncio
 import json
+import os
 import shutil
 import threading
 import traceback
+from collections import OrderedDict
 from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -50,38 +53,70 @@ def _error_excerpt(stderr: str) -> str:
     return text[:_ERROR_EXCERPT_CHARS].rstrip() + " […truncated; full text in meta.json]"
 
 
-def _count_csv_draws(paths: Sequence[str | Path]) -> int | None:
-    """Total draws across CmdStan CSVs (None if there are none). CmdStan CSV:
-    `#` comment lines, one header row, then one line per draw.
+@dataclass(frozen=True)
+class _CsvCursor:
+    identity: tuple[int, int]
+    size: int
+    modified: tuple[int, int]
+    offset: int
+    rows: int
 
-    Streams line by line: a long run's CSVs can be hundreds of MB and
-    get_run_progress may be polled repeatedly, so they must never be slurped
-    whole into memory."""
+
+_PROGRESS_FILES: OrderedDict[tuple[Path, bool], _CsvCursor] = OrderedDict()
+_PROGRESS_LOCK = threading.Lock()
+
+
+def _count_csv_draws(paths: Sequence[str | Path], *, live: bool = False) -> int | None:
+    """Count numeric rows, reusing the complete prefix of an append-only file."""
     total = 0
-    found = False
     for csv in paths:
-        found = True
-        rows = 0
+        path = Path(csv)
+        key = (path, live)
         try:
-            with open(csv, encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    s = line.strip()
-                    if s and not s.startswith("#"):
+            with path.open("rb") as stream:
+                stat = os.fstat(stream.fileno())
+                identity = stat.st_dev, stat.st_ino
+                modified = stat.st_mtime_ns, stat.st_ctime_ns
+                with _PROGRESS_LOCK:
+                    previous = _PROGRESS_FILES.get(key)
+                offset, rows = 0, 0
+                if previous and identity == previous.identity:
+                    unchanged = stat.st_size == previous.size and modified == previous.modified
+                    if unchanged or (live and stat.st_size > previous.size):
+                        offset, rows = previous.offset, previous.rows
+                stream.seek(offset)
+                while offset < stat.st_size:
+                    line = stream.readline(stat.st_size - offset)
+                    if not line or (live and not line.endswith(b"\n")):
+                        break
+                    offset += len(line)
+                    content = line.strip()
+                    if content and not content.startswith(b"#"):
                         rows += 1
+                cursor = _CsvCursor(identity, stat.st_size, modified, offset, rows)
+            with _PROGRESS_LOCK:
+                _PROGRESS_FILES[key] = cursor
+                _PROGRESS_FILES.move_to_end(key)
+                if len(_PROGRESS_FILES) > 256:
+                    _PROGRESS_FILES.popitem(last=False)
         except OSError:
             continue
-        total += max(rows - 1, 0)  # drop the header row
-    return total if found else None
+        total += max(rows - 1, 0)
+    return total if paths else None
 
 
 def _count_live_draws(run_id: str) -> int | None:
-    """Draws written so far for a run: from live/ while it is in flight, and
-    from the persisted csv/ copy once live/ has been cleaned up."""
     live = runstore.live_dir(run_id)
     if live.is_dir():
-        count = _count_csv_draws(sorted(p for p in live.glob("*.csv") if "-opt-" not in p.name))
+        count = _count_csv_draws(
+            sorted(p for p in live.glob("*.csv") if "-opt-" not in p.name), live=True
+        )
         if count is not None:
             return count
+    return _count_saved_draws(run_id)
+
+
+def _count_saved_draws(run_id: str) -> int | None:
     return _count_csv_draws([p for p in runstore.csv_paths(run_id) if "-opt-" not in p])
 
 
@@ -386,7 +421,9 @@ class RunManager:
                 out["elapsed_s"] = round(delta.total_seconds(), 1)
             except ValueError:
                 pass
-        written = _count_live_draws(run_id)
+        written = meta.get("draws_written")
+        if written is None:
+            written = _count_live_draws(run_id)
         if written is not None:
             out["draws_written"] = written
             if meta.get("method") == "sample":
@@ -448,6 +485,8 @@ class RunManager:
                 # clobber them.
                 meta = runstore.read_meta(run_id)
                 meta["status"] = "done"
+                if (written := _count_saved_draws(run_id)) is not None:
+                    meta["draws_written"] = written
             except Exception as exc:  # noqa: BLE001 - persisted, not raised
                 # Re-read: _persist may have written persist_warning / csv_warning
                 # before raising; the pre-persist snapshot would clobber them.

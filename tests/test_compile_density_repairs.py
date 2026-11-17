@@ -405,3 +405,44 @@ def test_installer_child_keeps_progress_off_protocol_stdout(tmp_path, monkeypatc
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "installer progress" in captured.err
+
+
+def test_registered_data_hit_checks_snapshot_without_reparsing(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path))
+    data_id = compilation.register_data({"n": 7})
+    path = tmp_path / "compiled" / "data" / f"{data_id}.json"
+    density.clear_cache()
+    monkeypatch.setattr(density, "_new_model", lambda *args: object())
+    first = density.get_model("model {}", data_id)
+    assert density.get_model("model {}", {"n": 7}) is first
+    with monkeypatch.context() as patch:
+
+        def no_open(*args, **kwargs):
+            raise AssertionError("a warm handle hit must not open its data file")
+
+        patch.setattr(Path, "open", no_open)
+        assert density.get_model("model {}", data_id) is first
+    path.write_text('{"n": 8}')
+    with pytest.raises(errors.ValidationError, match="content hash"):
+        density.get_model("model {}", data_id)
+    path.unlink()
+    with pytest.raises(errors.ValidationError, match="unknown data_id"):
+        density.get_model("model {}", data_id)
+    density.clear_cache()
+
+
+def test_evicted_sources_restore_from_disk_but_pruned_sources_do_not(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path))
+    source = "parameters {real x;} model {}"
+    first = compilation.stan_file_for(source)
+    for i in range(40):
+        compilation.stan_file_for(f"{source} // model {i}")
+    retained = compilation.resolve_source(first.stem)
+    assert retained == source
+    legacy = first.parent / "legacy.stan"
+    legacy.write_text("model {}")
+    result = compilation.prune_compiled(keep=0)
+    assert first.stem in result["removed_models"] and not legacy.exists()
+    assert compilation.refresh_source(retained) == source
+    with pytest.raises(errors.ValidationError, match="unknown model_id"):
+        compilation.resolve_source(first.stem)

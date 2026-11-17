@@ -26,10 +26,12 @@ Implemented during the build (see design "Run store").
 """
 
 import fcntl
+import heapq
 import json
 import os
 import shutil
 import tempfile
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -87,7 +89,7 @@ def reconcile_abandoned() -> None:
     """Finalize crashed owners; another live server retains its own runs."""
     import psutil
 
-    for meta in list_runs(limit=10**9):
+    for meta in _iter_run_meta():
         if meta.get("status") not in {"running", "cancelling"}:
             continue
         owner = meta.get("owner")
@@ -149,35 +151,41 @@ def read_meta(run_id: str) -> dict[str, Any]:
         raise RunError(f"run {run_id!r} has an unreadable meta.json: {exc}") from exc
 
 
+def _iter_run_meta() -> Iterator[dict[str, Any]]:
+    for directory in config.runs_dir().iterdir():
+        try:
+            meta = json.loads((directory / "meta.json").read_text())
+        except FileNotFoundError, NotADirectoryError, IsADirectoryError, json.JSONDecodeError:
+            continue
+        yield meta
+
+
 def list_runs(
     model_id: str | None = None,
     limit: int = 50,
     status: str | None = None,
     method: str | None = None,
 ) -> list[dict[str, Any]]:
-    rows = []
-    for d in config.runs_dir().iterdir():
-        mp = d / "meta.json"
-        if not mp.is_file():
-            continue
-        try:
-            meta = json.loads(mp.read_text())
-        except FileNotFoundError, json.JSONDecodeError:
-            continue  # Concurrent pruning or corrupt metadata.
-        if model_id is not None and meta.get("model_id") != model_id:
-            continue
-        if status is not None and meta.get("status") != status:
-            continue
-        if method is not None and meta.get("method") != method:
-            continue
-        # A failed run's stderr is a full traceback; returning 50 of them would
-        # swamp the caller's context. Keep the first line (as get_run_status
-        # does) and point at get_run_status/await_run for the rest.
+    matches = (
+        meta
+        for meta in _iter_run_meta()
+        if (model_id is None or meta.get("model_id") == model_id)
+        and (status is None or meta.get("status") == status)
+        and (method is None or meta.get("method") == method)
+    )
+
+    def sequence(meta: dict[str, Any]) -> int:
+        return int(meta.get("seq", 0))
+
+    rows = (
+        heapq.nlargest(limit, matches, key=sequence)
+        if limit >= 0
+        else sorted(matches, key=sequence, reverse=True)[:limit]
+    )
+    for meta in rows:
         if meta.get("stderr"):
             meta["stderr"] = str(meta["stderr"]).splitlines()[0]
-        rows.append(meta)
-    rows.sort(key=lambda m: m.get("seq", 0), reverse=True)
-    return rows[:limit]
+    return rows
 
 
 def max_seq() -> int:
@@ -340,8 +348,6 @@ def prune_runs(keep: int | None = None, older_than_days: float | None = None) ->
     if keep is not None:
         victims.extend(rows[keep:])
     if older_than_days is not None:
-        from datetime import datetime
-
         cutoff = datetime.now(UTC).timestamp() - older_than_days * 86400
         for m in rows:
             stamp = m.get("finished_at") or m.get("created_at")

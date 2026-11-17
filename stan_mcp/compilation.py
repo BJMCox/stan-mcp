@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import threading
+from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -29,11 +30,25 @@ class SourceSnapshot(str):
         return obj
 
 
-_SOURCES: dict[tuple[str, str], SourceSnapshot] = {}
+_SOURCES: OrderedDict[tuple[str, str], SourceSnapshot] = OrderedDict()
 _SOURCES_LOCK = threading.Lock()
 _BUILD_CACHE: tuple[tuple, dict[str, Any]] | None = None
 _BUILD_LOCK = threading.Lock()
 _VERSIONS = {p: importlib.metadata.version(p) for p in ("bridgestan", "cmdstanpy")}
+
+
+def _remember_source(key: tuple[str, str], source: SourceSnapshot) -> None:
+    # Bound both the number and size of retained source snapshots. Large
+    # snapshots remain available on disk or through the calling run.
+    size = len(source) + len(source.manifest["original_source"])
+    size += sum(len(item["source"]) for item in source.manifest["dependencies"])
+    if size > 512 * 1024:
+        _SOURCES.pop(key, None)
+        return
+    _SOURCES[key] = source
+    _SOURCES.move_to_end(key)
+    if len(_SOURCES) > 32:
+        _SOURCES.popitem(last=False)
 
 
 def _build_identity() -> dict[str, Any]:
@@ -223,8 +238,11 @@ def refresh_source(source: str, stanc_args: list[str] | None = None) -> SourceSn
     """Validate the build context before compiling an immutable source snapshot."""
     refreshed = _snapshot(source, stanc_args, refresh_build=True)
     if isinstance(source, SourceSnapshot):
+        directory = config.home() / "compiled"
+        model_id = source.manifest["model_id"]
         with _SOURCES_LOCK:
-            _SOURCES[(str(config.home() / "compiled"), source.manifest["model_id"])] = refreshed
+            if (directory / f"{model_id}.stan").is_file():
+                _remember_source((str(directory), model_id), refreshed)
     return refreshed
 
 
@@ -375,23 +393,23 @@ def resolve_source(stan: str, stanc_args: list[str] | None = None) -> SourceSnap
     # prior compile — lets callers pass the short id instead of re-sending source.
     if _is_hash_id(stan):
         key = (str(config.home() / "compiled"), stan)
+        cached = config.home() / "compiled" / f"{stan}.stan"
+        manifest = cached.with_suffix(".manifest.json")
         with _SOURCES_LOCK:
             cached_source = _SOURCES.get(key)
-        if cached_source is not None:
-            return _snapshot(cached_source, stanc_args)
-        cached = config.compiled_dir() / f"{stan}.stan"
-        manifest = cached.with_suffix(".manifest.json")
-        if cached.is_file() and manifest.is_file():
-            snapshot = restore_source(cached.read_text(), json.loads(manifest.read_text()))
-            if snapshot.manifest["model_id"] != stan:
-                raise errors.ValidationError("cached model_id does not match its manifest")
-            with _SOURCES_LOCK:
-                _SOURCES[key] = snapshot
-            return _snapshot(snapshot, stanc_args)
-        if cached.is_file():
-            raise errors.ValidationError(
-                f"model_id {stan!r} predates verified manifests; compile its source again"
-            )
+            if cached_source is not None:
+                _SOURCES.move_to_end(key)
+                return _snapshot(cached_source, stanc_args)
+            if cached.is_file() and manifest.is_file():
+                snapshot = restore_source(cached.read_text(), json.loads(manifest.read_text()))
+                if snapshot.manifest["model_id"] != stan:
+                    raise errors.ValidationError("cached model_id does not match its manifest")
+                _remember_source(key, snapshot)
+                return _snapshot(snapshot, stanc_args)
+            if cached.is_file():
+                raise errors.ValidationError(
+                    f"model_id {stan!r} predates verified manifests; compile its source again"
+                )
         raise errors.ValidationError(f"unknown model_id {stan!r} (compile the model first)")
     return _snapshot(stan, stanc_args)
 
@@ -464,9 +482,13 @@ def prune_compiled(keep: int | None = None, older_than_days: float | None = None
         if mid in seen:
             continue
         seen.add(mid)
-        for f in d.glob(f"{mid}*"):
-            if f.is_file():
-                f.unlink()
+        with _compile_lock(mid), _SOURCES_LOCK:
+            for f in d.glob(f"{mid}*"):
+                if f.is_file():
+                    f.unlink(missing_ok=True)
+            for key, snapshot in list(_SOURCES.items()):
+                if key[0] == str(d) and mid in (key[1], snapshot.manifest["model_id"]):
+                    del _SOURCES[key]
         removed_models.append(mid)
 
     removed_data: list[str] = []
@@ -549,13 +571,13 @@ def stan_file_for(source: str, stanc_args: list[str] | None = None) -> Path:
     source = _snapshot(source, stanc_args)
     mid = model_id(source)
     path = config.compiled_dir() / f"{mid}.stan"
-    if not path.exists():
-        _atomic_write(path, source)
-    manifest_path = path.with_suffix(".manifest.json")
-    if not manifest_path.exists():
-        _atomic_write(manifest_path, json.dumps(source.manifest, sort_keys=True))
     with _SOURCES_LOCK:
-        _SOURCES[(str(path.parent), mid)] = source
+        if not path.exists():
+            _atomic_write(path, source)
+        manifest_path = path.with_suffix(".manifest.json")
+        if not manifest_path.exists():
+            _atomic_write(manifest_path, json.dumps(source.manifest, sort_keys=True))
+        _remember_source((str(path.parent), mid), source)
     # Track last use so prune_compiled(keep=N) evicts by last use rather than by
     # first compile — otherwise the model you run every day loses to a one-off
     # compiled an hour ago.
