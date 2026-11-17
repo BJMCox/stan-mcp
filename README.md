@@ -31,6 +31,7 @@ For example:
 > parameter estimates and any convergence problems.
 
 Files must exist on the machine running the server. Runs retain input snapshots.
+Use `export_draws` to save a fit as Safetensors for analysis outside MCP.
 Batch inputs and outputs use Safetensors shards with JSON manifests.
 
 - [Tools and examples](docs/usage.md)

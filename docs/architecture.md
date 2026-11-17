@@ -1,6 +1,6 @@
 # Architecture
 
-`stan_mcp/server.py` registers 37 MCP tools with `MCPServer`. Blocking work runs in
+`stan_mcp/server.py` registers 38 MCP tools with `MCPServer`. Blocking work runs in
 `asyncio.to_thread`. Tool errors become structured error dictionaries. Results
 normalize nonfinite numbers recursively before MCP serialization.
 
@@ -16,6 +16,7 @@ normalize nonfinite numbers recursively before MCP serialization.
 | `stan_mcp/inference.py` | Submit background inference, cancel owned processes, await completion, rerun saved inputs |
 | `stan_mcp/runstore.py` | Reserve run IDs, recover abandoned owners, store inputs, outputs and metadata, prune runs |
 | `stan_mcp/draws.py` | Validate typed CSV sidecars and headers, stream numeric data, preserve component shapes |
+| `stan_mcp/draw_export.py` | Export selected typed draws and provenance in a portable Safetensors file |
 | `stan_mcp/fitstorage.py` | Persist fits, raw CSVs and typed sidecars |
 | `stan_mcp/diagnostics.py` | Summarize fits, report sampler health, localize divergences and compute LOO |
 | `stan_mcp/geometry.py` | Inspect posterior conditioning in verified parameter coordinates |

@@ -42,6 +42,7 @@ def test_run_tools_registered():
         "get_run_summary",
         "get_run_diagnostics",
         "extract_draws",
+        "export_draws",
         "evaluate_batch",
         "compare_batches",
         "get_batch_result",

@@ -523,6 +523,26 @@ async def extract_draws(
 
 
 @mcp.tool(structured_output=False)
+async def export_draws(
+    run_id: str, output_file: str, params: list[str] | None = None, thin: int = 1
+) -> dict[str, Any]:
+    """Export a completed run's draws to an absolute server-local .safetensors file.
+
+    Set `output_file` to a new file in an existing directory on the MCP server.
+    Use this for bulk export and `extract_draws` for a small preview.
+    Pass `params` to select variables or omit it to export all model variables.
+    Each tensor keeps its chain, draw and Stan variable axes at float64 precision.
+    `thin` retains every Nth saved draw within each chain. Chain and draw IDs
+    are 1-based positions in the stored fit. Returns the path, hash and counts.
+    """
+    from stan_mcp import draw_export
+
+    return await asyncio.to_thread(
+        _safe, draw_export.export_draws, run_id, output_file, params, thin
+    )
+
+
+@mcp.tool(structured_output=False)
 async def get_run_pathologies(
     run_id: str, top_k: int = 5, permutations: int = diagnostics.DEFAULT_PERMUTATIONS
 ) -> dict[str, Any]:

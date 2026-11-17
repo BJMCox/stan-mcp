@@ -364,7 +364,7 @@ draws (`extract_draws`) mostly just consume context.
 A spot-check of raw draws, not the main way to read a run — for statistics use
 `get_run_summary` and for convergence `get_run_diagnostics`; there is little to
 be learned from reading thousands of raw numbers that those two don't say
-better. Raise `max_draws` when feeding the draws somewhere else.
+better. Use `export_draws` for bulk access.
 
 Not available for `optimize` (raises `RunError`). Single-param form returns
 `{"param", "draws": [...], "thin"}` (or `{"param", "by_chain": true, "draws":
@@ -382,6 +382,40 @@ draws-producing methods now: reads the typed draws layer (`draws.load`, the
 same `draws_schema.json`-backed reader every other tool uses), so `by_chain`
 works identically regardless of method. The draws are loaded once per call,
 not once per requested parameter.
+
+### `export_draws(run_id, output_file, params=None, thin=1) -> dict`
+
+Export a completed run to a new absolute `.safetensors` path on the server.
+For example, ask to export `theta` and `beta` from `sample-0001` to
+`/absolute/path/fit.safetensors`. The parent directory must exist. The tool
+returns the file path, SHA-256 hash, and counts. It refuses to replace a file.
+
+Each `draws.<name>` tensor has shape `[chain, draw, *variable_shape]` and uses
+float64. Tuple fields and complex components use the same names as
+`extract_draws`. Omit `params` to export all variables. A root name selects
+all its fields. Ragged chains cannot enter a rectangular export.
+Export reads the selected variables into memory before writing the file.
+
+The int64 `chain_id` and `draw_id` vectors are 1-based positions in the stored
+fit. They preserve file order and saved draw order. `thin` retains every Nth
+saved draw in each chain and keeps its original position. These positions are
+independent of CmdStan's chain IDs and sampling iteration numbers.
+
+Read the JSON string in the file's `stan_mcp` metadata entry for the
+`stan-mcp.draws.v1` schema, run and model IDs, sampling method, and variable
+shapes. The format also covers approximate fits and simulation. The sampling
+method tells readers what kind of draws they have.
+
+```python
+import json
+from safetensors import safe_open
+
+with safe_open("fit.safetensors", framework="np") as fit:
+    metadata = json.loads(fit.metadata()["stan_mcp"])
+    beta = fit.get_tensor(metadata["variables"]["beta"]["tensor"])
+    chains = fit.get_tensor("chain_id")
+    draws = fit.get_tensor("draw_id")
+```
 
 ### `get_run_pathologies(run_id, top_k=5, permutations=2000) -> dict`
 Localizes a `sample` run's divergences: `get_run_diagnostics` says a run is

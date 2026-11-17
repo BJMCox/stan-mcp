@@ -8,6 +8,9 @@ from pathlib import Path
 import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from safetensors.numpy import load_file
+
+from tests.fakes import _typed_run
 
 
 async def test_pixi_launcher_from_foreign_directory(tmp_path):
@@ -47,7 +50,8 @@ async def test_pixi_launcher_from_foreign_directory(tmp_path):
             assert len(payload["data_id"]) == 16
 
 
-async def test_ssh_launcher_preserves_protocol_and_quoted_paths(tmp_path):
+async def test_ssh_launcher_preserves_protocol_and_quoted_paths(tmp_path, monkeypatch):
+    run_id = _typed_run(tmp_path, monkeypatch)
     project = Path(__file__).resolve().parents[1]
     remote = tmp_path / "remote ' checkout"
     remote.symlink_to(project, target_is_directory=True)
@@ -73,13 +77,13 @@ exec sh -c "$6"
         env={
             **os.environ,
             "PATH": f"{binary}:{os.environ['PATH']}",
-            "STAN_MCP_HOME": str(tmp_path / "home"),
+            "STAN_MCP_HOME": str(tmp_path / "sm"),
         },
     )
     async with stdio_client(params) as (reader, writer):
         async with ClientSession(reader, writer) as session:
             await session.initialize()
-            assert len((await session.list_tools()).tools) == 37
+            assert len((await session.list_tools()).tools) == 38
             result = await session.call_tool("register_data", {"data": str(data)})
             handle = json.loads(next(item.text for item in result.content if item.type == "text"))[
                 "data_id"
@@ -92,6 +96,17 @@ exec sh -c "$6"
                 ]
                 == handle
             )
+
+            path = tmp_path / "remote draws.safetensors"
+            result = await session.call_tool(
+                "export_draws", {"run_id": run_id, "output_file": str(path), "params": ["z"]}
+            )
+            payload = json.loads(next(item.text for item in result.content if item.type == "text"))
+            assert not result.is_error and payload["path"] == str(path)
+            assert load_file(path)["draws.z"].tolist() == [
+                [[10, 20], [11, 21]],
+                [[12, 22], [13, 23]],
+            ]
 
 
 def test_ssh_launcher_rejects_relative_remote_checkout(tmp_path):

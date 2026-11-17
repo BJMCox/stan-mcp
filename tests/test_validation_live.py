@@ -33,7 +33,7 @@ async def test_stdio_predictive_study_sbc_and_fixed_parameter_law(tmp_path, capl
         async with ClientSession(reader, writer, read_timeout_seconds=300) as session:
             await session.initialize()
             tools = (await session.list_tools()).tools
-            assert len(tools) == 37
+            assert len(tools) == 38
             for tool in tools:
                 Draft202012Validator.check_schema(tool.input_schema)
 
@@ -109,6 +109,31 @@ async def test_stdio_predictive_study_sbc_and_fixed_parameter_law(tmp_path, capl
             study = await call("await_run", {"run_id": started["study_id"], "timeout": 240})
             assert study["status"] == "done" and study["counts"] == {"done": 4}, study
             case = json.loads((Path(study["tasks_directory"]) / "00000.json").read_text())
+            posterior_path = tmp_path / "posterior.safetensors"
+            exported = await call(
+                "export_draws",
+                {
+                    "run_id": case["fit"]["run_id"],
+                    "output_file": str(posterior_path),
+                    "params": ["theta"],
+                    "thin": 20,
+                },
+            )
+            preview = await call(
+                "extract_draws",
+                {
+                    "run_id": case["fit"]["run_id"],
+                    "param": "theta",
+                    "thin": 20,
+                    "by_chain": True,
+                    "max_draws": 0,
+                },
+            )
+            arrays = load_file(exported["path"])
+            assert arrays["draws.theta"].tolist() == preview["draws"]
+            assert arrays["draw_id"].tolist() == [
+                1 + 20 * i for i in range(exported["draws_per_chain"])
+            ]
             observed.write_text(json.dumps(case["generated_data"]))
             request = tmp_path / "posterior.json"
             request.write_text(
