@@ -232,18 +232,7 @@ def test_convergence_warns_when_the_join_matches_nothing(tmp_path, monkeypatch):
 
 
 def test_ebfmi_is_reported_not_swallowed(tmp_path, monkeypatch):
-    """az.bfmi raises TypeError on an arviz 1.2 DataTree, and a bare `except:
-    pass` turned that into E-BFMI silently absent from every sample run — for the
-    diagnostic most specific to funnel geometry. `_sampler_stats` now feeds it a
-    plain (chain, draw) `energy__` array off the typed draws layer instead of an
-    idata, so that DataTree can no longer reach it at all -- verified end to end
-    through `run_diagnostics`, on a real (if minimal) sample run's sidecar and
-    CSVs rather than a hand-built `Draws`.
-
-    The `except Exception` around the az.bfmi call itself staying narrow enough
-    to still report a genuine failure is covered separately, by
-    `test_sampler_stats_reports_ebfmi_warning_when_bfmi_raises`.
-    """
+    """A finite energy series reports E-BFMI through typed draws."""
     monkeypatch.setenv("STAN_MCP_HOME", str(tmp_path / "sm"))
     _write_run_with_stats("sample-0001", diverging=False, tree_depth=3)
     # stansummary's binary is not available in the offline suite; this test is
@@ -252,27 +241,3 @@ def test_ebfmi_is_reported_not_swallowed(tmp_path, monkeypatch):
     d = diagnostics.run_diagnostics("sample-0001")
     assert d.get("min_ebfmi") is not None
     assert "ebfmi_warning" not in d
-
-
-def test_sampler_stats_reports_ebfmi_warning_when_bfmi_raises(monkeypatch):
-    """A diagnostic that quietly returns nothing on failure reads as "checked
-    and fine" -- the exact bug this code's own comment argues against. Forces
-    az.bfmi to raise (a stand-in for the arviz-1.2-DataTree TypeError this
-    replaced) and checks the `except Exception` around it still surfaces a
-    warning rather than swallowing it a second way."""
-    import arviz as az
-
-    def _boom(*a, **kw):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(az, "bfmi", _boom)
-    d = diagnostics.draws.Draws(
-        run_id="sample-0001",
-        params={},
-        sampler_stats={"energy__": np.zeros((2, 50))},
-        n_chain=2,
-        n_draw=50,
-    )
-    got = diagnostics._sampler_stats(d, {})
-    assert "min_ebfmi" not in got
-    assert got["ebfmi_warning"] == "E-BFMI unavailable: boom"

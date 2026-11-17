@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from itertools import chain, islice
 from pathlib import Path
 from typing import Any
 
@@ -165,88 +166,123 @@ def _validate_header(path: Path, header: list[str], expected: list[str] | None) 
         )
 
 
-def _read_csv(path: Path, expected_header: list[str] | None = None) -> np.ndarray:
-    """`(draw, column)` floats from one CmdStan CSV."""
+def _read_csv(
+    path: Path,
+    expected_header: list[str] | None,
+    columns: list[int] | None,
+    highest_column: int,
+    run_id: str,
+    expected_width: int | None,
+) -> tuple[np.ndarray, int]:
+    """Read selected columns while validating every numeric field."""
     with path.open() as stream:
         header = _csv_header(path, stream)
         _validate_header(path, header, expected_header)
-        try:
-            rows = np.loadtxt(stream, delimiter=",", comments="#", ndmin=2)
-        except ValueError as exc:
-            raise RunError(f"draws CSV {path.name!r} has invalid numeric rows: {exc}") from exc
-    if rows.size == 0:
-        raise RunError(f"draws CSV {path.name!r} has no draws")
-    if rows.shape[1] != len(header):
-        raise RunError(f"draws CSV {path.name!r} has numeric rows inconsistent with its header")
-    return rows
+        width = len(header)
+        if expected_width is not None and width != expected_width:
+            raise RunError(f"draws CSV {path.name!r} has a different width from the other chains")
+        if highest_column >= width:
+            raise RunError(
+                f"run {run_id!r}: draws_schema references column {highest_column} but its CSVs "
+                f"have {width} columns — the sidecar is stale, re-run the model"
+            )
 
-
-def load(run_id: str) -> Draws:
-    sc = schema(run_id)
-    # variational's first data row is cmdstanpy's own mean-field mean, not a
-    # draw (cmdstanpy stanfit/vb.py: draws_np[0] is the mean, draws_np[1:] the
-    # sample) -- every other method's rows are all draws, so this is 0 for
-    # them. Recorded at persist time (fitstorage._sidecar_from_fit) since
-    # this reader must stay method-agnostic.
-    offset = sc.get("draw_row_offset", 0)
-    csvdir = runstore.run_dir(run_id) / "csv"
-    per_chain = []
-    for name in sc["files"]:
-        p = csvdir / name
-        if not p.exists():
-            raise RunError(f"run {run_id!r} is missing its draws CSV {name!r}")
-        rows = _read_csv(p, sc.get("header"))
-        if offset:
-            rows = rows[offset:]
-            if rows.shape[0] == 0:
+        def parse(lines: Iterable[str]) -> np.ndarray:
+            try:
+                rows = np.loadtxt(lines, delimiter=",", comments="#", ndmin=2)
+            except ValueError as exc:
+                raise RunError(f"draws CSV {path.name!r} has invalid numeric rows: {exc}") from exc
+            if not rows.size:
+                raise RunError(f"draws CSV {path.name!r} has no draws")
+            if rows.shape[1] != width:
                 raise RunError(
-                    f"run {run_id!r}'s draws CSV {name!r} has no draws left after "
-                    f"skipping its leading {offset} summary row(s)"
+                    f"draws CSV {path.name!r} has numeric rows inconsistent with its header"
                 )
-        per_chain.append(rows)
+            return rows
 
-    lengths = [a.shape[0] for a in per_chain]
-    n_draw = min(lengths)
-    # A (chain, draw, ...) array cannot represent ragged chains. Truncate to the
-    # shortest and RECORD it: silently dropping the excess is the failure mode
-    # this layer exists to remove.
-    #
-    # NOT a cancelled run, despite how this once read. `persist_run` only runs
-    # when `_runner` RETURNS (sample.py), so a cancelled or killed run never gets
-    # a sidecar at all and can never reach this code — `schema()` fails first with
-    # "has no draws_schema.json". What this actually defends against is a CSV set
-    # that is malformed or was only partly written: a truncated copy, a
-    # half-populated `csv/`, a hand-built fixture. Worth keeping for that alone,
-    # since the alternative is a raw numpy broadcast error from `np.stack`.
-    #
-    # Only `_summary_from_draws` surfaces this as `chains_truncated_to`; the
-    # `sample` path never sees it, because `stansummary` itself rejects ragged
-    # input ("Error during processing. Error: chain 2, missing or extra rows.",
-    # exit 1) and so fails loudly instead. See docs/usage.md.
-    truncated_to = n_draw if len(set(lengths)) > 1 else None
-    arr = np.stack([a[:n_draw] for a in per_chain])  # (chain, draw, column)
+        if columns is None:
+            return parse(stream), width
+        lines = (
+            line for line in stream if (content := line.lstrip()) and not content.startswith("#")
+        )
+        first = next(lines, None)
+        if first is None:
+            raise RunError(f"draws CSV {path.name!r} has no draws")
+        lines = chain((first,), lines)
+        # Parse every field in C without retaining the unused values. Bound
+        # both the text and numeric scratch space for wide CSVs.
+        batch_size = max(1, min(4096, (128 * 1024) // width))
+        chunks = []
+        while batch := list(islice(lines, batch_size)):
+            chunks.append(parse(batch)[:, columns])
+        return (chunks[0] if len(chunks) == 1 else np.concatenate(chunks)), width
 
+
+def load(
+    run_id: str,
+    *,
+    params: Iterable[str] | None = None,
+    sampler_stats: Iterable[str] | None = None,
+    _schema: dict[str, Any] | None = None,
+) -> Draws:
+    """Load typed draws for the requested variables, or all variables by default."""
+    sc = schema(run_id) if _schema is None else _schema
+    selected = {}
+    for group, names in (("params", params), ("sampler_stats", sampler_stats)):
+        names = set(names) if names is not None else None
+        selected[group] = {
+            name: spec for name, spec in sc[group].items() if names is None or name in names
+        }
     highest = max(
         (
-            max(spec["cols"])
+            column
             for group in ("params", "sampler_stats")
             for spec in sc[group].values()
-            if spec["cols"]
+            for column in spec["cols"]
         ),
         default=-1,
     )
-    if highest >= arr.shape[2]:
-        raise RunError(
-            f"run {run_id!r}: draws_schema references column {highest} but its CSVs "
-            f"have {arr.shape[2]} columns — the sidecar is stale, re-run the model"
-        )
+    columns = None
+    offsets: dict[str, dict[str, slice]] = {}
+    if params is not None or sampler_stats is not None:
+        columns = []
+        for group, specs in selected.items():
+            offsets[group] = {}
+            for name, spec in specs.items():
+                start = len(columns)
+                columns.extend(spec["cols"])
+                offsets[group][name] = slice(start, len(columns))
+
+    # Variational CSVs start with a mean-field summary row, not a draw.
+    offset = sc.get("draw_row_offset", 0)
+    csvdir = runstore.run_dir(run_id) / "csv"
+    per_chain = []
+    width = None
+    for name in sc["files"]:
+        path = csvdir / name
+        if not path.exists():
+            raise RunError(f"run {run_id!r} is missing its draws CSV {name!r}")
+        rows, width = _read_csv(path, sc.get("header"), columns, highest, run_id, width)
+        if rows.shape[0] <= offset:
+            raise RunError(
+                f"run {run_id!r}'s draws CSV {name!r} has no draws left after "
+                f"skipping its leading {offset} summary row(s)"
+            )
+        per_chain.append(rows[offset:])
+
+    # Keep chain-major order and report when a rectangular array requires
+    # truncating ragged files to the shortest chain.
+    lengths = [a.shape[0] for a in per_chain]
+    n_draw = min(lengths)
+    truncated_to = n_draw if len(set(lengths)) > 1 else None
+    arr = np.stack([a[:n_draw] for a in per_chain])
+    del per_chain
 
     def build(group: str) -> dict[str, np.ndarray]:
         out: dict[str, np.ndarray] = {}
-        for name, spec in sc[group].items():
-            block = arr[:, :, spec["cols"]]
-            # cols are recorded in row-major fill order, so numpy's default
-            # reshape is correct and no order= argument is needed anywhere.
+        for name, spec in selected[group].items():
+            cols = spec["cols"] if columns is None else offsets[group][name]
+            block = arr[:, :, cols]
             out[name] = block.reshape(arr.shape[0], n_draw, *tuple(spec["dims"]))
         return out
 
@@ -399,15 +435,16 @@ def extract_draws(
     wanted = list(dict.fromkeys(params)) if params else ([param] if param else [])
     if not wanted:
         raise ValidationError("extract_draws requires `param` or `params`")
-    d = load(run_id)
+    sc = schema(run_id)
     for name in wanted:
-        if name not in d.params:
+        if name not in sc["params"]:
             raise RunError(
                 f"parameter {name!r} not found in run {run_id!r} "
-                f"(have: {', '.join(sorted(d.params))})"
+                f"(have: {', '.join(sorted(sc['params']))})"
             )
-    width = sum(int(np.prod(d.params[name].shape[2:])) for name in wanted)
-    budget = _draw_budget(max_draws, width, d.n_chain if by_chain else 1)
+    width = sum(len(sc["params"][name]["cols"]) for name in wanted)
+    budget = _draw_budget(max_draws, width, len(sc["files"]) if by_chain else 1)
+    d = load(run_id, params=wanted, sampler_stats=(), _schema=sc)
     n = d.n_draw if by_chain else d.n_chain * d.n_draw
     step = _thin_step(n, thin, budget)
     if params:

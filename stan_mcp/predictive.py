@@ -66,14 +66,15 @@ def check_predictive(request_file: str) -> dict[str, Any]:
     checks = request.get("checks")
     if not isinstance(checks, list) or not 1 <= len(checks) <= 20:
         raise ValidationError("checks must contain 1 to 20 explicit variable/statistic pairs")
-    d = draws.load(run_id)
+    for check in checks:
+        if not isinstance(check, dict) or set(check) != {"observed", "replicated", "statistic"}:
+            raise ValidationError("each check needs observed, replicated, and statistic")
+    d = draws.load(run_id, params=(check["replicated"] for check in checks), sampler_stats=())
     if d.truncated_to is not None:
         raise RunError("predictive checks require complete, equal-length chains")
     rows: list[dict[str, Any]] = []
     distributions: list[np.ndarray] = []
     for check in checks:
-        if not isinstance(check, dict) or set(check) != {"observed", "replicated", "statistic"}:
-            raise ValidationError("each check needs observed, replicated, and statistic")
         name = check["statistic"]
         if name not in STATISTICS:
             raise ValidationError(f"statistic must be one of {STATISTICS}")

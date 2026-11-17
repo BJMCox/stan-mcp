@@ -192,11 +192,13 @@ def test_undefined_bfmi_cannot_hide_behind_healthy_convergence(tmp_path, monkeyp
         "summarize",
         lambda files: {name: {"R_hat": 1, "ESS_bulk": 500, "ESS_tail": 500} for name in ("x", "g")},
     )
-    import arviz as az
-
-    monkeypatch.setattr(az, "bfmi", lambda energy: np.array([np.nan, 1.0]))
+    schema_path = draws.schema_path(rid)
+    sidecar = json.loads(schema_path.read_text())
+    csv_dir = schema_path.parent / "csv"
+    second = csv_dir / "second.csv"
+    second.write_text("lp__,x,g,energy__\n-1,1,2,0\n-1,-1,-2,2\n")
+    sidecar["files"].append(second.name)
+    schema_path.write_text(json.dumps(sidecar))
     result = diagnostics.run_diagnostics(rid)
-    assert result["verdict"] == "unknown" and result["min_ebfmi"] == 1.0
-    assert "1" in result["ebfmi_warning"]
-    monkeypatch.setattr(az, "bfmi", lambda energy: np.array([0.1, 1.0]))
-    assert diagnostics.run_diagnostics(rid)["verdict"] == "warn"
+    assert result["verdict"] == "unknown" and result["min_ebfmi"] == 2.0
+    assert result["ebfmi_warning"] == "E-BFMI undefined for chain(s) [1]"

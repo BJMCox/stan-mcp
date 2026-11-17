@@ -112,7 +112,7 @@ def check_sbc(request_file: str) -> dict[str, Any]:
             studies.verify_artifacts(state[stage]["run_id"], state[stage]["hashes"])
         run_id = state["fit"]["run_id"]
         try:
-            d = draws.load(run_id)
+            d = draws.load(run_id, params=targets, sampler_stats=())
             if d.truncated_to is not None:
                 raise RunError("ragged chains cannot enter SBC")
         except (RunError, ValueError) as exc:

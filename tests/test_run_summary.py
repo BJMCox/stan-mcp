@@ -302,3 +302,17 @@ def test_run_summary_omits_chains_truncated_to_when_chains_are_even(tmp_path, mo
     rid = _typed_run(tmp_path, monkeypatch, method="variational")
     out = diagnostics.run_summary(rid)
     assert "chains_truncated_to" not in out
+
+
+def test_targeted_summary_uses_native_leaf_names(tmp_path, monkeypatch):
+    rid = _typed_run(tmp_path, monkeypatch)
+
+    def summarize(paths, *, include):
+        assert include == ["z.1", "z.2"]
+        return {"z[1]": {"Mean": 1.5}, "z[2]": {"Mean": 2.5}}
+
+    monkeypatch.setattr(diagnostics.stansummary, "summarize", summarize)
+    assert diagnostics.run_summary(rid, params=["z"])["summary"] == [
+        {"param": "z[1]", "mean": 1.5},
+        {"param": "z[2]", "mean": 2.5},
+    ]

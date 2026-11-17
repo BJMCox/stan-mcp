@@ -129,7 +129,9 @@ def test_extract_draws_multi_param_loads_source_once(tmp_path, monkeypatch):
     rid = _typed_run_wide(tmp_path, monkeypatch)
     calls = []
     real = diagnostics.draws.load
-    monkeypatch.setattr(diagnostics.draws, "load", lambda r: (calls.append(r), real(r))[1])
+    monkeypatch.setattr(
+        diagnostics.draws, "load", lambda r, **kwargs: (calls.append(r), real(r, **kwargs))[1]
+    )
     draws.extract_draws(rid, params=["theta", "beta"])
     assert len(calls) == 1  # not one CSV parse per parameter
 
@@ -159,3 +161,16 @@ def test_max_draws_splits_across_params(tmp_path, monkeypatch):
     out = draws.extract_draws(rid, params=["theta", "beta"], max_draws=6)
     theta, beta = out["draws"]["theta"], out["draws"]["beta"]
     assert len(theta) + sum(len(d) for d in beta) <= 6  # not 6 per name
+
+
+def test_projected_draws_keep_flat_thinning_and_validate_skipped_fields(tmp_path, monkeypatch):
+    rid = _typed_run(tmp_path, monkeypatch)
+    assert draws.extract_draws(rid, "theta", thin=3)["draws"] == [0.1, 0.4]
+    csv_path = runstore.run_dir(rid) / "csv" / draws.schema(rid)["files"][0]
+    rows = csv_path.read_text().splitlines()
+    fields = rows[-1].split(",")
+    fields[-1] = "not-a-number"
+    rows[-1] = ",".join(fields)
+    csv_path.write_text("\n".join(rows) + "\n")
+    with pytest.raises(errors.RunError, match="invalid numeric rows"):
+        draws.extract_draws(rid, "theta", max_draws=1)

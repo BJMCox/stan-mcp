@@ -341,9 +341,9 @@ draws (`extract_draws`) mostly just consume context.
   "issues": [...]}`. `max_rhat`/`min_ess_bulk`/`min_ess_tail` come from
   CmdStan's own `stansummary` (the same output `get_run_summary` reads, so
   the two cannot disagree); `divergences`/`treedepth_saturations`/
-  `mean_accept_stat` come from the typed sampler stats; `min_ebfmi` from
-  `arviz.bfmi` — the one sampler diagnostic `stansummary` doesn't report
-  (CmdStan has it only in `diagnose`, as prose). `verdict` is `"warn"` if
+  `mean_accept_stat` come from the typed sampler stats. E-BFMI divides the
+  mean squared energy increment by the sample energy variance within each
+  chain. `verdict` is `"warn"` if
   R-hat > 1.01, bulk/tail ESS < 400, any divergences, any tree-depth
   saturations, or E-BFMI < 0.3 (see `diagnostics.RHAT_MAX` / `_ESS_MIN` /
   `_EBFMI_MIN`). Undefined or missing convergence metrics and undefined BFMI

@@ -117,26 +117,42 @@ def _summary_from_stansummary(
     the CSVs, so loading them again to learn names and dims would be wasted work.
     """
     sc = draws.schema(run_id)
-    stats = stansummary.summarize(draws.csv_files(run_id))
+    labels = [
+        pair
+        for name, spec in sc["params"].items()
+        if _wanted(name, params)
+        for pair in draws.spec_element_labels(name, spec)
+    ]
+    paths = draws.csv_files(run_id)
+    includes = list(dict.fromkeys(name for _, name in labels))
+    if params and includes and sum(len(name) + 1 for name in includes) <= 16384:
+        try:
+            stats = stansummary.summarize(paths, include=includes)
+        except RunError as exc:
+            detail = str(exc).lower()
+            if "include_param" not in detail and "parameter name" not in detail:
+                raise
+            # Older CmdStan or a legacy sidecar can reject a selection. The
+            # unfiltered join still reports valid partial matches.
+            stats = stansummary.summarize(paths)
+    else:
+        stats = stansummary.summarize(paths)
     records = []
     looked_up: list[str] = []
-    for name, spec in sc["params"].items():
-        if not _wanted(name, params):
+    for stan_label, cmdstan_name in labels:
+        looked_up.append(cmdstan_name)
+        row = stats.get(cmdstan_name) or stats.get(stansummary.native_name(cmdstan_name))
+        if row is None:
             continue
-        for stan_label, cmdstan_name in draws.spec_element_labels(name, spec):
-            looked_up.append(cmdstan_name)
-            row = stats.get(cmdstan_name)
-            if row is None:
-                continue
-            rec: dict[str, Any] = {"param": stan_label}
-            for src, dst in _SUMMARY_COLUMNS.items():
-                if src in row:
-                    rec[dst] = _sig6(row[src])
-            # stansummary reports `nan` for the MCSE/ESS/R_hat of a CONSTANT
-            # column (verified: `"fixed",2.5,nan,0,0,...,nan,nan,nan,nan`), and
-            # NaN is not valid JSON. A constant parameter is common enough that
-            # this is a normal path, not an edge case.
-            records.append(json_safe(rec))
+        rec: dict[str, Any] = {"param": stan_label}
+        for src, dst in _SUMMARY_COLUMNS.items():
+            if src in row:
+                rec[dst] = _sig6(row[src])
+        # stansummary reports `nan` for the MCSE/ESS/R_hat of a CONSTANT
+        # column (verified: `"fixed",2.5,nan,0,0,...,nan,nan,nan,nan`), and
+        # NaN is not valid JSON. A constant parameter is common enough that
+        # this is a normal path, not an edge case.
+        records.append(json_safe(rec))
     if looked_up and not records:
         raise _no_match(run_id, len(looked_up), looked_up, stats)
     out = _cap_rows(records, max_rows)
@@ -151,8 +167,13 @@ def _summary_from_draws(run_id: str, params: list[str] | None, max_rows: int) ->
     No R-hat or ESS: variational/pathfinder/laplace draws are not MCMC chains, and
     stansummary would happily report both anyway.
     """
-    d = draws.load(run_id)
     sc = draws.schema(run_id)
+    d = draws.load(
+        run_id,
+        params=(name for name in sc["params"] if _wanted(name, params)),
+        sampler_stats=(),
+        _schema=sc,
+    )
     selected = [(name, arr) for name, arr in d.params.items() if _wanted(name, params)]
     total = sum(int(np.prod(arr.shape[2:])) for _, arr in selected)
     records = []
@@ -266,7 +287,7 @@ def _convergence_stats(run_id: str) -> dict[str, Any]:
     for name, spec in sc["params"].items():
         for stan_label, cmdstan_name in draws.spec_element_labels(name, spec):
             looked_up.append(cmdstan_name)
-            row = stats.get(cmdstan_name)
+            row = stats.get(cmdstan_name) or stats.get(stansummary.native_name(cmdstan_name))
             if row is None:
                 undefined.setdefault("missing", []).append(stan_label)
                 continue
@@ -322,25 +343,20 @@ def _sampler_stats(d: draws.Draws, meta: dict[str, Any]) -> dict[str, Any]:
         out["mean_accept_stat"] = round(float(np.asarray(accept).mean()), 4)
 
     if (energy := ss.get("energy__")) is not None:
-        import arviz as az
-
-        # E-BFMI is not in stansummary (only in `diagnose`, as prose), so it stays
-        # an arviz call -- now on a clean (chain, draw) array rather than a
-        # DataTree. Passing the whole idata (arviz 1.2: a DataTree) raised
-        # TypeError every time, which a bare `except: pass` turned into E-BFMI
-        # silently missing from every run (measured on Neal's funnel: min E-BFMI
-        # 0.06 against 1.01 for its non-centered twin).
-        try:
-            values = [_finite(b) for b in np.asarray(az.bfmi(energy))]
-            bfmi = [v for v in values if v is not None]
-            if missing := [i + 1 for i, value in enumerate(values) if value is None]:
-                out["ebfmi_warning"] = f"E-BFMI undefined for chain(s) {missing}"
-            if bfmi:
-                out["min_ebfmi"] = round(min(bfmi), 4)
-        except Exception as exc:  # noqa: BLE001
-            # Surfaced, never swallowed: a diagnostic that quietly returns nothing
-            # reads as "checked and fine".
-            out["ebfmi_warning"] = f"E-BFMI unavailable: {exc}"
+        # Per-chain E-BFMI uses mean squared energy increments divided by
+        # sample energy variance. A short or constant chain is undefined.
+        values = np.full(energy.shape[0], np.nan)
+        if energy.shape[1] > 1:
+            with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+                values = np.square(np.diff(energy, axis=1)).mean(axis=1) / energy.var(
+                    axis=1, ddof=1
+                )
+        finite = np.isfinite(values)
+        missing = (np.flatnonzero(~finite) + 1).tolist()
+        if missing:
+            out["ebfmi_warning"] = f"E-BFMI undefined for chain(s) {missing}"
+        if finite.any():
+            out["min_ebfmi"] = round(float(values[finite].min()), 4)
     return out
 
 
@@ -435,7 +451,16 @@ def run_diagnostics(run_id: str) -> dict[str, Any]:
     if method == "sample":
         out.update(convergence(run_id))
         try:
-            out.update(_sampler_stats(draws.load(run_id), meta))
+            out.update(
+                _sampler_stats(
+                    draws.load(
+                        run_id,
+                        params=(),
+                        sampler_stats=("divergent__", "treedepth__", "accept_stat__", "energy__"),
+                    ),
+                    meta,
+                )
+            )
         except RunError as exc:
             out["sampler_stats_warning"] = f"sampler statistics unavailable: {exc}"
         out.update(_verdict(out))

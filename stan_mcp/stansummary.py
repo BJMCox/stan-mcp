@@ -21,6 +21,7 @@ third-party exception type leaking through instead used to escape both
 
 from __future__ import annotations
 
+import csv
 import subprocess
 import tempfile
 from pathlib import Path
@@ -71,6 +72,15 @@ def _to_float(raw: str) -> float:
         return float("nan")
 
 
+def native_name(csv_name: str) -> str:
+    """CmdStan's displayed name for a raw CSV leaf."""
+    parts = []
+    for part in csv_name.split(":"):
+        root, dot, index = part.partition(".")
+        parts.append(f"{root}[{index.replace('.', ',')}]" if dot else root)
+    return ".".join(parts)
+
+
 def parse(text: str) -> dict[str, dict[str, float]]:
     """`{cmdstan_name: {column: value}}` from stansummary's --csv_filename output."""
     # stansummary appends trailing `#`-prefixed commentary after the data (model
@@ -84,11 +94,8 @@ def parse(text: str) -> dict[str, dict[str, float]]:
         )
     header = [h.strip() for h in lines[0].split(",")]
     out: dict[str, dict[str, float]] = {}
-    for ln in lines[1:]:
-        parts = ln.split(",")
-        # Stan identifiers cannot contain a comma, so splitting on it is safe;
-        # stansummary quotes the name column.
-        name = parts[0].strip().strip('"')
+    for parts in csv.reader(lines[1:], skipinitialspace=True):
+        name = parts[0].strip()
         if len(parts) != len(header):
             # A column-count mismatch means the output is malformed. We must not
             # guess which parameter went missing by silently dropping the row —
@@ -112,6 +119,8 @@ def summarize(
     csv_paths: list[str],
     percentiles: tuple[int, ...] = (5, 50, 95),
     sig_figs: int = SIG_FIGS,
+    *,
+    include: list[str] | None = None,
 ) -> dict[str, dict[str, float]]:
     if not csv_paths:
         raise RunError("stansummary needs at least one draws CSV")
@@ -131,6 +140,8 @@ def summarize(
             # "Unrecognized parameter(s): '..._1[csv]'".
             *csv_paths,
         ]
+        if include:
+            cmd.extend(("--include_param", *include))
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_TIMEOUT_S)
         except subprocess.TimeoutExpired as exc:

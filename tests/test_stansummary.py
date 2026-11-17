@@ -158,3 +158,8 @@ def test_summarize_passes_sig_figs_18_and_percentiles(monkeypatch, tmp_path):
     assert cmd[cmd.index("--percentiles") + 1] == "5,50,95"
     # the input files come last, so --include_param style options cannot swallow one
     assert cmd[-2:] == ["a.csv", "b.csv"]
+
+
+def test_parse_preserves_quoted_matrix_leaves():
+    result = stansummary.parse('name,Mean\n"m[1,2]",1.5\n')
+    assert result == {"m[1,2]": {"Mean": 1.5}}
